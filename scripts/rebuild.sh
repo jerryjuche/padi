@@ -14,7 +14,14 @@ if [ ! -d "$src" ]; then
   exit 1
 fi
 
-sh "$src/deploy/host/rootless-docker.sh"
+# rootless-docker.sh deliberately refuses to run as root. Hand it to the
+# non-root owner of the source tree (override with AGENT_VM_USER).
+owner=${AGENT_VM_USER:-$(stat -c %U "$src")}
+if [ -z "$owner" ] || [ "$owner" = root ]; then
+  printf 'rebuild: source tree must be owned by a non-root user (set AGENT_VM_USER)\\n' >&2
+  exit 1
+fi
+runuser -u "$owner" -- sh "$src/deploy/host/rootless-docker.sh"
 
 install -m 644 "$src/deploy/host/sysctl.conf" /etc/sysctl.d/99-agent.conf
 sysctl --system >/dev/null 2>&1 || true

@@ -132,7 +132,7 @@ Roles were created **without passwords**; operator must set them from `/srv/agen
 | V4 Supabase connectivity; pause rule | **Resolved for localhost** (direct psql, REST anon test, JWKS 200) and pause rule confirmed from official docs (§5). VM-side direct connection still untested. |
 | V9 Rootless Docker cgroup delegation + OOM kill at 256 MB | Host here is amd64 localhost with system Docker; the target is an ARM64 VM. Scripts written, not executed. |
 | V6 Oracle idle-reclaim wording / OCI memory metric | Reclaim thresholds confirmed from official docs (§5). Exact OCI Monitoring memory-utilization computation still needs live tenancy check. |
-| V14 Object Storage upload, boot-volume backups, external monitors | Requires bucket, instance principal, monitor accounts. |
+| V14 Object Storage upload, boot-volume backups, external monitors | **Design resolved (§11):** rclone native `oracleobjectstorage` backend with `instance_principal_auth` — static arm64 Go binary, zero credentials on the VM. Live upload/boot-backup/alert drill still needs the VM, bucket, dynamic group and monitor accounts. |
 | `scripts/dbaccess_test.sh` against real Supabase | **DONE — PASS** on 14 tables (see §5). |
 | `restore-test.sh` against a real dump | Throwaway local DB validated the SQL, but no real nightly dump exists yet. |
 | SSH access to the ARM64 VM | **Blocked — owner confirmed the VM is not ready yet (2026-11-23).** Owner chose "Give me SSH access", but no host/user/key are in `.env.local`. Needed for rootless OOM, backup, HTTPS and monitor checks. Do not start M1 until these pass or the owner explicitly accepts M0 with them deferred. |
@@ -143,9 +143,9 @@ Roles were created **without passwords**; operator must set them from `/srv/agen
 
 ## 8. Open questions for the owner
 
-1. Can you supply `SUPABASE_URL` / anon key (via local `.env.local`, not chat) so `dbaccess_test.sh` can be run against the real project?
-2. What is `API_DOMAIN` (`api.<domain>`) and have the Object Storage bucket + instance principal been created?
-3. Should the Object Storage upload use `rclone` (implemented) or a static Go helper / OCI CLI alternative? (Contract forbids Python `oci-cli` on the VM.)
+1. ~~Can you supply `SUPABASE_URL` / anon key?~~ **DONE** — `.env.local` supplied; anon test and migrations pass.
+2. What is `API_DOMAIN` (`api.<domain>`), the Object Storage bucket name, `OOS_NAMESPACE`, `OCI_REGION`, `COMPARTMENT_OCID`, and `HEALTHCHECK_PING_URL`? DNS must point at the VM.
+3. ~~Should Object Storage upload use rclone or a Go helper?~~ **RESOLVED — use rclone** with instance-principal auth; no Python, no static keys. See §11.
 
 ## 9. Progress log
 
@@ -155,6 +155,7 @@ Roles were created **without passwords**; operator must set them from `/srv/agen
 - **2026-11-23 (connection check)** — Owner added `.env.local`. Added `.gitignore`, set mode 600. Live Supabase: REST anon test PASS (14/14 HTTP 404), direct psql PASS (role `postgres`), JWKS HTTP 200, `agent` schema absent. Owner pasted a masked secret key in chat; rotation advised.
 - **2026-11-23 (approved work)** — Owner approved applying migrations and web research. Applied `001`/`002` to the live project: 14 tables, all RLS on, telegram_state seeded, both roles created, anon re-check still 14/14 HTTP 404. Resolved V4/V6 with official docs, recorded V8 correction and Sources in `docs/decisions.md`. Web search tool returned HTTP 402, so official doc URLs were fetched directly. SSH details still not supplied.
 - **2026-11-23 (VM status)** — Owner reported the ARM64 VM is **not ready yet**. Paused all VM-side checks. Local + Supabase portions of M0 are complete; the milestone is not accepted.
+- **2026-11-23 (V14 research + runbook)** — Fetched primary docs for rclone's native Oracle backend, OCI S3 compatibility, credentials, boot-volume backups and free monitor tiers. Resolved V14 in favour of rclone + instance principal (no keys on VM); recorded sources in `docs/decisions.md`. Added the ordered VM command checklist in §11. Found and fixed a defect: `scripts/rebuild.sh` required root but called `rootless-docker.sh`, which refuses root — it now invokes it via `runuser` as the source-tree owner.
 
 ## 10. Handoff instructions for the next session
 
@@ -163,3 +164,210 @@ Roles were created **without passwords**; operator must set them from `/srv/agen
 3. If credentials/environment are provided: run `scripts/dbaccess_test.sh`, `scripts/restore-test.sh`, the rootless OOM test, and the HTTPS check; record results here and in `docs/decisions.md`; only then tick the M0 box in `BUILD_SPEC.md` §9.
 4. Keep everything on local `main`. **Never push.** Never put secrets in files or chat.
 5. On approval, M1 is next: `deploy/session/*`, minimal `cmd/gateway`, `internal/gateway/{telegram,opencode,runner,gitops,store}`, `config/gateway.yaml` — with the documented temporary M1 throwaway-key deviation recorded in `docs/decisions.md`.
+6. When the VM is ready, work through §11 in order. Do not skip the read-only recon in §11.1.
+
+---
+
+## 11. ARM64 VM command checklist (run in order)
+
+**Why this exists:** nothing has been pushed, so the VM cannot clone the repo from `origin`. The source tree must be copied from this machine (§11.2). Every step below is idempotent unless marked otherwise. Placeholders in `<ANGLE_BRACKETS>` are values the owner supplies; **no secret values belong in this file or in chat**.
+
+### 11.0 One-time console/account setup (owner, before SSH)
+
+1. Create a private Object Storage bucket, e.g. `agent-backups`, and note its **bucket name**, **namespace**, **region**, and **compartment OCID**.
+2. Create a **dynamic group** whose matching rule includes this instance:
+   ```
+   ANY {instance.id = '<INSTANCE_OCID>'}
+   ```
+   (or scope by compartment if preferred).
+3. Add a least-privilege policy, e.g.:
+   ```
+   Allow dynamic-group <DYNAMIC_GROUP> to manage objects in compartment id '<COMPARTMENT_OCID>' where target.bucket.name = 'agent-backups'
+   ```
+   `manage objects` is required because `backup.sh` deletes objects older than 14 days.
+4. Enable **policy-based automatic boot-volume backups** (Always Free includes 5 free volume backups).
+5. Create a free [Healthchecks.io](https://healthchecks.io/) check for the dead-man's switch; note the ping UUID (`https://hc-ping.com/<UUID>`). For the drill in §11.10, temporarily set its period/grace to a few minutes, then restore ~24 h + grace afterwards.
+6. Set up an external HTTPS uptime monitor (e.g. UptimeRobot free tier) for `https://<API_DOMAIN>/healthz`.
+7. Point `API_DOMAIN` DNS at the VM's public IP.
+
+### 11.1 First SSH — read-only recon
+
+Add the SSH values to the gitignored `.env.local` **on this machine** (names only shown):
+```
+AGENT_VM_HOST=<ip or hostname>
+AGENT_VM_USER=<ssh user>
+AGENT_VM_KEY=/absolute/path/to/passphrase-free/private/key
+AGENT_VM_PORT=22
+```
+Then confirm we are on the right host before changing anything:
+```sh
+set -a; . ./.env.local; set +a
+ssh -i "$AGENT_VM_KEY" -p "${AGENT_VM_PORT:-22}" -o BatchMode=yes \
+  "$AGENT_VM_USER@$AGENT_VM_HOST" \
+  'echo "ARCH=$(uname -m)"; . /etc/os-release; echo "OS=$PRETTY_NAME"; free -m; stat -fc %T /sys/fs/cgroup; systemd --version | head -1; command -v docker || true; command -v rclone || true; id'
+```
+Expected: `ARCH=aarch64`, cgroup `cgroup2fs`, `docker`/`rclone` absent initially, owner user is **not** root.
+
+### 11.2 Copy the source tree (from this machine) and install prerequisites
+
+```sh
+# FROM THIS MACHINE — repo is local-only, not pushed:
+rsync -av --exclude '.env.local' \
+  ./ "$AGENT_VM_USER@$AGENT_VM_HOST:/srv/agent/src/"
+```
+On the VM, as root:
+```sh
+sudo apt update
+sudo apt install -y ca-certificates curl git jq ufw unzip rsync \
+  postgresql-client uidmap dbus-user-session slirp4netns fuse-overlayfs
+```
+Install pinned Go 1.26 (arm64) and verify the checksum from `https://go.dev/dl/?mode=json`:
+```sh
+curl -fLO "https://go.dev/dl/go1.26.1.linux-arm64.tar.gz"
+# verify sha256 against the JSON manifest before extracting
+sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf go1.26.1.linux-arm64.tar.gz
+/usr/local/go/bin/go version   # expect go1.26.1 linux/arm64
+```
+
+### 11.3 rclone + instance principal (no credentials on disk)
+
+Install a **pinned** static arm64 build (check the current version at <https://rclone.org/downloads/>):
+```sh
+RCLONE_VER=<PINNED_VERSION>
+curl -fLO "https://downloads.rclone.org/v${RCLONE_VER}/rclone-v${RCLONE_VER}-linux-arm64.zip"
+curl -fLO "https://downloads.rclone.org/v${RCLONE_VER}/SHA256SUMS"
+grep "rclone-v${RCLONE_VER}-linux-arm64.zip" SHA256SUMS | sha256sum -c -
+unzip -o "rclone-v${RCLONE_VER}-linux-arm64.zip"
+sudo install -m 755 "rclone-v${RCLONE_VER}-linux-arm64/rclone" /usr/local/bin/rclone
+```
+Write the remote config (this contains **no secrets** — instance identity comes from metadata):
+```sh
+sudo install -d -m 700 /root/.config/rclone
+sudo tee /root/.config/rclone/rclone.conf >/dev/null <<'EOF'
+[oos]
+type = oracleobjectstorage
+provider = instance_principal_auth
+namespace = <OOS_NAMESPACE>
+region = <OCI_REGION>
+compartment = <COMPARTMENT_OCID>
+EOF
+sudo chmod 600 /root/.config/rclone/rclone.conf
+# nightly.sh runs as root; also give the owner user a copy for interactive checks
+sudo install -d -m 700 -o "$AGENT_VM_USER" -g "$AGENT_VM_USER" "/home/$AGENT_VM_USER/.config/rclone"
+sudo install -m 600 -o "$AGENT_VM_USER" -g "$AGENT_VM_USER" \
+  /root/.config/rclone/rclone.conf "/home/$AGENT_VM_USER/.config/rclone/rclone.conf"
+```
+Verify the dynamic-group policy works:
+```sh
+rclone lsd oos:                 # must list the bucket
+rclone ls oos:<BUCKET>          # must succeed (empty is fine)
+```
+If either fails, stop: the instance-principal policy is wrong. Do **not** fall back to Customer Secret Keys without an explicit decision.
+
+### 11.4 Secrets and DB roles
+
+```sh
+sudo install -d -m 700 /srv/agent/secrets
+sudo tee /srv/agent/secrets/gateway.env >/dev/null <<'EOF'
+DATABASE_URL=postgresql://agent_gateway:<PW>@<DB_HOST>/postgres
+SUPABASE_URL=https://<ref>.supabase.co
+SUPABASE_ANON_KEY=<anon key>
+RCLONE_REMOTE=oos:<BUCKET>
+HEALTHCHECK_PING_URL=https://hc-ping.com/<UUID>
+EOF
+sudo chmod 600 /srv/agent/secrets/gateway.env
+```
+Set the role passwords interactively so they never appear in shell history or process arguments:
+```sh
+psql "$MIGRATION_DATABASE_URL"     # the postgres-level connection string
+-- at the psql prompt:
+\password agent_gateway
+\password agent_router
+\q
+```
+`MIGRATION_DATABASE_URL` is only needed here and for future migrations; day-to-day `DATABASE_URL` uses `agent_gateway` (it has DML on `agent` and can run the nightly heartbeat).
+
+### 11.5 Bootstrap (idempotent)
+
+```sh
+sudo sh /srv/agent/src/deploy/host/firewall.sh
+sudo env AGENT_VM_USER="$AGENT_VM_USER" PATH=/usr/local/go/bin:$PATH \
+  sh /srv/agent/src/scripts/rebuild.sh
+```
+`rebuild.sh` now calls `rootless-docker.sh` through `runuser` as the owner (the earlier root-only version would have aborted). It installs sysctl/swap, builds `/usr/local/bin/keepalive`, installs the units, restores config from the newest archive if present, and enables `keepalive.service` + `agent-nightly.timer`.
+
+Caddy (HTTPS) is not in the M0 file list, so install it manually and keep the Caddyfile verbatim:
+```sh
+sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+  | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+  | sudo tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
+sudo apt update && sudo apt install -y caddy
+sudo install -m 644 /srv/agent/src/deploy/Caddyfile /etc/caddy/Caddyfile
+sudo install -d -m 755 /etc/systemd/system/caddy.service.d
+printf '[Service]\nEnvironment=API_DOMAIN=%s\n' "$API_DOMAIN" \
+  | sudo tee /etc/systemd/system/caddy.service.d/override.conf >/dev/null
+sudo systemctl daemon-reload && sudo systemctl enable --now caddy
+```
+Reboot once, then confirm everything came back:
+```sh
+sudo reboot
+# after reconnect:
+systemctl is-active keepalive.service caddy agent-nightly.timer
+docker --version
+```
+
+### 11.6 Accept: keepalive holds and yields
+
+```sh
+cat /srv/agent/state/keepalive.json
+journalctl -u keepalive -n 50 --no-pager
+free -m
+```
+Expected: `resident_mb` ≈ 4096 on an idle host (64 MiB steps), log lines "memory floor adjusted". Then create memory pressure for ~30 s and watch the floor drop:
+```sh
+timeout 30s awk 'BEGIN{while(1) s=s "aaaaaaaaaa"}' &
+watch -n 2 'cat /srv/agent/state/keepalive.json; free -m'
+```
+Expected: `resident_mb` falls as `MemAvailable` shrinks; it grows back after the process exits. **Caution:** keep an SSH session open and stop the test process immediately if `MemAvailable` approaches 2.5 GB.
+
+### 11.7 Accept: rootless Docker 256 MB OOM kill
+
+```sh
+docker run -d --name agent-oom-test --memory=256m --memory-swap=256m \
+  alpine:3.20 awk 'BEGIN{while(1) s=s "aaaaaaaaaa"}'
+sleep 20
+docker inspect agent-oom-test --format 'OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}}'
+docker rm -f agent-oom-test
+```
+Expected: `OOMKilled=true ExitCode=137`. If `OOMKilled=false`, cgroup delegation failed — re-check `Delegate=cpu memory pids` and cgroup v2 before proceeding.
+
+### 11.8 Accept: nightly, backup upload, restore
+
+```sh
+sudo systemctl start agent-nightly.service
+cat /srv/agent/state/nightly.json          # every step ok or explicitly skipped
+rclone ls oos:<BUCKET>/agent               # must show agent-*.sql.gz and config-state-*.tar.gz
+sudo sh /srv/agent/src/scripts/restore-test.sh
+```
+`restore-test.sh` restores into a throwaway `postgres:16-alpine` container and prints row counts; it never touches the live database.
+
+### 11.9 Accept: HTTPS
+
+```sh
+curl -fsS "https://<API_DOMAIN>/healthz"    # expect: ok
+curl -sS -o /dev/null -w '%{http_code}\n' "https://<API_DOMAIN>/nope"   # expect 404
+```
+
+### 11.10 Accept: external monitor drill
+
+1. Confirm the uptime monitor shows `https://<API_DOMAIN>/healthz` as UP.
+2. Trigger the dead-man's switch by stopping the VM (from the OCI console) or `sudo shutdown -h now`.
+3. Wait past the check's grace period; confirm Healthchecks.io sends the alert.
+4. Start the VM, confirm the next nightly ping clears the check, then **restore the check's normal ~24 h period + grace**.
+5. Record the timestamps and screenshots.
+
+### 11.11 Record and close M0
+
+Paste the real outputs (with secrets redacted) into this file §5 and `docs/decisions.md` VERIFY rows V4/V6/V8/V9/V14. Only when every item above passes: tick the M0 box in `BUILD_SPEC.md` §9, commit locally on `main`, send the §2.5 report, and **stop**. M1 starts only after explicit owner approval.

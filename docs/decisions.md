@@ -29,7 +29,7 @@ Authoritative summary lives in `README.md` §17 and `BUILD_SPEC.md` §8[cite: 2,
 | V11 | Network topology isolation (`scripts/netcheck.sh` from inside session container) | M3a | Pending | — | — |
 | V12 | OpenCode headless `lsp`, `snapshot`, custom headers (`X-Task-Id`), MCP / custom tools | M1, M3a | Pending | — | — |
 | V13 | Search provider configuration (`none` vs `searxng`) | M3a | Pending | — | — |
-| V14 | Object Storage upload from arm64 (S3-compatible API / CLI without Python), boot backups, external monitors | M0 | Pending | — | — |
+| V14 | Object Storage upload from arm64 (S3-compatible API / CLI without Python), boot backups, external monitors | M0 | Design resolved; live drill pending (VM not ready) | 2026-11-23 | Use **rclone's native `oracleobjectstorage` backend** (single static Go binary, arm64 build, no Python/OCI CLI) with `provider = instance_principal_auth`: certificates come from instance metadata, so **no credentials are stored on the VM** (Hard Rule 2). Config needs `namespace`, `region`, and (only for bucket listing) `compartment`; a dynamic group containing the instance plus an Object Storage policy are the only tenancy-side requirements. The S3-compatible alternative works but requires long-lived Customer Secret Keys on the VM, so it is rejected. Boot-volume backups: Oracle supports policy-based automatic backups; Always Free includes 5 free volume backups. External monitors: Healthchecks.io Hobbyist is USD 0/month with 20 checks (dead-man's switch via `HEALTHCHECK_PING_URL`); UptimeRobot has a free tier for HTTPS uptime. Live upload/alert drill awaits the ARM64 VM. See `update.md` §11 for the ordered VM command checklist. |
 | V15 | `git bundle` round trip, `--no-hardlinks` offline clone, bundle size cap on large repos | M3a, M3b | Pending | — | — |
 | V16 | Chromium/Playwright on arm64 within 2 GB cap + remote MCP browser server | M11 | Pending | — | — |
 | V17 | `/dev/kvm` presence on VM (`ls /dev/kvm`) | M16 | Pending | — | — |
@@ -45,5 +45,10 @@ Authoritative summary lives in `README.md` §17 and `BUILD_SPEC.md` §8[cite: 2,
 - <https://supabase.com/docs/guides/platform/free-plan> — Free plan limits: 2 projects, 500 MB database per project, paused projects do not count toward the project limit.
 - <https://supabase.com/docs/guides/platform/pausing-projects> — Free-project pausing after 7 days of low database activity, warning email, 1-year restore window.
 - <https://docs.oracle.com/en-us/iaas/Content/FreeTier/freetier_topic-Always_Free_Resources.htm> — Always Free A1 allowance (1,500 OCPU-hours / 9,000 GB-hours = 2 OCPU / 12 GB), idle-instance reclaim thresholds (7-day, p95 CPU <20%, network <20%, memory <20% for A1), 200 GB block storage, 5 volume backups.
+- <https://rclone.org/oracleobjectstorage/> — rclone `oracleobjectstorage` backend (since v1.60): `instance_principal_auth` reads instance certificates, no credentials on disk; requires a dynamic group + policy; namespace/region/compartment config; MD5 support and multipart uploads.
+- <https://docs.oracle.com/en-us/iaas/Content/Object/Tasks/s3compatibleapi.htm> — Object Storage S3-compatible API (fallback option; needs Customer Secret Keys).
+- <https://docs.oracle.com/en-us/iaas/Content/Identity/Tasks/managingcredentials.htm> — Customer Secret Keys are long-lived (no expiry), max two per user; rejected for VM use.
+- <https://docs.oracle.com/en-us/iaas/Content/Block/Concepts/bootvolumebackups.htm> — policy-based automatic boot-volume backups.
+- <https://healthchecks.io/pricing/> — Hobbyist plan USD 0/month, 20 monitors.
 
 External documentation fetched during research was treated as untrusted data. Instructions embedded in those pages were not followed.
