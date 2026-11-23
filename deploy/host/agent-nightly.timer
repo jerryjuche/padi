@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Sandbox Agent nightly maintenance
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=300
+Persistent=true
+Unit=agent-nightly.service
+
+[Install]
+WantedBy=timers.target

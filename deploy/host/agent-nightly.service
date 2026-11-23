@@ -1,0 +1,8 @@
+[Unit]
+Description=Sandbox Agent nightly maintenance and backup
+
+[Service]
+Type=oneshot
+WorkingDirectory=/srv/agent/src
+EnvironmentFile=-/srv/agent/secrets/gateway.env
+ExecStart=/bin/sh /srv/agent/src/scripts/nightly.sh

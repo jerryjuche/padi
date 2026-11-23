@@ -1,0 +1,12 @@
+# M0: minimal HTTPS listener that answers /healthz.
+# Set API_DOMAIN=api.example.com on the VM. The localhost default is for dev.
+{$API_DOMAIN:localhost} {
+	handle /healthz {
+		header Content-Type text/plain
+		respond "ok" 200
+	}
+
+	handle {
+		respond "not found" 404
+	}
+}

@@ -1,0 +1,15 @@
+[Unit]
+Description=Sandbox Agent memory floor (free-tier survival)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/keepalive --target-used-mb=4096 --min-available-mb=2500 --tick=30s --state=/srv/agent/state/keepalive.json
+Restart=always
+RestartSec=5
+OOMScoreAdjust=1000
+MemoryMax=4352M
+
+[Install]
+WantedBy=multi-user.target
