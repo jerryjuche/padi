@@ -13,6 +13,8 @@
 - Authoritative specs now on disk: `README.md` (v0.6, 150 KB), `BUILD_SPEC.md` (v1.2, 109 KB), `docs/decision-record-v2.md` (moved from repo root to the canonical path), `CONTRACT.md`, `docs/decisions.md`, `docs/runbooks.md`.
 - M0 files created per `BUILD_SPEC.md` §2.4 (see §4), plus `go.mod` (required to build the Go module; spec §1 explicitly permits a single root module).
 - `skills/` and `.github/workflows/ci.yml` were **deliberately not created** in M0 (see §2 decision 3).
+- Owner supplied `.env.local` (`SUPABASE_URL`, `SUPABASE_ANON_KEY`, `DATABASE_URL`). It is `chmod 600` and ignored via a newly added `.gitignore`. **No secret values are in tracked files or in this record.**
+- Owner pasted a masked `sb_secret_...` key in chat; recommend rotating it in Supabase → API Keys. Our design never uses that key: the Go gateway uses the dedicated `agent_gateway` DB role.
 
 ## 2. Decisions confirmed by the owner
 
@@ -78,6 +80,21 @@ Throwaway database and the two test roles were dropped afterwards.
 
 Unit tests cover: `Desired` table cases (idle/busy/low-MemAvailable/dead-band/own-memory), no oscillation near target, keeper grows 128 MiB then yields to 0 on a busy host, hysteresis avoids one-block churn, `Run` stops on context cancel, `/proc/meminfo` parsing.
 
+**Live Supabase read-only checks (2026-11-23, using `.env.local`):**
+```
+$ sh scripts/dbaccess_test.sh
+PASS  sessions / repos / tasks / events / approvals / login_tokens / web_sessions /
+      telegram_state / telegram_messages / system_flags / llm_usage / audit_log /
+      provider_keys / risk_cache   -> HTTP 404 for all 14
+dbaccess_test: anon key cannot read any agent table (14 checked)
+$ psql "$DATABASE_URL" -Atc 'select current_user, current_database()'
+postgres|postgres
+$ psql "$DATABASE_URL" -Atc "select count(*) from information_schema.schemata where schema_name='agent'"
+0                         (migrations NOT yet applied to the live project)
+$ curl -sS -o /dev/null -w 'jwks HTTP %{http_code}\n' "$SUPABASE_URL/auth/v1/.well-known/jwks.json"
+jwks HTTP 200
+```
+
 ## 6. Deviations from spec (explicit)
 
 1. **Module path** `github.com/jerryjuche/padi` chosen (spec §1 allows a single root module and says "choose one and keep it"); repo remote is `jerryjuche/padi`, not `sandbox-agent`.
@@ -86,17 +103,18 @@ Unit tests cover: `Desired` table cases (idle/busy/low-MemAvailable/dead-band/ow
 4. **`nightly.sh` records `gc`, `osv_refresh` as skipped** because `scripts/gc.sh` (M9) and osv-scanner (M14) are not M0 files. It does not abort on a failed step.
 5. **`deploy/Caddyfile` defaults to `localhost`** via `{$API_DOMAIN:localhost}` for localhost-first development; production TLS activates when `API_DOMAIN` is set.
 6. **`CONTRACT.md` / `docs/decisions.md` / `docs/runbooks.md` keep the `[cite: N]` markers verbatim** from the owner-provided text.
-7. No `.github/workflows/ci.yml`, `skills/`, or `scripts/skills-verify.sh` (deferred to M12 per owner decision 5).
+7. No `.github/workflows/ci.yml`, `skills/`, or `scripts/skills-verify.sh` (deferred to M12 per owner decision 5). The `npx skills add ...` / `@supabase/server` instructions pasted by the owner were **not followed**: unpinned runtime skill installs violate §3.8, and a Supabase client/secret key in the app would violate Hard Rule 6.
+8. Added `.gitignore` (not in the M0 file list) to keep `.env.local` and secrets untracked.
 
 ## 7. M0 acceptance items still BLOCKED (need live environment)
 
 | Item | Why blocked |
 |---|---|
-| V4 Supabase connectivity from localhost/VM; pause rule | No connection string supplied in this session. |
+| V4 Supabase connectivity; pause rule | **Connectivity from localhost PASS** (direct psql, REST anon test, JWKS 200 recorded in §5). Free-project pause rule still needs confirmation. VM-side direct connection not yet tested. |
 | V9 Rootless Docker cgroup delegation + OOM kill at 256 MB | Host here is amd64 localhost with system Docker; the target is an ARM64 VM. Scripts written, not executed. |
 | V6 Oracle idle-reclaim wording / OCI memory metric | Requires Oracle tenancy access. |
 | V14 Object Storage upload, boot-volume backups, external monitors | Requires bucket, instance principal, monitor accounts. |
-| `scripts/dbaccess_test.sh` against real Supabase | Requires `SUPABASE_URL` + `SUPABASE_ANON_KEY`. Script written and shell-checked. |
+| `scripts/dbaccess_test.sh` against real Supabase | **DONE — PASS** on 14 tables (see §5). |
 | `restore-test.sh` against a real dump | Throwaway local DB validated the SQL, but no real nightly dump exists yet. |
 | HTTPS answers / VM reboot healthy | Requires `API_DOMAIN` and Caddy on the VM. |
 | OOM kill of 256 MB-limited container allocating 1 GB | Requires rootless VM; not run locally. |
@@ -113,7 +131,8 @@ Unit tests cover: `Desired` table cases (idle/busy/low-MemAvailable/dead-band/ow
 
 - **2026-11-23 (early)** — Repo inspected: empty, no commits, local `main`. Asked four clarifying questions; answers recorded. Created `update.md`. No implementation.
 - **2026-11-23 (later)** — Owner supplied the three ZIP spec files plus canonical answers and the remaining M0 docs. Moved `decision-record-v2.md` into `docs/`; wrote `CONTRACT.md`, `docs/decisions.md`, `docs/runbooks.md`.
-- **2026-11-23 (now)** — Implemented the full M0 file list. `go vet ./...` and `go test -race -count=1 ./...` pass. All 8 shell scripts pass `sh -n`. SQL migrations apply twice cleanly to a throwaway local PostgreSQL: 14 tables, all RLS on, telegram_state seeded, both roles created. Live VM/Supabase acceptance remains blocked.
+- **2026-11-23 (now)** — Implemented the full M0 file list. `go vet ./...` and `go test -race -count=1 ./...` pass. All 8 shell scripts pass `sh -n`. SQL migrations apply twice cleanly to a throwaway local PostgreSQL: 14 tables, all RLS on, telegram_state seeded, both roles created.
+- **2026-11-23 (connection check)** — Owner added `.env.local`. Added `.gitignore`, set mode 600. Live Supabase: REST anon test PASS (14/14 HTTP 404), direct psql PASS (role `postgres`), JWKS HTTP 200, `agent` schema absent (migrations not applied). Owner pasted a masked secret key in chat; rotation advised. VM-side checks and migration application still await approval.
 
 ## 10. Handoff instructions for the next session
 
