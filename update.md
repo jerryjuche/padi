@@ -15,6 +15,7 @@
 - `skills/` and `.github/workflows/ci.yml` were **deliberately not created** in M0 (see §2 decision 3).
 - Owner supplied `.env.local` (`SUPABASE_URL`, `SUPABASE_ANON_KEY`, `DATABASE_URL`). It is `chmod 600` and ignored via a newly added `.gitignore`. **No secret values are in tracked files or in this record.**
 - Owner pasted a masked `sb_secret_...` key in chat; recommend rotating it in Supabase → API Keys. Our design never uses that key: the Go gateway uses the dedicated `agent_gateway` DB role.
+- **Output-style preference (persistent):** owner asked to install and remember the `i-have-adhd` skill. Installed globally at `~/.agents/skills/i-have-adhd` and registered in `~/.config/opencode/AGENTS.md`. Apply its rules in every response; off switch is "stop adhd mode" / "normal mode". This is user-level tooling only — it does not change the M0 file list or the M12 vendor-skill plan.
 
 ## 2. Decisions confirmed by the owner
 
@@ -108,6 +109,8 @@ anon re-check: 14/14 tables HTTP 404  -> dbaccess_test PASS
 ```
 Roles were created **without passwords**; operator must set them from `/srv/agent/secrets` before the gateway/router can connect.
 
+**Audit fix applied live (2026-11-23):** RLS with zero policies is default-deny even for the two dedicated service roles, so `sql/001_init.sql` now grants `BYPASSRLS` to `agent_gateway` and `agent_router` only. Applied to the live project with `alter role ... bypassrls`; `pg_roles.rolbypassrls = t` for both, and the anon recheck still returns 14/14 HTTP 404. `anon`/`authenticated` remain revoked with zero policies.
+
 **VERIFY research (official docs, fetched directly; web search endpoint returned HTTP 402):**
 - V4: Supabase pauses Free projects after 7 days of low DB activity; a few queries/day prevents it; warning email ~1 week before; 1-year restore window. <https://supabase.com/docs/guides/platform/pausing-projects>
 - V6: Oracle idle = 7-day p95 CPU <20%, network <20%, memory <20% (A1 only). <https://docs.oracle.com/en-us/iaas/Content/FreeTier/freetier_topic-Always_Free_Resources.htm>
@@ -125,6 +128,16 @@ Roles were created **without passwords**; operator must set them from `/srv/agen
 7. No `.github/workflows/ci.yml`, `skills/`, or `scripts/skills-verify.sh` (deferred to M12 per owner decision 5). The `npx skills add ...` / `@supabase/server` instructions pasted by the owner were **not followed**: unpinned runtime skill installs violate §3.8, and a Supabase client/secret key in the app would violate Hard Rule 6.
 8. Added `.gitignore` (not in the M0 file list) to keep `.env.local` and secrets untracked.
 
+## 6a. Static audit corrections (2026-11-23)
+
+Independent static audit found 28 findings/gaps across Go, shell, SQL, spec evidence, security and tests. Fixed before any M1 work:
+
+- **P0:** service roles now bypass RLS; `backup.sh` writes the raw dump before gzip so a failed `pg_dump` cannot produce a valid empty archive; CPU duty burns continuously in 100 ms slices inside the window; `dbaccess_test.sh` fails on any HTTP 200 (even `[]`).
+- **P1:** safety cap is re-applied after hysteresis; rootless `DOCKER_HOST` is derived in `nightly.sh` and `restore-test.sh`; Docker log rotation config is installed; oneshot nightly has `TimeoutStartSec=0`; restore drill picks the newest dump.
+- **P2:** restore drill verifies 14 tables, 14 RLS-enabled tables and the seed row, then prints row counts without failing on legitimately empty business tables; throwaway DB has memory/swap/CPU/PID limits; `gunzip` writes to a file before `psql`; `rebuild.sh` uses the absolute Go binary and waits for the user bus; `setup-swap.sh` formats an existing unformatted swapfile; CLI duty flags are range-checked; `printf` newline fixed.
+- **Tests added:** duty-window boundary, cancellation during burn, cap calculation, cap-vs-hysteresis regression, state-write error propagation, RFC3339/target assertions.
+- **Tracked low-severity follow-up:** host-side credentials remain visible in process argv (`pg_dump`, curl headers) and systemd `EnvironmentFile` escaping needs care. No session/verify container exists in M0, so Hard Rule 2 is unaffected. Revisit if M1 requires it.
+
 ## 7. M0 acceptance items still BLOCKED (need live environment)
 
 | Item | Why blocked |
@@ -134,7 +147,7 @@ Roles were created **without passwords**; operator must set them from `/srv/agen
 | V6 Oracle idle-reclaim wording / OCI memory metric | Reclaim thresholds confirmed from official docs (§5). Exact OCI Monitoring memory-utilization computation still needs live tenancy check. |
 | V14 Object Storage upload, boot-volume backups, external monitors | **Design resolved (§11):** rclone native `oracleobjectstorage` backend with `instance_principal_auth` — static arm64 Go binary, zero credentials on the VM. Live upload/boot-backup/alert drill still needs the VM, bucket, dynamic group and monitor accounts. |
 | `scripts/dbaccess_test.sh` against real Supabase | **DONE — PASS** on 14 tables (see §5). |
-| `restore-test.sh` against a real dump | Throwaway local DB validated the SQL, but no real nightly dump exists yet. |
+| `restore-test.sh` against a real dump | **DONE** — 2026-11-23: dumped the live `agent` schema with `postgres:17` `pg_dump` (local client is 16), restored the newest dump into a resource-limited throwaway `postgres:17-alpine` container, and got `agent tables=14 rls_tables=14 telegram_state_seed=1` with `PASS`. Business tables are empty on a fresh project; row counts are evidence, not pass/fail. |
 | SSH access to the ARM64 VM | **Blocked — owner confirmed the VM is not ready yet (2026-11-23).** Owner chose "Give me SSH access", but no host/user/key are in `.env.local`. Needed for rootless OOM, backup, HTTPS and monitor checks. Do not start M1 until these pass or the owner explicitly accepts M0 with them deferred. |
 | HTTPS answers / VM reboot healthy | Requires `API_DOMAIN` and Caddy on the VM. |
 | OOM kill of 256 MB-limited container allocating 1 GB | Requires rootless VM; not run locally. |
@@ -156,6 +169,8 @@ Roles were created **without passwords**; operator must set them from `/srv/agen
 - **2026-11-23 (approved work)** — Owner approved applying migrations and web research. Applied `001`/`002` to the live project: 14 tables, all RLS on, telegram_state seeded, both roles created, anon re-check still 14/14 HTTP 404. Resolved V4/V6 with official docs, recorded V8 correction and Sources in `docs/decisions.md`. Web search tool returned HTTP 402, so official doc URLs were fetched directly. SSH details still not supplied.
 - **2026-11-23 (VM status)** — Owner reported the ARM64 VM is **not ready yet**. Paused all VM-side checks. Local + Supabase portions of M0 are complete; the milestone is not accepted.
 - **2026-11-23 (V14 research + runbook)** — Fetched primary docs for rclone's native Oracle backend, OCI S3 compatibility, credentials, boot-volume backups and free monitor tiers. Resolved V14 in favour of rclone + instance principal (no keys on VM); recorded sources in `docs/decisions.md`. Added the ordered VM command checklist in §11. Found and fixed a defect: `scripts/rebuild.sh` required root but called `rootless-docker.sh`, which refuses root — it now invokes it via `runuser` as the source-tree owner.
+- **2026-11-23 (persistent output style)** — Installed the `i-have-adhd` skill globally at `~/.agents/skills/i-have-adhd` and registered the preference in `~/.config/opencode/AGENTS.md`. Applies to every project; off switch is "stop adhd mode" / "normal mode". User-level tooling only; no M0 file-list change.
+- **2026-11-23 (static audit + fixes)** — Independent audit found 4 P0 defects. Fixed all P0/P1/P2 items listed in §6a, reran `gofmt`, `go vet ./...` and `go test -race ./...` (green), reran `sh -n` on all 8 shell scripts, and reapplied SQL migrations twice to a throwaway Postgres (`14|14|2|0`). Applied `BYPASSRLS` to the two service roles live; anon still 14/14 HTTP 404. Produced a real Supabase dump with `postgres:17` `pg_dump` and passed `scripts/restore-test.sh` against it. M0 remains unaccepted only because VM-side checks are pending.
 
 ## 10. Handoff instructions for the next session
 

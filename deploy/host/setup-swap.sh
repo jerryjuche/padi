@@ -18,6 +18,10 @@ if [ ! -e "$swapfile" ]; then
 fi
 
 if ! swapon --show | grep -q "^$swapfile[[:space:]]"; then
+  # A pre-existing file may be unformatted (e.g. a partial earlier run).
+  if ! swaplabel "$swapfile" >/dev/null 2>&1; then
+    mkswap "$swapfile" >/dev/null
+  fi
   swapon "$swapfile"
 fi
 if ! grep -q "^$swapfile[[:space:]]" /etc/fstab; then

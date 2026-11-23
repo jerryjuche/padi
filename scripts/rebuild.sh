@@ -18,10 +18,20 @@ fi
 # non-root owner of the source tree (override with AGENT_VM_USER).
 owner=${AGENT_VM_USER:-$(stat -c %U "$src")}
 if [ -z "$owner" ] || [ "$owner" = root ]; then
-  printf 'rebuild: source tree must be owned by a non-root user (set AGENT_VM_USER)\\n' >&2
+  printf 'rebuild: source tree must be owned by a non-root user (set AGENT_VM_USER)\n' >&2
   exit 1
 fi
 runuser -u "$owner" -- sh "$src/deploy/host/rootless-docker.sh"
+
+# Install log rotation for both the system daemon and the rootless daemon.
+install -d -m 755 /etc/docker
+install -m 644 "$src/deploy/host/docker-daemon.json" /etc/docker/daemon.json
+runuser -u "$owner" -- sh -s "$src" <<'EOF'
+install -d -m 755 "$HOME/.config/docker"
+install -m 644 "$1/deploy/host/docker-daemon.json" "$HOME/.config/docker/daemon.json"
+EOF
+runuser -u "$owner" -- env XDG_RUNTIME_DIR="/run/user/$(id -u "$owner")" \
+  systemctl --user restart docker >/dev/null 2>&1 || true
 
 install -m 644 "$src/deploy/host/sysctl.conf" /etc/sysctl.d/99-agent.conf
 sysctl --system >/dev/null 2>&1 || true
@@ -31,7 +41,8 @@ mkdir -p /srv/agent/state /srv/agent/backups /srv/agent/cache \
   /srv/agent/secrets /srv/agent/workspaces /srv/agent/quarantine /srv/agent/src
 chmod 700 /srv/agent/secrets
 
-(cd "$src" && go build -o /usr/local/bin/keepalive ./cmd/keepalive)
+# sudo's PATH does not include /usr/local/go/bin; use the absolute binary.
+(cd "$src" && /usr/local/go/bin/go build -o /usr/local/bin/keepalive ./cmd/keepalive)
 
 install -m 644 "$src/deploy/host/keepalive.service" /etc/systemd/system/keepalive.service
 install -m 644 "$src/deploy/host/agent-nightly.service" /etc/systemd/system/agent-nightly.service

@@ -27,6 +27,13 @@ begin
 end
 $$;
 
+-- RLS with zero policies denies every non-owner role. The two dedicated
+-- service roles are the only intended data path, so they bypass RLS; anon and
+-- authenticated stay subject to it with zero policies and are revoked below.
+-- This requires a superuser migration role (Supabase's postgres role).
+alter role agent_gateway bypassrls;
+alter role agent_router bypassrls;
+
 create table if not exists agent.sessions (
   id uuid primary key default gen_random_uuid(),
   created_at timestamptz not null default now(),

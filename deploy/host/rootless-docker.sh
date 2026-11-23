@@ -27,8 +27,19 @@ cat > "$dropin/override.conf" <<'EOF'
 Delegate=cpu memory pids
 EOF
 
-systemctl --user daemon-reload
-systemctl --user restart docker
+# loginctl enable-linger starts the user manager asynchronously. Wait for the
+# private bus socket so a fresh VM does not fail with "Failed to connect to bus".
+attempt=0
+while [ ! -S "$XDG_RUNTIME_DIR/systemd/private" ] && [ "$attempt" -lt 30 ]; do
+  attempt=$((attempt + 1))
+  sleep 1
+done
+if [ -S "$XDG_RUNTIME_DIR/systemd/private" ]; then
+  systemctl --user daemon-reload
+  systemctl --user restart docker
+else
+  printf 'rootless-docker: user bus not ready; run "systemctl --user daemon-reload && systemctl --user restart docker" manually\n' >&2
+fi
 
 printf 'rootless-docker: installed for %s\n' "$user"
 printf 'Add to your shell profile: export DOCKER_HOST=unix://%s/docker.sock\n' "$XDG_RUNTIME_DIR"

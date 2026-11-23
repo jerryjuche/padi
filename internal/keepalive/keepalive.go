@@ -79,10 +79,7 @@ func Desired(info MemInfo, ownMB int, cfg Config) (holdMB int) {
 	// availableMB already excludes our resident blocks; adding ownMB gives the
 	// memory that would be available if we released everything. Never push that
 	// below MinAvailableMB because of ourselves.
-	capMB := availableMB + ownMB - cfg.MinAvailableMB
-	if capMB < 0 {
-		capMB = 0
-	}
+	capMB := capFor(info, ownMB, cfg)
 	if want > capMB {
 		want = capMB
 	}
@@ -93,6 +90,16 @@ func Desired(info MemInfo, ownMB int, cfg Config) (holdMB int) {
 		want = 0
 	}
 	return want
+}
+
+// capFor is the largest floor that keeps MemAvailable at or above the
+// configured minimum once the current holding (ownMB) is accounted for.
+func capFor(info MemInfo, ownMB int, cfg Config) int {
+	capMB := int(info.AvailableKB/1024) + ownMB - cfg.MinAvailableMB
+	if capMB < 0 {
+		return 0
+	}
+	return capMB
 }
 
 // Run holds the floor until ctx is cancelled.
@@ -136,8 +143,19 @@ func (k *Keeper) tick(ctx context.Context) error {
 	}
 	target -= target % StepMB
 
+	// Hysteresis can lift target back above the safety cap. Re-clamp so the
+	// "never below MinAvailableMB" promise survives the dead band.
+	if limit := capFor(info, k.heldMB, k.cfg); target > limit {
+		target = limit - limit%StepMB
+	}
+
 	grew, shrunk := false, false
 	for k.heldMB < target {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
 		block := make([]byte, StepMB*1024*1024)
 		for i := 0; i < len(block); i += pageSize {
 			block[i] = 1 // touch every page so the memory is genuinely resident
@@ -163,11 +181,11 @@ func (k *Keeper) tick(ctx context.Context) error {
 		)
 	}
 
+	if ctx.Err() != nil {
+		return nil
+	}
 	if err := k.writeState(target); err != nil {
 		return err
-	}
-	if err := ctx.Err(); err != nil {
-		return nil
 	}
 	return nil
 }
@@ -217,47 +235,55 @@ func (k *Keeper) runCPUDuty(ctx context.Context) {
 	if duty.Percent < 1 || duty.Percent > 100 {
 		duty.Percent = 20
 	}
-	if duty.WindowMinutes < 1 {
+	if duty.WindowMinutes < 1 || duty.WindowMinutes > 60 {
 		duty.WindowMinutes = 60
 	}
 
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
+		const sliceMS = 100
 		for {
-			now := time.Now().UTC()
-			inWindow := now.Hour() == duty.StartHourUTC &&
-				now.Minute() < duty.WindowMinutes
-			if inWindow {
-				// Percent ms of work, then the remainder of a 100 ms slice idle.
-				burn(time.Duration(duty.Percent)*time.Millisecond, ctx)
+			if !inDutyWindow(time.Now(), duty) {
 				select {
 				case <-ctx.Done():
 					return
-				case <-time.After(time.Duration(100-duty.Percent) * time.Millisecond):
+				case <-time.After(30 * time.Second):
 				}
+				continue
+			}
+			// Inside the window, repeat 100 ms slices continuously: Percent ms
+			// of work, the rest idle. Waiting on the 30 s ticker here would
+			// reduce a 20 % duty cycle to a single 20 ms burst per 30 s.
+			if !burn(time.Duration(duty.Percent)*time.Millisecond, ctx) {
+				return
 			}
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
+			case <-time.After(time.Duration(sliceMS-duty.Percent) * time.Millisecond):
 			}
 		}
 	}()
 }
 
-func burn(d time.Duration, ctx context.Context) {
+func inDutyWindow(now time.Time, duty CPUDuty) bool {
+	utc := now.UTC()
+	return utc.Hour() == duty.StartHourUTC && utc.Minute() < duty.WindowMinutes
+}
+
+// burn returns false when ctx was cancelled mid-slice.
+func burn(d time.Duration, ctx context.Context) bool {
 	deadline := time.Now().Add(d)
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
-			return
+			return false
 		default:
 		}
 		for i := 0; i < 10000; i++ {
 			_ = i * i
 		}
 	}
+	return true
 }
 
 func abs(n int) int {

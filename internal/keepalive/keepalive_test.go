@@ -101,8 +101,8 @@ func TestKeeperGrowsThenYields(t *testing.T) {
 	if err := k.tick(context.Background()); err != nil {
 		t.Fatalf("first tick: %v", err)
 	}
-	if got := readState(t, statePath); got.ResidentMB != 128 {
-		t.Fatalf("resident after idle tick = %d, want 128", got.ResidentMB)
+	if got := readState(t, statePath); got.ResidentMB != 128 || got.TargetMB != 128 {
+		t.Fatalf("state after idle tick = %+v, want resident/target 128", got)
 	}
 
 	// A test process allocates memory: MemAvailable drops and the keeper yields.
@@ -110,8 +110,8 @@ func TestKeeperGrowsThenYields(t *testing.T) {
 	if err := k.tick(context.Background()); err != nil {
 		t.Fatalf("busy tick: %v", err)
 	}
-	if got := readState(t, statePath); got.ResidentMB != 0 {
-		t.Fatalf("resident after busy tick = %d, want 0", got.ResidentMB)
+	if got := readState(t, statePath); got.ResidentMB != 0 || got.TargetMB != 0 {
+		t.Fatalf("state after busy tick = %+v, want resident/target 0", got)
 	}
 	if k.heldMB != 0 || len(k.blocks) != 0 {
 		t.Fatalf("keeper still holds %d MB in %d blocks", k.heldMB, len(k.blocks))
@@ -135,6 +135,30 @@ func TestKeeperHysteresisAvoidsOneBlockChurn(t *testing.T) {
 	}
 	if got := k.heldMB; got != 256 {
 		t.Fatalf("held = %d MB, want 256 (hysteresis)", got)
+	}
+}
+
+func TestHysteresisRespectsSafetyCap(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "keepalive.json")
+	// Desired is capped at 4032 MiB; held is 4096 MiB, so hysteresis would
+	// otherwise round target back up and push MemAvailable below the floor.
+	info := MemInfo{TotalKB: 6400 * 1024, AvailableKB: 2436 * 1024}
+	cfg := Config{TargetUsedMB: 4096, MinAvailableMB: 2500, Tick: time.Hour, StatePath: statePath}
+	k := New(cfg, &fakeReader{info: info})
+	k.heldMB = 4096
+	k.blocks = make([][]byte, 4096/StepMB)
+	if got := Desired(info, k.heldMB, cfg); got != 4032 {
+		t.Fatalf("Desired() = %d, want 4032", got)
+	}
+
+	if err := k.tick(context.Background()); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if got := k.heldMB; got != 4032 {
+		t.Fatalf("held = %d MB, want 4032 (cap beats hysteresis)", got)
+	}
+	if got := readState(t, statePath); got.TargetMB != 4032 {
+		t.Fatalf("state target = %d MB, want 4032", got.TargetMB)
 	}
 }
 
@@ -163,6 +187,58 @@ func TestProcMemInfoParsesFile(t *testing.T) {
 	}
 }
 
+func TestInDutyWindow(t *testing.T) {
+	duty := CPUDuty{StartHourUTC: 3, WindowMinutes: 15}
+	tests := []struct {
+		at   time.Time
+		want bool
+	}{
+		{time.Date(2026, 11, 23, 2, 59, 0, 0, time.UTC), false},
+		{time.Date(2026, 11, 23, 3, 0, 0, 0, time.UTC), true},
+		{time.Date(2026, 11, 23, 3, 14, 59, 0, time.UTC), true},
+		{time.Date(2026, 11, 23, 3, 15, 0, 0, time.UTC), false},
+		{time.Date(2026, 11, 23, 4, 0, 0, 0, time.UTC), false},
+		// Non-UTC input must still be evaluated in UTC (04:01+01:00 = 03:01Z).
+		{time.Date(2026, 11, 23, 4, 1, 0, 0, time.FixedZone("X", 3600)), true},
+	}
+	for _, tc := range tests {
+		if got := inDutyWindow(tc.at, duty); got != tc.want {
+			t.Errorf("inDutyWindow(%s) = %v, want %v", tc.at, got, tc.want)
+		}
+	}
+}
+
+func TestBurnStopsOnCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if burn(5*time.Second, ctx) {
+		t.Fatal("burn ignored a cancelled context")
+	}
+}
+
+func TestCapFor(t *testing.T) {
+	info := MemInfo{TotalKB: 12288 * 1024, AvailableKB: 2404 * 1024}
+	cfg := Config{MinAvailableMB: 2500}
+	if got := capFor(info, 4096, cfg); got != 4000 {
+		t.Fatalf("capFor() = %d, want 4000", got)
+	}
+	if got := capFor(info, 0, cfg); got != 0 {
+		t.Fatalf("capFor() with no holding = %d, want 0", got)
+	}
+}
+
+func TestWriteStateErrorPropagates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state-is-a-directory")
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{TargetUsedMB: 128, MinAvailableMB: 100, Tick: time.Hour, StatePath: path}
+	reader := &fakeReader{info: MemInfo{TotalKB: testTotalKB, AvailableKB: testAvailableKB}}
+	if err := New(cfg, reader).tick(context.Background()); err == nil {
+		t.Fatal("tick should fail when the state path cannot be replaced")
+	}
+}
+
 func readState(t *testing.T, path string) State {
 	t.Helper()
 	data, err := os.ReadFile(path)
@@ -175,6 +251,12 @@ func readState(t *testing.T, path string) State {
 	}
 	if state.Updated == "" {
 		t.Fatal("state has no updated timestamp")
+	}
+	if _, err := time.Parse(time.RFC3339, state.Updated); err != nil {
+		t.Fatalf("state timestamp %q is not RFC3339: %v", state.Updated, err)
+	}
+	if state.TargetMB < 0 {
+		t.Fatalf("state target is negative: %d", state.TargetMB)
 	}
 	return state
 }

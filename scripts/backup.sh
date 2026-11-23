@@ -13,7 +13,17 @@ mkdir -p "$backup_dir"
 ts=$(date -u +%Y%m%dT%H%M%SZ)
 dump="$backup_dir/agent-$ts.sql.gz"
 
-pg_dump -n agent --no-owner --no-acl "$DATABASE_URL" | gzip > "$dump.tmp"
+# No pipefail in /bin/sh: a failed pg_dump through a pipe would leave a valid
+# but empty gzip. Write the raw dump first so set -e sees pg_dump's status.
+raw="$dump.raw"
+pg_dump -n agent --no-owner --no-acl "$DATABASE_URL" > "$raw"
+if ! grep -q 'CREATE TABLE agent\.' "$raw"; then
+  printf 'backup: dump contains no agent tables\n' >&2
+  rm -f "$raw"
+  exit 1
+fi
+gzip -c "$raw" > "$dump.tmp"
+rm -f "$raw"
 mv "$dump.tmp" "$dump"
 
 archive="$backup_dir/config-state-$ts.tar.gz"

@@ -40,6 +40,18 @@ func main() {
 		fmt.Fprintln(os.Stderr, "--state is required")
 		os.Exit(2)
 	}
+	if *cpuPercent < 1 || *cpuPercent > 100 {
+		fmt.Fprintln(os.Stderr, "--cpu-duty-percent must be between 1 and 100")
+		os.Exit(2)
+	}
+	if *cpuWindow < 1 || *cpuWindow > 60 {
+		fmt.Fprintln(os.Stderr, "--cpu-duty-window-minutes must be between 1 and 60")
+		os.Exit(2)
+	}
+	if *cpuStartHour < 0 || *cpuStartHour > 23 {
+		fmt.Fprintln(os.Stderr, "--cpu-duty-start-hour-utc must be between 0 and 23")
+		os.Exit(2)
+	}
 
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 

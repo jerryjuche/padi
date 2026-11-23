@@ -40,6 +40,21 @@ Authoritative summary lives in `README.md` §17 and `BUILD_SPEC.md` §8[cite: 2,
 | V22 | `gitleaks` and `osv-scanner` arm64 builds, CLI flags, offline DB refresh | M14 | Pending | — | — |
 | V23 | `npm`, `go`, and `pip` base-URL overrides through credential injection routes | M16 | Pending | — | — |
 
+## Implementation Audit Corrections (2026-11-23)
+
+Independent static audit of the M0 file set found concrete defects; all P0/P1/P2 items were fixed before M1.
+
+| Area | Correction | Evidence |
+|---|---|---|
+| SQL / RLS | `agent_gateway` and `agent_router` get `BYPASSRLS`; `anon`/`authenticated` stay revoked with zero policies. RLS with zero policies otherwise denied the service roles outright. | Live `pg_roles.rolbypassrls = t` for both; `dbaccess_test.sh` still PASS with 14/14 HTTP 404. |
+| Backup integrity | `backup.sh` writes the raw dump before gzip, then checks for `CREATE TABLE agent.`. A failed `pg_dump` can no longer become a valid empty archive. | Real `postgres:17` dump restored successfully by `restore-test.sh`. |
+| Keepalive CPU duty | The duty loop runs 100 ms work/idle slices continuously inside the window and sleeps 30 s only outside it. The old code gave ~0.07 % duty, not 20 %. | New `TestInDutyWindow` and `TestBurnStopsOnCancel`; `go test -race` green. |
+| Keepalive memory cap | The safety cap is re-applied after hysteresis so `MemAvailable` cannot be pushed below `MinAvailableMB`. | New `TestHysteresisRespectsSafetyCap`; `go test -race` green. |
+| Nightly / rebuild | `DOCKER_HOST` derived for rootless Docker; `TimeoutStartSec=0`; Docker log rotation installed; absolute Go binary used under sudo; user-bus readiness polled. | `sh -n` on all shell scripts; no VM execution yet (V9 pending). |
+| Restore drill | Newest dump selected; resource limits applied; gzip decompressed to a file; 14 tables, 14 RLS tables and seed row verified; row counts reported but empty business tables allowed. | `restore-test: agent tables=14 rls_tables=14 telegram_state_seed=1` then `PASS`. |
+
+Tracked low-severity follow-up: host-side credentials still appear in process argv and systemd `EnvironmentFile` escaping needs care. No session/verify container exists in M0, so Hard Rule 2 is unaffected.
+
 ## Sources
 
 - <https://supabase.com/docs/guides/platform/free-plan> — Free plan limits: 2 projects, 500 MB database per project, paused projects do not count toward the project limit.

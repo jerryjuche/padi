@@ -8,6 +8,16 @@ src=${AGENT_SRC:-/srv/agent/src}
 state_dir=$root/state
 mkdir -p "$state_dir"
 
+# Rootless Docker's socket lives in the owner user's runtime dir. This service
+# runs as root, so DOCKER_HOST must be derived rather than inherited.
+if [ -z "${DOCKER_HOST:-}" ]; then
+  owner_uid=$(stat -c %u "$src" 2>/dev/null || printf '')
+  if [ -n "$owner_uid" ] && [ -S "/run/user/$owner_uid/docker.sock" ]; then
+    DOCKER_HOST="unix:///run/user/$owner_uid/docker.sock"
+    export DOCKER_HOST
+  fi
+fi
+
 started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 results=""
 

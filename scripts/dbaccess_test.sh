@@ -22,12 +22,10 @@ for table in $tables; do
       printf 'PASS  %-22s HTTP %s (no exposure)\n' "$table" "$code"
       ;;
     200)
-      if grep -q '\[[[:space:]]*\]' "$body_file"; then
-        printf 'PASS  %-22s HTTP 200 but empty result\n' "$table"
-      else
-        printf 'FAIL  %-22s HTTP 200 with data: %s\n' "$table" "$(head -c 120 "$body_file")"
-        failed=$((failed + 1))
-      fi
+      # Any 200 is a failure: an exposed schema with empty tables today leaks
+      # rows as soon as the first one is inserted.
+      printf 'FAIL  %-22s HTTP 200 (schema exposed): %s\n' "$table" "$(head -c 120 "$body_file")"
+      failed=$((failed + 1))
       ;;
     *)
       printf 'FAIL  %-22s unexpected HTTP %s: %s\n' "$table" "$code" "$(head -c 120 "$body_file")"
