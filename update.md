@@ -95,6 +95,25 @@ $ curl -sS -o /dev/null -w 'jwks HTTP %{http_code}\n' "$SUPABASE_URL/auth/v1/.we
 jwks HTTP 200
 ```
 
+**Migrations applied to the LIVE Supabase project (owner approved 2026-11-23):**
+```
+001 OK
+002 OK
+14                         (tables in schema agent)
+14                         (tables with relrowsecurity = t)
+1|0                        (telegram_state seeded)
+agent_gateway
+agent_router
+anon re-check: 14/14 tables HTTP 404  -> dbaccess_test PASS
+```
+Roles were created **without passwords**; operator must set them from `/srv/agent/secrets` before the gateway/router can connect.
+
+**VERIFY research (official docs, fetched directly; web search endpoint returned HTTP 402):**
+- V4: Supabase pauses Free projects after 7 days of low DB activity; a few queries/day prevents it; warning email ~1 week before; 1-year restore window. <https://supabase.com/docs/guides/platform/pausing-projects>
+- V6: Oracle idle = 7-day p95 CPU <20%, network <20%, memory <20% (A1 only). <https://docs.oracle.com/en-us/iaas/Content/FreeTier/freetier_topic-Always_Free_Resources.htm>
+- V8 correction: current Oracle docs say 1,500 OCPU-hours / 9,000 GB-hours (= 2 OCPU / 12 GB), not the older 3,000 / 18,000 quoted in the spec. Design unchanged.
+- Evidence and URLs recorded in `docs/decisions.md`. Embedded "AI agent" instructions in fetched pages were treated as untrusted data and ignored (Hard Rule 10).
+
 ## 6. Deviations from spec (explicit)
 
 1. **Module path** `github.com/jerryjuche/padi` chosen (spec §1 allows a single root module and says "choose one and keep it"); repo remote is `jerryjuche/padi`, not `sandbox-agent`.
@@ -110,12 +129,13 @@ jwks HTTP 200
 
 | Item | Why blocked |
 |---|---|
-| V4 Supabase connectivity; pause rule | **Connectivity from localhost PASS** (direct psql, REST anon test, JWKS 200 recorded in §5). Free-project pause rule still needs confirmation. VM-side direct connection not yet tested. |
+| V4 Supabase connectivity; pause rule | **Resolved for localhost** (direct psql, REST anon test, JWKS 200) and pause rule confirmed from official docs (§5). VM-side direct connection still untested. |
 | V9 Rootless Docker cgroup delegation + OOM kill at 256 MB | Host here is amd64 localhost with system Docker; the target is an ARM64 VM. Scripts written, not executed. |
-| V6 Oracle idle-reclaim wording / OCI memory metric | Requires Oracle tenancy access. |
+| V6 Oracle idle-reclaim wording / OCI memory metric | Reclaim thresholds confirmed from official docs (§5). Exact OCI Monitoring memory-utilization computation still needs live tenancy check. |
 | V14 Object Storage upload, boot-volume backups, external monitors | Requires bucket, instance principal, monitor accounts. |
 | `scripts/dbaccess_test.sh` against real Supabase | **DONE — PASS** on 14 tables (see §5). |
 | `restore-test.sh` against a real dump | Throwaway local DB validated the SQL, but no real nightly dump exists yet. |
+| SSH access to the ARM64 VM | Owner chose "Give me SSH access" but host/user/key path are not yet in `.env.local`. Needed for rootless OOM, backup, HTTPS and monitor checks. |
 | HTTPS answers / VM reboot healthy | Requires `API_DOMAIN` and Caddy on the VM. |
 | OOM kill of 256 MB-limited container allocating 1 GB | Requires rootless VM; not run locally. |
 
@@ -132,7 +152,8 @@ jwks HTTP 200
 - **2026-11-23 (early)** — Repo inspected: empty, no commits, local `main`. Asked four clarifying questions; answers recorded. Created `update.md`. No implementation.
 - **2026-11-23 (later)** — Owner supplied the three ZIP spec files plus canonical answers and the remaining M0 docs. Moved `decision-record-v2.md` into `docs/`; wrote `CONTRACT.md`, `docs/decisions.md`, `docs/runbooks.md`.
 - **2026-11-23 (now)** — Implemented the full M0 file list. `go vet ./...` and `go test -race -count=1 ./...` pass. All 8 shell scripts pass `sh -n`. SQL migrations apply twice cleanly to a throwaway local PostgreSQL: 14 tables, all RLS on, telegram_state seeded, both roles created.
-- **2026-11-23 (connection check)** — Owner added `.env.local`. Added `.gitignore`, set mode 600. Live Supabase: REST anon test PASS (14/14 HTTP 404), direct psql PASS (role `postgres`), JWKS HTTP 200, `agent` schema absent (migrations not applied). Owner pasted a masked secret key in chat; rotation advised. VM-side checks and migration application still await approval.
+- **2026-11-23 (connection check)** — Owner added `.env.local`. Added `.gitignore`, set mode 600. Live Supabase: REST anon test PASS (14/14 HTTP 404), direct psql PASS (role `postgres`), JWKS HTTP 200, `agent` schema absent. Owner pasted a masked secret key in chat; rotation advised.
+- **2026-11-23 (approved work)** — Owner approved applying migrations and web research. Applied `001`/`002` to the live project: 14 tables, all RLS on, telegram_state seeded, both roles created, anon re-check still 14/14 HTTP 404. Resolved V4/V6 with official docs, recorded V8 correction and Sources in `docs/decisions.md`. Web search tool returned HTTP 402, so official doc URLs were fetched directly. SSH details still not supplied.
 
 ## 10. Handoff instructions for the next session
 
