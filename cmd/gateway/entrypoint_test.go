@@ -1,0 +1,77 @@
+package main
+
+import (
+	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestEntrypointRendersConfigWithoutKey(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not available")
+	}
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fake := filepath.Join(bin, "opencode")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nprintf '%s' \"$*\" > \"$FAKE_ARGS\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	argsFile := filepath.Join(tmp, "args")
+	cmd := exec.Command("sh", filepath.Join(root, "deploy", "session", "entrypoint.sh"))
+	cmd.Env = append(os.Environ(),
+		"HOME="+tmp,
+		"PATH="+bin+":"+os.Getenv("PATH"),
+		"FAKE_ARGS="+argsFile,
+		"OPENCODE_BASE_CONFIG="+filepath.Join(root, "deploy", "session", "opencode.base.json"),
+		"PADI_MODEL=openai/gpt-5-nano",
+		"PADI_TASK_ID=task-42",
+		"SESSION_ID=ses-42",
+		"PADI_MODEL_BASE_URL=http://fake-provider:9999/v1",
+		"OPENAI_API_KEY=DO_NOT_WRITE_ME",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("entrypoint: %v: %s", err, out)
+	}
+	rendered, err := os.ReadFile(filepath.Join(tmp, ".config", "opencode", "opencode.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(rendered), "DO_NOT_WRITE_ME") {
+		t.Fatal("model key leaked into rendered config")
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(rendered, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	providers := cfg["providers"].(map[string]any)
+	openai := providers["openai"].(map[string]any)
+	headers := openai["headers"].(map[string]any)
+	if headers["X-Task-Id"] != "task-42" {
+		t.Fatalf("headers=%+v", headers)
+	}
+	settings, ok := openai["settings"].(map[string]any)
+	if !ok || settings["baseURL"] != "http://fake-provider:9999/v1" {
+		t.Fatalf("settings=%+v", openai["settings"])
+	}
+	args, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(args) != "serve --hostname 0.0.0.0 --port 4096" {
+		t.Fatalf("args=%q", args)
+	}
+}

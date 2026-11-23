@@ -3,7 +3,7 @@
 **Project:** Sandbox Agent (single-user remote AI coding agent)
 **Repository:** `/home/gamp/Desktop/padi` (remote `https://github.com/jerryjuche/padi.git`)
 **Last updated:** 2026-11-23
-**Current phase:** **M0 implemented; code gate PASS; live VM/Supabase acceptance BLOCKED — awaiting owner verification and approval**
+**Current phase:** **M0 local + Supabase gates COMPLETE and approved; VM-only M0 drills explicitly deferred by owner (Option B); M1 Spine preflight started locally**
 
 ---
 
@@ -28,6 +28,7 @@
 | 5 | Vendor GitHub skills **deferred to M12**; M0 creates only §2.4 M0 files. |
 | 6 | Live Supabase project exists. Credentials go in gitignored `.env.local` / `/srv/agent/secrets`; never pasted in chat or committed. |
 | 7 | Work starts on local `main`; **never push** to a remote/default branch. Owner approved pushing an `agent/<slug>-<shortid>` branch after verification (2026-11-23). |
+| 8 | **Option B (2026-11-23):** defer the ARM64-VM-only M0 checks until the VM is provisioned; keep the §9 M0 checkbox **unchecked**; local + Supabase M0 gates are complete and approved to proceed with M1 Spine locally. |
 
 ## 3. Hard rules carried forward (condensed from CONTRACT.md)
 
@@ -138,21 +139,33 @@ Independent static audit found 28 findings/gaps across Go, shell, SQL, spec evid
 - **Tests added:** duty-window boundary, cancellation during burn, cap calculation, cap-vs-hysteresis regression, state-write error propagation, RFC3339/target assertions.
 - **Tracked low-severity follow-up:** host-side credentials remain visible in process argv (`pg_dump`, curl headers) and systemd `EnvironmentFile` escaping needs care. No session/verify container exists in M0, so Hard Rule 2 is unaffected. Revisit if M1 requires it.
 
-## 7. M0 acceptance items still BLOCKED (need live environment)
+## 7. M0 acceptance status and owner-approved deferrals
 
-| Item | Why blocked |
+**Owner decision (Option B, 2026-11-23):** the local + Supabase M0 gates are complete and approved; the remaining ARM64-VM-only drills are explicitly **deferred until the Oracle ARM64 VM is provisioned** and no longer block M1 Spine on localhost.
+
+### Complete and accepted locally / on Supabase
+
+| Item | Status |
 |---|---|
-| V4 Supabase connectivity; pause rule | **Resolved for localhost** (direct psql, REST anon test, JWKS 200) and pause rule confirmed from official docs (§5). VM-side direct connection still untested. |
-| V9 Rootless Docker cgroup delegation + OOM kill at 256 MB | Host here is amd64 localhost with system Docker; the target is an ARM64 VM. Scripts written, not executed. |
-| V6 Oracle idle-reclaim wording / OCI memory metric | Reclaim thresholds confirmed from official docs (§5). Exact OCI Monitoring memory-utilization computation still needs live tenancy check. |
-| V14 Object Storage upload, boot-volume backups, external monitors | **Design resolved (§11):** rclone native `oracleobjectstorage` backend with `instance_principal_auth` — static arm64 Go binary, zero credentials on the VM. Live upload/boot-backup/alert drill still needs the VM, bucket, dynamic group and monitor accounts. |
-| `scripts/dbaccess_test.sh` against real Supabase | **DONE — PASS** on 14 tables (see §5). |
-| `restore-test.sh` against a real dump | **DONE** — 2026-11-23: dumped the live `agent` schema with `postgres:17` `pg_dump` (local client is 16), restored the newest dump into a resource-limited throwaway `postgres:17-alpine` container, and got `agent tables=14 rls_tables=14 telegram_state_seed=1` with `PASS`. Business tables are empty on a fresh project; row counts are evidence, not pass/fail. |
-| SSH access to the ARM64 VM | **Blocked — owner confirmed the VM is not ready yet (2026-11-23).** Owner chose "Give me SSH access", but no host/user/key are in `.env.local`. Needed for rootless OOM, backup, HTTPS and monitor checks. Do not start M1 until these pass or the owner explicitly accepts M0 with them deferred. |
-| HTTPS answers / VM reboot healthy | Requires `API_DOMAIN` and Caddy on the VM. |
-| OOM kill of 256 MB-limited container allocating 1 GB | Requires rootless VM; not run locally. |
+| `go vet ./... && go test -race -count=1 ./...`, `sh -n` on all shell scripts | PASS (§5, §6a). |
+| SQL migrations applied twice, idempotent; 14 tables, all RLS on, `telegram_state` seeded, dedicated roles with `BYPASSRLS` | PASS locally and on the live Supabase project (§5). |
+| `scripts/dbaccess_test.sh` against real Supabase | **PASS** — 14/14 tables HTTP 404 for the anon/publishable key (§5). |
+| `restore-test.sh` against a real dump | **PASS** — `postgres:17` dump restored into a resource-limited throwaway container; `agent tables=14 rls_tables=14 telegram_state_seed=1` (§5). |
+| V4 (localhost connectivity + pause rule), V6 (reclaim thresholds), V8 (allowance), V14 (rclone design) | Recorded in `docs/decisions.md`; VM-side portions remain in the deferred list below. |
 
-**`BUILD_SPEC.md` §9 M0 checkbox is intentionally left unchecked** until these real-environment checks pass.
+### Deferred to the ARM64 VM (owner Option B)
+
+| Item | Requirement that remains |
+|---|---|
+| Keepalive live floor | Run the built `keepalive` binary on the ARM64 VM; prove it holds the 4 GB memory floor and yields to a task (V9/V6 live portion). |
+| Rootless 256 MB OOM drill | Provision rootless Docker with cgroup v2 delegation and kill a 256 MB-limited container that allocates 1 GB (V9). |
+| rclone Object Storage upload | Real upload/prune to the private bucket using `oracleobjectstorage` + instance principal; needs bucket, namespace, region, compartment OCID, dynamic group and policy (§11, V14). |
+| Caddy HTTPS | Set `API_DOMAIN`, point DNS at the VM, run Caddy, and verify `https://<API_DOMAIN>/healthz` plus VM reboot health. |
+| External monitor drill | Dead-man's-switch ping to `HEALTHCHECK_PING_URL` and external HTTPS uptime monitor alert verified end to end (V14). |
+
+SSH access is still unavailable; add the gitignored `AGENT_VM_*` values locally when the VM is ready (§11.1). Do not invent or commit them.
+
+**`BUILD_SPEC.md` §9 M0 checkbox stays intentionally unchecked** until those five live VM drills are executed and recorded here and in `docs/decisions.md`. This does *not* block M1 Spine locally.
 
 ## 8. Open questions for the owner
 
@@ -172,15 +185,15 @@ Independent static audit found 28 findings/gaps across Go, shell, SQL, spec evid
 - **2026-11-23 (persistent output style)** — Installed the `i-have-adhd` skill globally at `~/.agents/skills/i-have-adhd` and registered the preference in `~/.config/opencode/AGENTS.md`. Applies to every project; off switch is "stop adhd mode" / "normal mode". User-level tooling only; no M0 file-list change.
 - **2026-11-23 (static audit + fixes)** — Independent audit found 4 P0 defects. Fixed all P0/P1/P2 items listed in §6a, reran `gofmt`, `go vet ./...` and `go test -race ./...` (green), reran `sh -n` on all 8 shell scripts, and reapplied SQL migrations twice to a throwaway Postgres (`14|14|2|0`). Applied `BYPASSRLS` to the two service roles live; anon still 14/14 HTTP 404. Produced a real Supabase dump with `postgres:17` `pg_dump` and passed `scripts/restore-test.sh` against it. M0 remains unaccepted only because VM-side checks are pending.
 - **2026-11-23 (approved push)** — Owner asked to push to a branch and selected `agent/m0-audit-fixes-b53482d`. Created that branch from `main` and pushed it to `origin` at `b53482d`. Default branch untouched. §11.2 now clones this branch on the VM instead of using rsync.
+- **2026-11-23 (Option B + M1 preflight)** — Owner chose Option B: defer the five VM-only M0 drills, keep the §9 M0 checkbox unchecked, and start M1 Spine locally. Recorded the deferral in §7 and `docs/decisions.md`. Resolved V1/V12 against real `opencode v2.4.0` (local OpenAPI schema, config schema and a live `serve` probe); recorded the exact M1 file list and temporary deviations in §12. No M1 code written yet.
 
 ## 10. Handoff instructions for the next session
 
-1. Read this file first, then `BUILD_SPEC.md` §2.4 M0 and §3.5B/§3.7.
-2. Do **not** start M1. M0 needs owner approval and the live checks in §7. The VM is not ready as of 2026-11-23; wait for the owner to supply SSH details before attempting VM checks.
-3. If credentials/environment are provided: run `scripts/dbaccess_test.sh`, `scripts/restore-test.sh`, the rootless OOM test, and the HTTPS check; record results here and in `docs/decisions.md`; only then tick the M0 box in `BUILD_SPEC.md` §9.
+1. Read this file first, then `BUILD_SPEC.md` §2.4 M1, §3.3, §3.7, §7 and §8.
+2. M1 Spine **is authorized** locally under owner Option B. Before code: post the exact M1 file list, resolve/record V1 and V12 in `docs/decisions.md`, and record the temporary M1 deviations and `gitexec.Run` conventions (§12).
+3. Build M1 with table-driven tests; run `go vet ./... && go test -race -count=1 ./...`; verify the local Telegram → container → OpenCode → independent clone → Telegram summary loop; stop with the `BUILD_SPEC.md` §2.5 report.
 4. Never push to `main` or any default branch. Only push approved `agent/*` branches after verification. Never put secrets in files or chat.
-5. On approval, M1 is next: `deploy/session/*`, minimal `cmd/gateway`, `internal/gateway/{telegram,opencode,runner,gitops,store}`, `config/gateway.yaml` — with the documented temporary M1 throwaway-key deviation recorded in `docs/decisions.md`.
-6. When the VM is ready, work through §11 in order. Do not skip the read-only recon in §11.1.
+5. When the VM is ready, execute the five deferred drills in §7 and work through §11 in order. Do not skip the read-only recon in §11.1. Only then tick the M0 box in `BUILD_SPEC.md` §9.
 
 ---
 
@@ -388,4 +401,247 @@ curl -sS -o /dev/null -w '%{http_code}\n' "https://<API_DOMAIN>/nope"   # expect
 
 ### 11.11 Record and close M0
 
-Paste the real outputs (with secrets redacted) into this file §5 and `docs/decisions.md` VERIFY rows V4/V6/V8/V9/V14. Only when every item above passes: tick the M0 box in `BUILD_SPEC.md` §9, commit locally on `main`, send the §2.5 report, and **stop**. M1 starts only after explicit owner approval.
+Paste the real outputs (with secrets redacted) into this file §5 and `docs/decisions.md` VERIFY rows V4/V6/V8/V9/V14. Only when every item above passes: tick the M0 box in `BUILD_SPEC.md` §9 and send the §2.5 report. **Owner has already given explicit approval (Option B) to proceed with M1 locally while these VM drills are deferred** (§7); this checklist remains the condition for closing M0, not for starting M1.
+
+---
+
+## 12. M1 Spine preflight
+
+### 12.1 Exact files to create per `BUILD_SPEC.md` §2.4 M1
+
+| Area | Files |
+|---|---|
+| Session image | `deploy/session/Dockerfile`, `deploy/session/entrypoint.sh`, `deploy/session/opencode.base.json`, `deploy/session/AGENTS.target.md` |
+| Gateway entrypoint | `cmd/gateway/main.go` (minimal wiring) |
+| Telegram | `internal/gateway/telegram/*` (poller, owner allowlist, reply streaming) |
+| OpenCode client | `internal/gateway/opencode/*` including `internal/gateway/opencode/translate.go` |
+| Runner | `internal/gateway/runner/*` (`Start`, `Wait`, `Stop`, `Exec`, `Reconcile`) |
+| GitOps (M1 subset) | `internal/gateway/gitops/*` limited to `MintInstallationToken`, `EnsureCache`, `CloneForTask` |
+| Store (minimal) | `internal/gateway/store/*` (events, tasks) |
+| Config | `config/gateway.yaml` |
+
+Additional test files will be colocated with each package (table-driven, `-race`). No `sql/003_harness.sql`, `gitexec.go`, `bundle.go`, `quarantine.go`, `deploy/docker-compose.yml` or `cmd/agent-verify` in M1 — those belong to M3a/M3b.
+
+### 12.2 VERIFY results before code
+
+V1 and V12 are resolved against the installed **`opencode v2.4.0`** binary, its live `/openapi.json`, the official `https://opencode.ai/config.json` schema and official docs. Full evidence is in `docs/decisions.md`. Headlines: `serve` exposes `/api/session`, `/api/session/{id}/prompt`, `/api/event` (SSE) and `/api/session/{id}/model`; HTTP auth is Basic with username `opencode` and password from `OPENCODE_PASSWORD` (unauthenticated probe returned 401); model changes are per-session, not per-message; `lsp` and `snapshots` are valid config keys, custom headers belong under `providers.<id>.headers`, and MCP servers under `mcp.servers`.
+
+### 12.3 Temporary deviations and conventions
+
+1. M1 only: a **throwaway free-tier model API key** is passed to the session container via environment variable at run time. It is never baked into the Dockerfile, image, compose file, config file, git or chat, and is revoked when M2 passes.
+2. M1 only: containers use a plain bridge network named `agent-session-net` (not `internal`); M3a replaces it and proves isolation with `netcheck.sh`.
+3. From day one: host `git` is never run inside `workspaces/*/repo`. All gateway git calls go through a single hardened `gitexec.Run` wrapper (`exec.CommandContext`, no shell, per-call timeout, neutral git env/config, protocol allowlist). M1 only needs the cache/installation-token/clone subset; the lint test that forbids any other `exec.Command("git", ...)` is specified for M3a, but the convention is followed now. Code leaves the container only as `out.bundle` fetched into a gateway-owned quarantine repo (M3a).
+
+- **2026-11-23 (M1 complete)** — Implemented and verified the M1 Spine locally. `gofmt`, `go vet` and `go test -race` are green. Host probe drove real `opencode v2.4.0` with a fake OpenAI-compatible provider and executed an `edit` tool against a real README. Full local loop passed: fake Telegram → real Docker container → real OpenCode → independent clone edit → Telegram summary; task `DONE`, 9 events, no leftover container, no credential-like image env. Corrected V1/V12 evidence with data-only SSE frames and observed completion events. No push performed; M0 checkbox remains unchecked per Option B. Full §2.5 report in §13.
+
+---
+
+## 13. M1 Spine report (`BUILD_SPEC.md` §2.5)
+
+### Done
+
+- Session image: `deploy/session/Dockerfile`, `deploy/session/entrypoint.sh`, `deploy/session/opencode.base.json`, `deploy/session/AGENTS.target.md`.
+- Gateway: `cmd/gateway/main.go`, `cmd/gateway/config.go`, `cmd/gateway/config_test.go`, `cmd/gateway/entrypoint_test.go`.
+- Config: `config/gateway.yaml`.
+- Telegram: `internal/gateway/telegram/api.go`, `poller.go`, `render.go`, `telegram_test.go`.
+- OpenCode: `internal/gateway/opencode/client.go`, `translate.go`, `client_test.go`, `translate_test.go`.
+- Runner: `internal/gateway/runner/docker.go`, `runner.go`, `runner_test.go`.
+- GitOps: `internal/gateway/gitops/gitexec.go`, `git.go`, `gitexec_lint_test.go`, `git_test.go`.
+- Store: `internal/gateway/store/store.go`, `store_test.go`.
+- Module/dependencies: `go.mod`, `go.sum`.
+- Continuity/evidence: `docs/decisions.md` (V1/V12 corrections), `update.md` (this report).
+
+### Evidence
+
+Formatting and static checks:
+
+```text
+$ gofmt -l cmd/gateway internal/gateway
+(no output)
+
+$ git diff --check
+(no output)
+```
+
+```text
+$ GOFLAGS=-mod=mod GOPROXY=off go vet ./... && GOFLAGS=-mod=mod GOPROXY=off go test -race -count=1 ./...
+ok  	github.com/jerryjuche/padi/cmd/gateway	1.315s
+?   	github.com/jerryjuche/padi/cmd/keepalive	[no test files]
+ok  	github.com/jerryjuche/padi/internal/gateway/gitops	2.317s
+ok  	github.com/jerryjuche/padi/internal/gateway/opencode	1.160s
+ok  	github.com/jerryjuche/padi/internal/gateway/runner	1.467s
+ok  	github.com/jerryjuche/padi/internal/gateway/store	1.128s
+ok  	github.com/jerryjuche/padi/internal/gateway/telegram	1.420s
+ok  	github.com/jerryjuche/padi/internal/keepalive	5.378s
+```
+
+Host-side probe with real `opencode v2.4.0`, fake OpenAI-compatible provider and SSE capture:
+
+```text
+SID=ses_df73f4363ffefENgxSIBv33Sfe
+INFO:
+{"version":"2.4.0","pid":178387,"hostname":"CL2-T1-S03","urls":["http://127.0.0.1:4598"],"paths":{"tmp":"/tmp/opencode"},"capabilities":{"persistentPty":true}}
+SSE (delta/idle lines):
+data: {"id":"evt_208c0f899001jgGhrEeaZ4zSY7","created":1795443194009,"type":"session.text.delta","location":{"directory":"/tmp/opencode/padi-m1-loop/host-probe"},"data":{"sessionID":"ses_df73f4363ffefENgxSIBv33Sfe","assistantMessageID":"msg_208c0f808001esta5QGmGaHX18","ordinal":0,"delta":"M1 loop verified with a fake model provider."}}
+FAKE REQUEST PATHS:
+/v1/chat/completions	m1-model	0
+/v1/chat/completions	m1-model	14
+/v1/chat/completions	m1-model	14
+README AFTER:
+# fixture
+
+M1 loop verified by fake provider
+```
+
+Final local loop (evidence directory `/tmp/opencode/padi-m1-loop/evidence-1795445642470`):
+
+```text
+bridge_gateway=172.20.0.1
+=== M1 LOCAL LOOP EVIDENCE ===
+stamp=1795445642470
+task_id=fc833f21-2eb7-4bba-8d44-11f40cddeff1
+branch=agent/tmp-opencode-padi-m1-loop-source-fc833f21
+gateway_exit=0
+summary_received=1
+task_state=DONE
+event_count=9
+source_inode=5961547 workspace_inode=6753100
+leftover_containers=[]
+
+--- source README (must stay unchanged) ---
+# fixture
+--- workspace README (must contain marker) ---
+# fixture
+
+M1 loop verified by fake provider
+--- telegram outbox ---
+{"method":"sendMessage","text":"Working..."}
+{"method":"editMessageText","text":"Running a tool..."}
+{"method":"editMessageText","text":"Running a tool..."}
+{"method":"editMessageText","text":"Tool finished."}
+{"method":"editMessageText","text":"Working..."}
+{"method":"editMessageText","text":"M1 loop verified with a fake model provider."}
+{"method":"editMessageText","text":"M1 loop verified with a fake model provider."}
+--- gateway log ---
+2026/11/23 15:54:25 gateway: M1 spine ready (model=fake/m1-model, network=agent-session-net)
+--- fake provider requests (path/model/tool-count) ---
+/v1/chat/completions	m1-model	0
+/v1/chat/completions	m1-model	14
+/v1/chat/completions	m1-model	14
+--- image env credential scan ---
+PASS: no credential-like env keys in image
+--- evidence files ---
+/tmp/opencode/padi-m1-loop/evidence-1795445642470
+```
+
+Persisted events for the completed task:
+
+```text
+1|status|{"state": "QUEUED"}
+2|status|{"state": "PREPARING", "branch": "agent/tmp-opencode-padi-m1-loop-source-fc833f21"}
+3|tool_call|{"text": "", "tool": "", "message": ""}
+4|tool_call|{"text": "", "tool": "", "message": ""}
+5|tool_result|{"text": "", "tool": "", "message": ""}
+6|status|{"text": "", "tool": "", "message": "Working..."}
+7|token|{"text": "M1 loop verified with a fake model provider.", "tool": "", "message": ""}
+8|done|{"text": "", "tool": "", "message": ""}
+9|done|{"summary": "M1 loop verified with a fake model provider."}
+```
+
+Provider headers observed by the fake provider:
+
+```text
+{"x-session-affinity":"ses_df7191ed7ffek7wV30trPMsS48","x-session-id":"ses_df7191ed7ffek7wV30trPMsS48","x-task-id":"fc833f21-2eb7-4bba-8d44-11f40cddeff1"}
+```
+
+Acceptance mapping to `BUILD_SPEC.md` M1:
+
+- “Clone repo X and add a line to the README” edited the independent clone: PASS (source inode `5961547` unchanged; workspace inode `6753100` contains marker).
+- Telegram shows the summary: PASS (`summary_received=1`, outbox final edit contains `M1 loop verified with a fake model provider.`).
+- Container gone afterwards: PASS (`leftover_containers=[]`).
+- No git credential in the container: PASS (`no credential-like env keys in image`; git access used the local fixture through `gitexec.Run` only).
+- V1/V12: PASS with live evidence; details in `docs/decisions.md`.
+
+### Deviations
+
+1. M1 temporary deviations already recorded: throwaway model key via environment variable only, and plain bridge `agent-session-net`. M2/M3a replace them.
+2. Local verification used a fake Telegram Bot API, a fake OpenAI-compatible provider and a local git fixture instead of real external credentials. The Docker container, OpenCode binary and git clone path were real.
+3. Live V1 evidence corrected the pre-code expectation: v2.4.0 SSE frames are data-only (`type` inside JSON), and successful completion was observed as `session.text.ended` plus `session.execution.succeeded`, not `session.idle`. The client now accepts data-only frames; the translator treats `session.text.ended`/`session.idle` as done and execution/step failures as terminal errors.
+4. Bundle export, quarantine, verification container, approvals and push are deliberately absent from M1 per §2.4; they belong to M3a/M3b.
+
+### Open items
+
+- ARM64 VM still not provisioned. Five VM-only M0 drills remain deferred by owner Option B; `BUILD_SPEC.md` §9 M0 checkbox stays unchecked.
+- No real Telegram bot token, GitHub App credentials or real model key was supplied; local fakes were used. The throwaway key must be revoked when M2 passes.
+- `agent_gateway` / `agent_router` DB roles still need passwords set from `/srv/agent/secrets` on the VM.
+- The masked `sb_secret_...` key pasted earlier in chat must be rotated by the owner.
+- No push was performed. Current work is uncommitted on `agent/m0-audit-fixes-b53482d`.
+
+### Next
+
+M2 Router v1, awaiting owner go-ahead. It retires the M1 throwaway key, introduces model aliases/rate limiting, and verifies custom-provider and tool-call passthrough.
+
+---
+
+## 14. Credential paste guide (NVIDIA + Groq)
+
+### 14.1 Where to paste
+
+All values go in `.env.local` (mode 600, gitignored). The gateway reads process environment, not the file directly, so load it before starting:
+
+```sh
+set -a; . ./.env.local; set +a
+go run ./cmd/gateway
+```
+
+Never paste a token or private key into chat, `config/gateway.yaml`, an image or git.
+
+### 14.2 Telegram
+
+1. In Telegram, message **@BotFather** → `/newbot` → follow prompts → copy the token into `TELEGRAM_BOT_TOKEN`.
+2. Get your numeric user ID (for example from **@userinfobot**) → `TELEGRAM_ALLOWED_USER_ID`. Only this ID is admitted.
+3. `TELEGRAM_OWNER_ID` and `GITHUB_INSTALLATION_ID` remain accepted aliases; the README names are now canonical and the code accepts both.
+
+### 14.3 GitHub — create a GitHub App, not a PAT
+
+Per `README.md` §8.8:
+
+1. **Settings → Developer settings → GitHub Apps → New GitHub App** under Jerry's account.
+2. Repository permissions: **Contents: read and write**, **Pull requests: read and write**, **Metadata: read**. Grant **no** Actions, Workflows or Administration permission.
+3. Generate a private key in the App settings → download the PEM → store it on the host as `/srv/agent/secrets/github-app.pem` with mode 600. Only the path goes in `GITHUB_APP_PRIVATE_KEY_PATH`; never the key contents.
+4. Copy the **App ID** into `GITHUB_APP_ID`.
+5. Install the App on **selected repositories only** (that list is the repo allowlist). The installation ID is in the install URL / App settings installations page → `GITHUB_APP_INSTALLATION_ID`.
+6. On each allowed repo, enable branch protection on the default branch: require PRs, block force pushes.
+7. The gateway signs a short-lived RS256 JWT, exchanges it for an installation token and passes it per git command via `-c http.extraheader=...`. It never writes the token to git config, an image or a container.
+
+A local path repo (`clone /tmp/...`) needs none of these; the fake GitHub credentials were used only for the local loop.
+
+### 14.4 Model choice
+
+`nemotron-3.5-bolt-e4b` is a valid NVIDIA API model (`nvidia/nemotron-3.5-bolt-e4b`) but is **absent from this OpenCode v2.4.0 bundled catalog**, so `deploy/session/opencode.base.json` declares it explicitly as an override. OpenCode then references it as `nvidia/nvidia/nemotron-3.5-bolt-e4b`.
+
+Active configuration (already applied):
+
+```yaml
+# config/gateway.yaml
+model: "nvidia/nvidia/nemotron-3.5-bolt-e4b"
+model_key_env: "NVIDIA_API_KEY"
+```
+
+Paste your NVIDIA key into `PADI_MODEL_API_KEY` in `.env.local`; the gateway injects it into the session container under `NVIDIA_API_KEY`. Key link: <https://build.nvidia.com/settings/api-keys>.
+
+Groq is declared as a custom OpenAI-compatible provider in the same base config (`env: ["GROQ_API_KEY"]`, base URL `https://api.groq.com/openai/v1`, models `openai/gpt-oss-120b` and `llama-3.3-70b-versatile`). To switch:
+
+1. Paste the Groq key into `PADI_MODEL_API_KEY` (<https://console.groq.com/keys>).
+2. In `config/gateway.yaml`, set `model: "groq/openai/gpt-oss-120b"` and `model_key_env: "GROQ_API_KEY"`.
+
+No image rebuild is needed for the switch: the base JSON is copied into the image at build time, so only a rebuild is required if you add a *new* provider or model. Verified locally with `opencode models`: both `nvidia/nvidia/nemotron-3.5-bolt-e4b` and the `groq/...` models appear, and `opencode serve` accepts the dual-provider config with no keys set.
+
+### 14.5 Sanity checks after filling the file
+
+```sh
+set -a; . ./.env.local; set +a
+test -n "$TELEGRAM_BOT_TOKEN" && test -n "$TELEGRAM_ALLOWED_USER_ID" && echo telegram-ok
+test -n "$PADI_MODEL_API_KEY" && echo model-key-ok
+GOFLAGS=-mod=mod GOPROXY=off go vet ./... && GOFLAGS=-mod=mod GOPROXY=off go test -race -count=1 ./...
+```

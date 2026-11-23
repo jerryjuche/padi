@@ -1,0 +1,46 @@
+# M1 Spine gateway config. No secrets belong in this file.
+http:
+  listen: ":8080"
+  ui_origin: "http://localhost:5173"
+  cookie_domain: "localhost"
+
+telegram:
+  poll_timeout_s: 30
+  edit_interval_ms: 1200
+  max_message_chars: 3800
+  photo_max_mb: 10
+
+sessions:
+  max_sessions: 1
+  min_free_mem_mb: 3000
+  workspace_retention_days: 7
+  workspace_max_mb: 2048
+
+container:
+  image: "sandbox-agent-session:latest"
+  runtime: runc
+  memory_mb: 2560
+  cpus: 1.0
+  pids: 512
+  network: "agent-session-net"   # plain bridge in M1; internal in M3a
+  proxy: ""                      # unused until M3a
+  bundle_max_mb: 200
+
+opencode:
+  # Active M1 model. Declared explicitly in deploy/session/opencode.base.json
+  # because this OpenCode build's bundled catalog omits the Bolt model.
+  model: "nvidia/nvidia/nemotron-3.5-bolt-e4b"
+  # Env name injected into the session container from PADI_MODEL_API_KEY.
+  # Switch to GROQ_API_KEY and groq/openai/gpt-oss-120b to use Groq instead.
+  model_key_env: "NVIDIA_API_KEY"
+  model_base_url: ""             # optional local fake provider for the spike
+  lsp: false
+  snapshots: false
+
+git:
+  cache_dir: "/srv/agent/cache/repos"
+  workspaces_dir: "/srv/agent/workspaces"
+  default_repo: ""               # optional local source for the M1 spike
+
+store:
+  dsn_env: "DATABASE_URL"
