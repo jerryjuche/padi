@@ -685,3 +685,38 @@ set -a; . ./.env.local; set +a
 ```
 
 Then message the bot from the configured owner ID: `/status` or `/help` for help, or `clone <repo> and <prompt>` to start one M1 task. M1 still has no bundle, quarantine, push or PR stage; those land in M3a/M3b.
+
+---
+
+## 16. First real Telegram run — two fixes
+
+### 16.1 Poisoned update cursor
+
+The local M1 loop harness had left `agent.telegram_state.last_update_id` at `1795447659401` (its evidence timestamp). Real Telegram update IDs are around `374300000`, so `getUpdates(offset)` returned nothing and the bot looked silent. Reset once before switching from the local harness to real Telegram:
+
+```sh
+set -a; . ./.env.local; set +a
+psql "$DATABASE_URL" -c "update agent.telegram_state set last_update_id=0 where id=1"
+```
+
+The harness should not write a fake timestamp into the shared cursor; local-loop state belongs in a separate DB or a distinct state row.
+
+### 16.2 HTML parse error on help/hint messages
+
+With the cursor reset, the poller reached the queued messages but every handler failed:
+
+```
+telegram handle update 374300388: telegram: sendMessage: HTTP 400:
+Bad Request: can't parse entities: Unsupported start tag "repo" at byte offset 26
+```
+
+`telegram.Client.SendMessage` always sets `parse_mode=HTML`. The renderer escaped its own text, but `cmd/gateway/main.go` sent the `/help`, `/status` and no-repo hints with literal `<repo>` / `<prompt>`, which Telegram rejects as invalid HTML. All call sites now pass those strings through `html.EscapeString`; `cmd/gateway/main_test.go` guards it with an `httptest` Telegram stub that asserts no raw placeholder reaches the wire.
+
+The poller also now waits 2 seconds after a failed handler before replaying the same update. Cursor semantics remain at-least-once (it still advances only after success), but a permanently bad message can no longer spin the loop at full speed.
+
+### 16.3 Verification
+
+- `gofmt`, `git diff --check`, `go vet`, `go test -race`: green.
+- Gateway restarted with real credentials: `M1 spine ready (model=nvidia/nvidia/nemotron-3.5-bolt-e4b, network=agent-session-net)`, no handler errors.
+- Cursor advanced `0` → `374300394`; `getUpdates` now reports zero pending updates.
+- No new session or task was created by the queued `/start`, `Hi`, `Hello` messages — they only received the escaped help/no-repo hint. The gateway is still running in the background with pid recorded in `/tmp/opencode/gateway-live.pid`.

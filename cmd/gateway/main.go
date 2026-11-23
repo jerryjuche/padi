@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"html"
 	"log"
 	"os"
 	"os/signal"
@@ -158,13 +159,13 @@ func (a *application) handleUpdate(ctx context.Context, u telegram.Update) error
 		return nil
 	}
 	if strings.HasPrefix(text, "/status") || strings.HasPrefix(text, "/help") {
-		_, err := a.tg.SendMessage(ctx, chatID, "M1 spine: send 'clone <repo> and <prompt>' to start one task.")
+		_, err := a.tg.SendMessage(ctx, chatID, html.EscapeString("M1 spine: send 'clone <repo> and <prompt>' to start one task."))
 		return err
 	}
 
 	repo, prompt := a.parseRepo(text)
 	if repo == "" {
-		_, err := a.tg.SendMessage(ctx, chatID, "No repository. Use: clone <repo> and <prompt>")
+		_, err := a.tg.SendMessage(ctx, chatID, html.EscapeString("No repository. Use: clone <repo> and <prompt>"))
 		return err
 	}
 

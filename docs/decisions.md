@@ -58,6 +58,12 @@ Deferral does not block M1 Spine on localhost (`update.md` §7).
 2. **Plain bridge network (M1 only).** Containers join a bridge network named `agent-session-net` without `internal: true`. M3a makes it internal, adds `egress-proxy`, and proves isolation with `scripts/netcheck.sh`.
 3. **Host git boundary from day one.** Host `git` never executes inside `workspaces/*/repo`. Every gateway git invocation goes through one hardened `gitexec.Run(ctx, dir, env, args...)`: `exec.CommandContext`, no shell, per-call timeout, `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_TERMINAL_PROMPT=0`, `GIT_PAGER=cat`, `GIT_ASKPASS=/bin/false`, `-c core.hooksPath=/dev/null -c core.fsmonitor=false`, and only the protocols each call needs (`https` for GitHub; `file` only for the local cache clone). M1 uses only `MintInstallationToken`, `EnsureCache`, `CloneForTask`; the lint test forbidding any other `exec.Command("git", ...)` is an M3a file (`internal/gateway/gitops/gitexec_lint_test.go`), but the rule applies now. Code leaves a container solely as `out.bundle`, verified and fetched into a gateway-owned quarantine repo in M3a.
 
+### First real Telegram run corrections (2026-11-23)
+
+- `telegram.Client.SendMessage` sets `parse_mode=HTML` unconditionally. Every caller must escape dynamic text; the renderer did, but `cmd/gateway/main.go` sent `/help`, `/status` and no-repo hints with raw `<repo>` / `<prompt>`, so Telegram rejected them with HTTP 400 and the poller replayed the same updates forever. Fixed with `html.EscapeString` at all call sites plus `cmd/gateway/main_test.go` (`httptest` stub asserting no raw placeholder on the wire).
+- Failed handlers now back off 2 s before replay. The cursor still advances only after success (at-least-once), but a permanently bad message no longer hot-loops.
+- Operator gotcha: the local M1 loop harness left `agent.telegram_state.last_update_id` at a fake timestamp above real Telegram update IDs, so real updates were skipped. Reset it to `0` when switching to the real bot; local-loop state should never share the production cursor row.
+
 ## Implementation Audit Corrections (2026-11-23)
 
 Independent static audit of the M0 file set found concrete defects; all P0/P1/P2 items were fixed before M1.

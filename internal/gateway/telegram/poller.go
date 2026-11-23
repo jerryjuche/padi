@@ -75,7 +75,14 @@ func (p *Poller) Run(ctx context.Context) error {
 				continue
 			}
 			if err := p.Handle(ctx, u); err != nil {
+				// Keep the cursor unchanged for at-least-once replay, but back
+				// off so a permanently bad message cannot spin the poller.
 				log.Printf("telegram handle update %d: %v", u.UpdateID, err)
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-time.After(2 * time.Second):
+				}
 				continue
 			}
 			last = u.UpdateID
