@@ -135,7 +135,7 @@ Roles were created **without passwords**; operator must set them from `/srv/agen
 | V14 Object Storage upload, boot-volume backups, external monitors | Requires bucket, instance principal, monitor accounts. |
 | `scripts/dbaccess_test.sh` against real Supabase | **DONE — PASS** on 14 tables (see §5). |
 | `restore-test.sh` against a real dump | Throwaway local DB validated the SQL, but no real nightly dump exists yet. |
-| SSH access to the ARM64 VM | Owner chose "Give me SSH access" but host/user/key path are not yet in `.env.local`. Needed for rootless OOM, backup, HTTPS and monitor checks. |
+| SSH access to the ARM64 VM | **Blocked — owner confirmed the VM is not ready yet (2026-11-23).** Owner chose "Give me SSH access", but no host/user/key are in `.env.local`. Needed for rootless OOM, backup, HTTPS and monitor checks. Do not start M1 until these pass or the owner explicitly accepts M0 with them deferred. |
 | HTTPS answers / VM reboot healthy | Requires `API_DOMAIN` and Caddy on the VM. |
 | OOM kill of 256 MB-limited container allocating 1 GB | Requires rootless VM; not run locally. |
 
@@ -154,11 +154,12 @@ Roles were created **without passwords**; operator must set them from `/srv/agen
 - **2026-11-23 (now)** — Implemented the full M0 file list. `go vet ./...` and `go test -race -count=1 ./...` pass. All 8 shell scripts pass `sh -n`. SQL migrations apply twice cleanly to a throwaway local PostgreSQL: 14 tables, all RLS on, telegram_state seeded, both roles created.
 - **2026-11-23 (connection check)** — Owner added `.env.local`. Added `.gitignore`, set mode 600. Live Supabase: REST anon test PASS (14/14 HTTP 404), direct psql PASS (role `postgres`), JWKS HTTP 200, `agent` schema absent. Owner pasted a masked secret key in chat; rotation advised.
 - **2026-11-23 (approved work)** — Owner approved applying migrations and web research. Applied `001`/`002` to the live project: 14 tables, all RLS on, telegram_state seeded, both roles created, anon re-check still 14/14 HTTP 404. Resolved V4/V6 with official docs, recorded V8 correction and Sources in `docs/decisions.md`. Web search tool returned HTTP 402, so official doc URLs were fetched directly. SSH details still not supplied.
+- **2026-11-23 (VM status)** — Owner reported the ARM64 VM is **not ready yet**. Paused all VM-side checks. Local + Supabase portions of M0 are complete; the milestone is not accepted.
 
 ## 10. Handoff instructions for the next session
 
 1. Read this file first, then `BUILD_SPEC.md` §2.4 M0 and §3.5B/§3.7.
-2. Do **not** start M1. M0 needs owner approval and the live checks in §7.
+2. Do **not** start M1. M0 needs owner approval and the live checks in §7. The VM is not ready as of 2026-11-23; wait for the owner to supply SSH details before attempting VM checks.
 3. If credentials/environment are provided: run `scripts/dbaccess_test.sh`, `scripts/restore-test.sh`, the rootless OOM test, and the HTTPS check; record results here and in `docs/decisions.md`; only then tick the M0 box in `BUILD_SPEC.md` §9.
 4. Keep everything on local `main`. **Never push.** Never put secrets in files or chat.
 5. On approval, M1 is next: `deploy/session/*`, minimal `cmd/gateway`, `internal/gateway/{telegram,opencode,runner,gitops,store}`, `config/gateway.yaml` — with the documented temporary M1 throwaway-key deviation recorded in `docs/decisions.md`.
