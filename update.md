@@ -9,7 +9,7 @@
 
 ## 1. Repository state
 
-- Branch: local `main`. `origin/main` is gone. **Nothing has been pushed.**
+- Branch: current `agent/m0-audit-fixes-b53482d` tracks `origin/agent/m0-audit-fixes-b53482d` and was pushed at `b53482d`. Local `main` still exists; `origin/main` is gone. **No default branch was pushed.**
 - Authoritative specs now on disk: `README.md` (v0.6, 150 KB), `BUILD_SPEC.md` (v1.2, 109 KB), `docs/decision-record-v2.md` (moved from repo root to the canonical path), `CONTRACT.md`, `docs/decisions.md`, `docs/runbooks.md`.
 - M0 files created per `BUILD_SPEC.md` §2.4 (see §4), plus `go.mod` (required to build the Go module; spec §1 explicitly permits a single root module).
 - `skills/` and `.github/workflows/ci.yml` were **deliberately not created** in M0 (see §2 decision 3).
@@ -27,7 +27,7 @@
 | 4 | Canonical skill script: **`scripts/skills-verify.sh`** wrapping `cmd/skills-verify` (M12). **`skills/install-vendor-skills.sh` must NOT be created.** `scripts/vendor-skill.sh` is optional and also deferred. |
 | 5 | Vendor GitHub skills **deferred to M12**; M0 creates only §2.4 M0 files. |
 | 6 | Live Supabase project exists. Credentials go in gitignored `.env.local` / `/srv/agent/secrets`; never pasted in chat or committed. |
-| 7 | Work stays on local `main`; **never push** to any remote or default branch. |
+| 7 | Work starts on local `main`; **never push** to a remote/default branch. Owner approved pushing an `agent/<slug>-<shortid>` branch after verification (2026-11-23). |
 
 ## 3. Hard rules carried forward (condensed from CONTRACT.md)
 
@@ -171,13 +171,14 @@ Independent static audit found 28 findings/gaps across Go, shell, SQL, spec evid
 - **2026-11-23 (V14 research + runbook)** — Fetched primary docs for rclone's native Oracle backend, OCI S3 compatibility, credentials, boot-volume backups and free monitor tiers. Resolved V14 in favour of rclone + instance principal (no keys on VM); recorded sources in `docs/decisions.md`. Added the ordered VM command checklist in §11. Found and fixed a defect: `scripts/rebuild.sh` required root but called `rootless-docker.sh`, which refuses root — it now invokes it via `runuser` as the source-tree owner.
 - **2026-11-23 (persistent output style)** — Installed the `i-have-adhd` skill globally at `~/.agents/skills/i-have-adhd` and registered the preference in `~/.config/opencode/AGENTS.md`. Applies to every project; off switch is "stop adhd mode" / "normal mode". User-level tooling only; no M0 file-list change.
 - **2026-11-23 (static audit + fixes)** — Independent audit found 4 P0 defects. Fixed all P0/P1/P2 items listed in §6a, reran `gofmt`, `go vet ./...` and `go test -race ./...` (green), reran `sh -n` on all 8 shell scripts, and reapplied SQL migrations twice to a throwaway Postgres (`14|14|2|0`). Applied `BYPASSRLS` to the two service roles live; anon still 14/14 HTTP 404. Produced a real Supabase dump with `postgres:17` `pg_dump` and passed `scripts/restore-test.sh` against it. M0 remains unaccepted only because VM-side checks are pending.
+- **2026-11-23 (approved push)** — Owner asked to push to a branch and selected `agent/m0-audit-fixes-b53482d`. Created that branch from `main` and pushed it to `origin` at `b53482d`. Default branch untouched. §11.2 now clones this branch on the VM instead of using rsync.
 
 ## 10. Handoff instructions for the next session
 
 1. Read this file first, then `BUILD_SPEC.md` §2.4 M0 and §3.5B/§3.7.
 2. Do **not** start M1. M0 needs owner approval and the live checks in §7. The VM is not ready as of 2026-11-23; wait for the owner to supply SSH details before attempting VM checks.
 3. If credentials/environment are provided: run `scripts/dbaccess_test.sh`, `scripts/restore-test.sh`, the rootless OOM test, and the HTTPS check; record results here and in `docs/decisions.md`; only then tick the M0 box in `BUILD_SPEC.md` §9.
-4. Keep everything on local `main`. **Never push.** Never put secrets in files or chat.
+4. Never push to `main` or any default branch. Only push approved `agent/*` branches after verification. Never put secrets in files or chat.
 5. On approval, M1 is next: `deploy/session/*`, minimal `cmd/gateway`, `internal/gateway/{telegram,opencode,runner,gitops,store}`, `config/gateway.yaml` — with the documented temporary M1 throwaway-key deviation recorded in `docs/decisions.md`.
 6. When the VM is ready, work through §11 in order. Do not skip the read-only recon in §11.1.
 
@@ -185,7 +186,7 @@ Independent static audit found 28 findings/gaps across Go, shell, SQL, spec evid
 
 ## 11. ARM64 VM command checklist (run in order)
 
-**Why this exists:** nothing has been pushed, so the VM cannot clone the repo from `origin`. The source tree must be copied from this machine (§11.2). Every step below is idempotent unless marked otherwise. Placeholders in `<ANGLE_BRACKETS>` are values the owner supplies; **no secret values belong in this file or in chat**.
+**Why this exists:** the approved review branch is pushed, so the VM can clone it from `origin` (§11.2) without copying local secrets. Every step below is idempotent unless marked otherwise. Placeholders in `<ANGLE_BRACKETS>` are values the owner supplies; **no secret values belong in this file or in chat**.
 
 ### 11.0 One-time console/account setup (owner, before SSH)
 
@@ -223,12 +224,14 @@ ssh -i "$AGENT_VM_KEY" -p "${AGENT_VM_PORT:-22}" -o BatchMode=yes \
 ```
 Expected: `ARCH=aarch64`, cgroup `cgroup2fs`, `docker`/`rclone` absent initially, owner user is **not** root.
 
-### 11.2 Copy the source tree (from this machine) and install prerequisites
+### 11.2 Clone the pushed review branch on the VM and install prerequisites
+
+The approved branch `agent/m0-audit-fixes-b53482d` now exists on `origin` at `b53482d`. Do **not** clone the default branch. On the VM, replace `<VM_USER>` with the non-root SSH user, then clone as that user so `rebuild.sh` can hand rootless Docker work back to it:
 
 ```sh
-# FROM THIS MACHINE — repo is local-only, not pushed:
-rsync -av --exclude '.env.local' \
-  ./ "$AGENT_VM_USER@$AGENT_VM_HOST:/srv/agent/src/"
+sudo install -d -o <VM_USER> -g <VM_USER> -m 755 /srv/agent
+sudo -u <VM_USER> git clone --branch agent/m0-audit-fixes-b53482d --single-branch \
+  https://github.com/jerryjuche/padi.git /srv/agent/src
 ```
 On the VM, as root:
 ```sh
