@@ -596,6 +596,8 @@ go run ./cmd/gateway
 
 Never paste a token or private key into chat, `config/gateway.yaml`, an image or git.
 
+Leave `TELEGRAM_API_BASE` and `PADI_MODEL_BASE_URL` **empty** unless you are pointing them at a local stub or proxy. The default Telegram API host is `https://api.telegram.org`; setting `TELEGRAM_API_BASE=https://telegram.org` (the website) breaks every Bot API call. `GITHUB_APP_PRIVATE_KEY_PATH` must point to a PEM **file** (mode 600), not a directory.
+
 ### 14.2 Telegram
 
 1. In Telegram, message **@BotFather** → `/newbot` → follow prompts → copy the token into `TELEGRAM_BOT_TOKEN`.
@@ -645,3 +647,41 @@ test -n "$TELEGRAM_BOT_TOKEN" && test -n "$TELEGRAM_ALLOWED_USER_ID" && echo tel
 test -n "$PADI_MODEL_API_KEY" && echo model-key-ok
 GOFLAGS=-mod=mod GOPROXY=off go vet ./... && GOFLAGS=-mod=mod GOPROXY=off go test -race -count=1 ./...
 ```
+
+---
+
+## 15. Live credential verification and gateway smoke test (owner-supplied values)
+
+Date: 2026-11-23. All checks used the real values in the owner's gitignored `.env.local`; no credential value is recorded here.
+
+### 15.1 Corrections made before testing
+
+- `TELEGRAM_API_BASE` was set to `https://telegram.org` (website). Cleared so the default `https://api.telegram.org` is used.
+- `PADI_MODEL_BASE_URL` was set to the NVIDIA endpoint already used by the provider. Cleared as a redundant override.
+- `GITHUB_APP_PRIVATE_KEY_PATH` pointed at a directory. Set to the actual downloaded PEM; the PEM mode was `664` and is now `600`.
+- `.env.local` remains mode `600` and gitignored. These are local operator fixes, not repository changes.
+
+### 15.2 Results
+
+| Check | Result |
+|---|---|
+| Telegram `getMe` | HTTP 200, `ok=true`, bot `@Padi_Ai_bot` |
+| Database | Direct `DATABASE_URL` connection OK |
+| NVIDIA key | HTTP 200 on `/v1/models`; 32 models returned, including `nvidia/nemotron-3.5-bolt-e4b` |
+| GitHub App | JWT → installation token minted by `gitops.MintInstallationToken`; `GET /installation/repositories` HTTP 200 with `jerryjuche/padi` accessible |
+| Real model through OpenCode | Prompt `Reply with exactly: M1 NVIDIA OK` returned exactly that text; SSE included `session.text.ended` and `session.execution.succeeded` |
+| Gateway smoke test | 22-second bounded run; log line `gateway: M1 spine ready (model=nvidia/nvidia/nemotron-3.5-bolt-e4b, network=agent-session-net)`; no poller or startup errors; exit `124` is the expected SIGTERM from `timeout` |
+
+The smoke test routed Telegram polling to a local stub that returned empty updates, so the two already-queued owner messages (`/start`, `Hi`) were **not** consumed. The stub logged 38 `getUpdates` calls, confirming the poller loop ran. No session containers were left behind (only the pre-existing `sabify-postgres`). No real task, push or PR was started.
+
+### 15.3 Running it for real
+
+The gateway is a long-running process; it is not started by these tests. To use it from Telegram:
+
+```sh
+cd /home/gamp/Desktop/padi
+set -a; . ./.env.local; set +a
+/tmp/opencode/padi-gateway
+```
+
+Then message the bot from the configured owner ID: `/status` or `/help` for help, or `clone <repo> and <prompt>` to start one M1 task. M1 still has no bundle, quarantine, push or PR stage; those land in M3a/M3b.
