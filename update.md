@@ -779,3 +779,9 @@ A local Telegram stub injected two owner messages while the real Supabase DB, Gi
 Result: both tasks reached `DONE`, both used the **same** `agent.sessions` row (`4fc78801-8d6d-4748-820d-b0c3876431af`), and the session recorded 4 `done`, 5 `status`, 16 `token`, 2 `tool_call` and 1 `tool_result` events. That confirms the follow-up reused the workspace and OpenCode conversation instead of starting a new task. The gateway stopped its session container cleanly at shutdown; only the pre-existing Postgres container remained. The shared Telegram cursor was restored to `374300401`, so no real queued update was consumed by the test.
 
 The earlier Bearer-extraheader attempt failed with git's anonymous username prompt; with `x-access-token:<token>` encoded as Basic auth, `git ls-remote https://github.com/jerryjuche/koder` succeeded and the two-turn clone passed. No credential value appears in command lines, logs, task failures or this record.
+
+### 16.9 Telegram no-op edit fix
+
+Live messages such as `hi`, `hello`, `why is this failing` and `3` were finishing their agent work but then failing with `telegram: editMessageText: HTTP 400 ... message is not modified`. Telegram returns this when the final text and reply markup are identical to the last streamed edit; the gateway was treating that benign no-op as a task failure.
+
+`telegram.Client` now treats Telegram's `message is not modified` response to `editMessageText` as success. The renderer also tracks the last text/keyboard it sent and skips redundant edits. A stub that deliberately returned the exact HTTP 400 for unchanged edits then ran the same two-turn real-provider flow: both tasks reached `DONE` in one session, with no gateway errors. `go vet ./...` and `go test -race -count=1 ./...` are green.

@@ -96,6 +96,9 @@ func (c *Client) call(ctx context.Context, method string, params url.Values, out
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if method == "editMessageText" && isMessageNotModified(body) {
+			return nil
+		}
 		return fmt.Errorf("telegram: %s: HTTP %d: %s", method, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	var envelope struct {
@@ -140,18 +143,40 @@ func (c *Client) SendMessageKeyboard(ctx context.Context, chatID int64, text str
 	params.Set("chat_id", strconv.FormatInt(chatID, 10))
 	params.Set("text", text)
 	params.Set("parse_mode", "HTML")
-	if len(rows) > 0 {
-		raw, err := json.Marshal(map[string]any{"inline_keyboard": rows})
-		if err != nil {
-			return 0, err
-		}
-		params.Set("reply_markup", string(raw))
+	if markup, err := keyboardJSON(rows); err != nil {
+		return 0, err
+	} else if markup != "" {
+		params.Set("reply_markup", markup)
 	}
 	var msg Message
 	if err := c.call(ctx, "sendMessage", params, &msg); err != nil {
 		return 0, err
 	}
 	return msg.MessageID, nil
+}
+
+// isMessageNotModified recognises Telegram's benign no-op edit response. It
+// happens when a streamed status is identical to the final text/keyboard, and
+// must not turn an otherwise successful task into a failure.
+func isMessageNotModified(body []byte) bool {
+	var envelope struct {
+		Description string `json:"description"`
+	}
+	if json.Unmarshal(body, &envelope) != nil {
+		return false
+	}
+	return strings.Contains(envelope.Description, "message is not modified")
+}
+
+func keyboardJSON(rows [][]InlineButton) (string, error) {
+	if len(rows) == 0 {
+		return "", nil
+	}
+	raw, err := json.Marshal(map[string]any{"inline_keyboard": rows})
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
 }
 
 // EditMessageText updates a message in place; used for streamed tokens.
@@ -166,12 +191,10 @@ func (c *Client) EditMessageTextKeyboard(ctx context.Context, chatID, messageID 
 	params.Set("message_id", strconv.FormatInt(messageID, 10))
 	params.Set("text", text)
 	params.Set("parse_mode", "HTML")
-	if len(rows) > 0 {
-		raw, err := json.Marshal(map[string]any{"inline_keyboard": rows})
-		if err != nil {
-			return err
-		}
-		params.Set("reply_markup", string(raw))
+	if markup, err := keyboardJSON(rows); err != nil {
+		return err
+	} else if markup != "" {
+		params.Set("reply_markup", markup)
 	}
 	return c.call(ctx, "editMessageText", params, nil)
 }

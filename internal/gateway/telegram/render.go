@@ -123,6 +123,23 @@ func (r *Renderer) RelayWithKeyboard(ctx context.Context, chatID int64, sessionI
 	}
 	r.record(ctx, sessionID, taskID, chatID, statusID)
 
+	lastText := html.EscapeString("Working...")
+	lastMarkup := ""
+	edit := func(text string, rows [][]InlineButton) error {
+		markup, err := keyboardJSON(rows)
+		if err != nil {
+			return err
+		}
+		if text == lastText && markup == lastMarkup {
+			return nil
+		}
+		if err := r.Client.EditMessageTextKeyboard(ctx, chatID, statusID, text, rows); err != nil {
+			return err
+		}
+		lastText, lastMarkup = text, markup
+		return nil
+	}
+
 	var answer strings.Builder
 	var status string
 	var lastEdit time.Time
@@ -135,7 +152,7 @@ func (r *Renderer) RelayWithKeyboard(ctx context.Context, chatID int64, sessionI
 		case "error":
 			if ev.Terminal {
 				message := Render(ev)
-				if editErr := r.Client.EditMessageText(ctx, chatID, statusID, html.EscapeString(message)); editErr != nil {
+				if editErr := edit(html.EscapeString(message), nil); editErr != nil {
 					return "", editErr
 				}
 				return "", fmt.Errorf("%s", message)
@@ -155,7 +172,7 @@ func (r *Renderer) RelayWithKeyboard(ctx context.Context, chatID int64, sessionI
 		} else if status != "" {
 			text = status
 		}
-		if err := r.Client.EditMessageText(ctx, chatID, statusID, html.EscapeString(truncate(text, r.maxChars()))); err != nil {
+		if err := edit(html.EscapeString(truncate(text, r.maxChars())), nil); err != nil {
 			return "", err
 		}
 		lastEdit = time.Now()
@@ -167,7 +184,7 @@ finish:
 		summary = "Task finished."
 	}
 	parts := Split(summary, r.maxChars())
-	if err := r.Client.EditMessageTextKeyboard(ctx, chatID, statusID, html.EscapeString(parts[0]), rows); err != nil {
+	if err := edit(html.EscapeString(parts[0]), rows); err != nil {
 		return "", err
 	}
 	for _, part := range parts[1:] {

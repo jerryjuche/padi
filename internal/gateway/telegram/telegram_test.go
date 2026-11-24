@@ -138,6 +138,18 @@ func TestSendMessageKeyboard(t *testing.T) {
 	}
 }
 
+func TestEditMessageTextNotModifiedIsNoOp(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"ok":false,"error_code":400,"description":"Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message"}`)
+	}))
+	defer srv.Close()
+	c := &Client{BaseURL: srv.URL, Token: "t", HTTP: srv.Client()}
+	if err := c.EditMessageText(context.Background(), 7, 1, "same"); err != nil {
+		t.Fatalf("benign edit returned %v", err)
+	}
+}
+
 func TestPollerAdvancesOnReportedError(t *testing.T) {
 	page := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -208,6 +220,35 @@ func TestRendererRelay(t *testing.T) {
 	defer mu.Unlock()
 	if len(calls) < 2 || !strings.Contains(calls[len(calls)-1], "done &lt;x&gt;") {
 		t.Fatalf("calls=%v", calls)
+	}
+}
+
+func TestRendererRelayTreatsNotModifiedAsNoOp(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/sendMessage") {
+			fmt.Fprint(w, `{"ok":true,"result":{"message_id":99}}`)
+			return
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"ok":false,"error_code":400,"description":"Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message"}`)
+	}))
+	defer srv.Close()
+	events := make(chan opencode.Event, 3)
+	events <- opencode.Event{Type: "status", Message: "same"}
+	events <- opencode.Event{Type: "token", Text: "same"}
+	events <- opencode.Event{Type: "done"}
+	close(events)
+	r := &Renderer{
+		Client:       &Client{BaseURL: srv.URL, Token: "t", HTTP: srv.Client()},
+		EditInterval: 0, MaxChars: 3800,
+	}
+	rows := [][]InlineButton{{{Text: "Build", CallbackData: "mode:build"}}}
+	summary, err := r.RelayWithKeyboard(context.Background(), 7, uuid.New(), nil, events, rows)
+	if err != nil {
+		t.Fatalf("RelayWithKeyboard returned %v", err)
+	}
+	if summary != "same" {
+		t.Fatalf("summary=%q", summary)
 	}
 }
 
