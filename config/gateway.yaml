@@ -1,4 +1,6 @@
-# M1 Spine gateway config. No secrets belong in this file.
+# Gateway config. No secrets belong in this file.
+policies_file: "config/policies.yaml"
+
 http:
   listen: ":8080"
   ui_origin: "http://localhost:5173"
@@ -46,3 +48,27 @@ git:
 
 store:
   dsn_env: "DATABASE_URL"
+
+approvals:
+  ttl: "30m"                     # pending push/PR and protected-path gates
+
+contract_defaults:
+  wall_minutes: 45
+  max_tokens: 400000
+  max_tool_calls: 200
+  max_files_changed: 40
+  max_fix_loops: 3
+  checkpoint_every_min: 10
+
+risk:
+  stale_days: 180
+  high_fix_density: 0.4
+  high_commits_90d: 3
+  high_change_size: 0.5
+  medium_change_size: 0.2
+  incident_medium: 1
+  incident_high: 2
+
+github:
+  api_url: "https://api.github.com"
+  default_draft: true            # owner can choose "ready" on the approval card

@@ -129,8 +129,8 @@ func TestButtonsAreTaskScoped(t *testing.T) {
 	}{
 		{"running", []string{"status", "new"}},
 		{"decision", []string{"exec:task-42", "a:task-42:revise", "new"}},
-		{"done", []string{"a:task-42:checks", "a:task-42:explain", "a:task-42:diff", "new"}},
-		{"failed", []string{"a:task-42:continue", "a:task-42:checks", "new"}},
+		{"done", []string{"a:task-42:checks", "a:task-42:explain", "a:task-42:diff", "undo:task-42:latest", "new"}},
+		{"failed", []string{"a:task-42:continue", "a:task-42:checks", "undo:task-42:latest", "new"}},
 		{"workspace", []string{"a:task-42:summary", "a:task-42:checks", "new"}},
 	}
 	for _, tc := range cases {
@@ -323,6 +323,69 @@ func TestModeCommandsAndCallbacks(t *testing.T) {
 	}
 	if !strings.Contains(texts[0], "plan mode on") || !strings.Contains(texts[1], "research mode on") || !strings.Contains(texts[2], "New topic") {
 		t.Fatalf("unexpected replies: %q", texts)
+	}
+}
+
+func TestCallbackButtonsEditInsteadOfStackingMessages(t *testing.T) {
+	var mu sync.Mutex
+	var sends, edits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		mu.Lock()
+		if strings.Contains(r.URL.Path, "editMessageText") {
+			edits++
+		} else if strings.Contains(r.URL.Path, "sendMessage") {
+			sends++
+		}
+		mu.Unlock()
+		fmt.Fprint(w, `{"ok":true,"result":{"message_id":1}}`)
+	}))
+	defer srv.Close()
+	a := &application{cfg: defaults(), tg: &telegram.Client{
+		BaseURL: srv.URL, Token: "test", HTTP: srv.Client(),
+	}, pending: map[int64]string{}, modes: map[int64]string{}, chats: map[int64]*chatSession{}}
+	q := &telegram.CallbackQuery{
+		ID: "cb-edit", From: telegram.User{ID: 42}, Data: "mode:research",
+		Message: &telegram.Message{MessageID: 77, Chat: telegram.Chat{ID: 42, Type: "private"}},
+	}
+	if err := a.handleUpdate(context.Background(), telegram.Update{CallbackQuery: q}); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if edits != 1 || sends != 0 {
+		t.Fatalf("button sent %d messages and made %d edits; want 0/1", sends, edits)
+	}
+	if a.currentMode(42) != modeResearch {
+		t.Fatalf("mode=%q want research", a.currentMode(42))
+	}
+}
+
+func TestUndoCallbackKeepsTaskScopedData(t *testing.T) {
+	var mu sync.Mutex
+	var texts []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		mu.Lock()
+		texts = append(texts, r.Form.Get("text"))
+		mu.Unlock()
+		fmt.Fprint(w, `{"ok":true,"result":{"message_id":1}}`)
+	}))
+	defer srv.Close()
+	chat := &chatSession{}
+	chat.setLastTask(taskRecord{ID: "task-42"})
+	chat.begin()
+	chat.end()
+	a := &application{cfg: defaults(), tg: &telegram.Client{
+		BaseURL: srv.URL, Token: "test", HTTP: srv.Client(),
+	}, pending: map[int64]string{}, modes: map[int64]string{}, chats: map[int64]*chatSession{42: chat}}
+	if err := a.undoCallback(context.Background(), 42, "undo:task-42:latest"); err != nil {
+		t.Fatalf("undoCallback: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(texts) != 1 || !strings.Contains(texts[0], "No live workspace") {
+		t.Fatalf("undo replies=%q, want one no-workspace reply", texts)
 	}
 }
 

@@ -1,0 +1,35 @@
+#!/bin/sh
+# Fixed container-side checkpoint command. Called only by contract.Checkpoint
+# and contract.Rollback with one of save|rollback and a validated integer.
+# It never receives user-controlled command text and never runs on the host.
+set -eu
+
+action="$1"
+n="$2"
+printf '%s' "$n" | grep -Eq '^[0-9]{1,6}$' || exit 2
+
+workdir="${PADI_CHECKPOINT_DIR:-/workspace}"
+git -c safe.directory="$workdir" -C "$workdir" rev-parse --verify HEAD >/dev/null
+
+case "$action" in
+  save)
+    export GIT_INDEX_FILE=/tmp/padi-checkpoint.idx
+    rm -f "$GIT_INDEX_FILE"
+    git -c safe.directory="$workdir" -C "$workdir" add -A
+    tree=$(git -c safe.directory="$workdir" -C "$workdir" write-tree)
+    commit=$(git -c safe.directory="$workdir" -C "$workdir" \
+      -c user.name=sandbox-agent -c user.email=noreply@sandbox.local \
+      commit-tree "$tree" -p HEAD -m "checkpoint $n")
+    git -c safe.directory="$workdir" -C "$workdir" \
+      update-ref "refs/agent/checkpoints/$n" "$commit"
+    printf '%s\n' "$commit"
+    ;;
+  rollback)
+    git -c safe.directory="$workdir" -C "$workdir" \
+      read-tree --reset -u "refs/agent/checkpoints/$n"
+    git -c safe.directory="$workdir" -C "$workdir" clean -fdq -e .agent
+    ;;
+  *)
+    exit 2
+    ;;
+esac

@@ -227,6 +227,28 @@ cap_over=101743081 result=accepted
 
 Conclusion: a ~96 MiB repo round-trips with byte-identical tree contents; the cap boundary is enforced by the same size check used in `ExportBundle` and `Quarantine`. V15 is fully resolved; no VM dependency remains.
 
+## M3b Trust implementation (2026-11-24)
+
+Approved deviations recorded before code:
+
+1. `sql/004_checkpoints.sql` is applied now and also adds `tasks.contract` and `tasks.budget_used`. The spec's `003_harness.sql` was already applied in M3a, so a second migration is the safe idempotent path.
+2. M10's confirmed incident log moves to `sql/005_incidents.sql`; M3b risk reads history-only signals from the quarantine repository and leaves incident input empty until M10.
+3. Trust composition lives in `internal/gateway/pipeline/` so the individual `contract`, `approvals`, `risk`, `guard` and `gitops` packages remain independently testable.
+4. `deploy/session/padi-checkpoint` plus an explicit `Dockerfile` install are part of accepted M3b scope because `contract.Checkpoint` invokes `/usr/local/bin/padi-checkpoint` inside the session container.
+5. `scripts/m3b-smoke.sh` is the hermetic end-to-end drill: local bare remote, fixed-script checkpoint rewind, real `agent-verify`, stub GitHub API, push/branch gates, contract/guard/risk/approval gates, and Telegram button/callback contracts. No live PR and no secrets are used.
+6. Telegram approval decisions use the `ap:` callback namespace; `undo:<task>:<n>` and `undo:<task>:latest` are task-scoped. This avoids collision with the M1 `a:<task>:<action>` quick actions and the legacy `act:` buttons.
+
+Verification evidence:
+
+- `psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/004_checkpoints.sql` is idempotent and leaves `agent.session_checkpoints` with RLS enabled, zero policies and `REVOKE ALL` from `anon, authenticated`.
+- `scripts/dbaccess_test.sh` passes for all 16 `agent` tables, including `egress_allow` and `session_checkpoints`.
+- `scripts/m3b-smoke.sh` ends with `PASS M3b smoke (no live PR, no secrets used)`.
+- `GOPROXY=off go vet ./...` and `GOPROXY=off go test -race -count=1 ./...` are green.
+- Session image rebuilt with both fixed scripts and `agent-verify`: `sandbox-agent-session:latest = sha256:6c745ef9dfbacd8fafa920139c67bbcee44293b946d2ce9b642e667980a410da`.
+- An independent audit found five trust gaps before acceptance; all five were fixed with regression tests: dual approvals no longer deadlock and no extra message is sent while the second gate is pending, a 100% budget aborts with a checkpoint, owner off-limits paths stop a task on `file_change`, contract approval uses `AWAITING_PLAN_APPROVAL`, and verifier output is cleared so a stale verdict or non-zero wait is `unverifiable`.
+
+Live PR remains deliberately unopened: the owner has not supplied a genuine Telegram decision for a target repository installation, and no approval is forged in code or tests.
+
 ## M0 VM-only deferral — owner Option B (2026-11-23)
 
 Local + Supabase M0 gates are complete and approved; the owner explicitly deferred the ARM64-VM-only checks until the Oracle ARM64 VM is provisioned. The `BUILD_SPEC.md` §9 M0 checkbox stays **unchecked** until these are executed and recorded:

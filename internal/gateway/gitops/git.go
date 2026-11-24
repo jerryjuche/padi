@@ -41,6 +41,13 @@ type Git struct {
 	VerifyDir     string
 	BundleMaxMB   int
 	HTTPClient    *http.Client
+
+	// APIURL is the GitHub REST base URL. Empty means gitHubAPI.
+	APIURL string
+	// DefaultDraft controls the draft flag used by OpenPR.
+	DefaultDraft bool
+	// tokenFunc is an optional test hook; nil means MintInstallationToken.
+	tokenFunc func(context.Context, string) (string, time.Time, error)
 }
 
 // MintInstallationToken exchanges GitHub App credentials for a 10-minute
@@ -243,6 +250,24 @@ func (g *Git) EnsureCache(ctx context.Context, repo string) (string, error) {
 		return "", fmt.Errorf("gitops: clone cache: %w", err)
 	}
 	return cache, nil
+}
+
+// BaseSHA returns the gateway-owned cache HEAD used as the bundle base. It is
+// read on the host from the cache, never from an agent-writable workspace.
+func (g *Git) BaseSHA(ctx context.Context, repo string) (string, error) {
+	if !validRepo(repo) {
+		return "", fmt.Errorf("%w: %q", ErrForbiddenRepo, repo)
+	}
+	cache := g.cachePath(repo)
+	out, err := Run(ctx, g.CacheDir, nil, "-C", cache, "rev-parse", "HEAD")
+	if err != nil {
+		return "", fmt.Errorf("gitops: base sha: %w", err)
+	}
+	sha := strings.TrimSpace(string(out))
+	if !shaPattern.MatchString(sha) {
+		return "", fmt.Errorf("gitops: invalid base sha %q", sha)
+	}
+	return sha, nil
 }
 
 // BranchName builds the single per-task branch pattern allowed by spec.

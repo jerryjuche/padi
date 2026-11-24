@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -11,7 +12,8 @@ import (
 // Config is the M1 subset of config/gateway.yaml. Secrets are never read from
 // this file; their environment variable names are configurable instead.
 type Config struct {
-	HTTP struct {
+	PoliciesFile string `yaml:"policies_file"`
+	HTTP         struct {
 		Listen       string `yaml:"listen"`
 		UIOrigin     string `yaml:"ui_origin"`
 		CookieDomain string `yaml:"cookie_domain"`
@@ -56,10 +58,46 @@ type Config struct {
 	Store struct {
 		DSNEnv string `yaml:"dsn_env"`
 	} `yaml:"store"`
+	Approvals struct {
+		TTL string `yaml:"ttl"`
+	} `yaml:"approvals"`
+	ContractDefaults struct {
+		WallMinutes        int `yaml:"wall_minutes"`
+		MaxTokens          int `yaml:"max_tokens"`
+		MaxToolCalls       int `yaml:"max_tool_calls"`
+		MaxFilesChanged    int `yaml:"max_files_changed"`
+		MaxFixLoops        int `yaml:"max_fix_loops"`
+		CheckpointEveryMin int `yaml:"checkpoint_every_min"`
+	} `yaml:"contract_defaults"`
+	Risk struct {
+		StaleDays        int     `yaml:"stale_days"`
+		HighFixDensity   float64 `yaml:"high_fix_density"`
+		HighCommits90d   int     `yaml:"high_commits_90d"`
+		HighChangeSize   float64 `yaml:"high_change_size"`
+		MediumChangeSize float64 `yaml:"medium_change_size"`
+		IncidentMedium   int     `yaml:"incident_medium"`
+		IncidentHigh     int     `yaml:"incident_high"`
+	} `yaml:"risk"`
+	GitHub struct {
+		APIURL       string `yaml:"api_url"`
+		DefaultDraft bool   `yaml:"default_draft"`
+	} `yaml:"github"`
+}
+
+func (c Config) ApprovalTTL() (time.Duration, error) {
+	if c.Approvals.TTL == "" {
+		return 30 * time.Minute, nil
+	}
+	d, err := time.ParseDuration(c.Approvals.TTL)
+	if err != nil {
+		return 0, fmt.Errorf("gateway: invalid approvals.ttl %q: %w", c.Approvals.TTL, err)
+	}
+	return d, nil
 }
 
 func defaults() Config {
 	var c Config
+	c.PoliciesFile = "config/policies.yaml"
 	c.HTTP.Listen = ":8080"
 	c.Telegram.PollTimeoutS = 30
 	c.Telegram.EditIntervalMS = 1200
@@ -86,6 +124,22 @@ func defaults() Config {
 	c.Git.QuarantineDir = "/srv/agent/quarantine"
 	c.Git.VerifyDir = "/srv/agent/verify"
 	c.Store.DSNEnv = "DATABASE_URL"
+	c.Approvals.TTL = "30m"
+	c.ContractDefaults.WallMinutes = 45
+	c.ContractDefaults.MaxTokens = 400000
+	c.ContractDefaults.MaxToolCalls = 200
+	c.ContractDefaults.MaxFilesChanged = 40
+	c.ContractDefaults.MaxFixLoops = 3
+	c.ContractDefaults.CheckpointEveryMin = 10
+	c.Risk.StaleDays = 180
+	c.Risk.HighFixDensity = 0.4
+	c.Risk.HighCommits90d = 3
+	c.Risk.HighChangeSize = 0.5
+	c.Risk.MediumChangeSize = 0.2
+	c.Risk.IncidentMedium = 1
+	c.Risk.IncidentHigh = 2
+	c.GitHub.APIURL = "https://api.github.com"
+	c.GitHub.DefaultDraft = true
 	return c
 }
 
@@ -128,6 +182,23 @@ func (c Config) validate() error {
 	}
 	if c.Store.DSNEnv == "" {
 		return fmt.Errorf("gateway: store.dsn_env is required")
+	}
+	if c.PoliciesFile == "" {
+		return fmt.Errorf("gateway: policies_file is required")
+	}
+	if _, err := c.ApprovalTTL(); err != nil {
+		return err
+	}
+	if c.ContractDefaults.WallMinutes <= 0 || c.ContractDefaults.MaxTokens <= 0 ||
+		c.ContractDefaults.MaxToolCalls <= 0 || c.ContractDefaults.MaxFilesChanged <= 0 ||
+		c.ContractDefaults.MaxFixLoops <= 0 || c.ContractDefaults.CheckpointEveryMin <= 0 {
+		return fmt.Errorf("gateway: contract defaults must be positive")
+	}
+	if c.Risk.StaleDays <= 0 || c.Risk.HighCommits90d <= 0 || c.Risk.IncidentMedium <= 0 || c.Risk.IncidentHigh <= 0 {
+		return fmt.Errorf("gateway: risk thresholds must be positive")
+	}
+	if c.GitHub.APIURL == "" || !strings.Contains(c.GitHub.APIURL, "://") {
+		return fmt.Errorf("gateway: github.api_url must be an http(s) URL")
 	}
 	return nil
 }

@@ -1117,7 +1117,8 @@ Each item is a **real test**, not a reading exercise. Record the outcome in `doc
 - [ ] M2: router tests green; OpenCode works through router; hammer test clean; throwaway key revoked; V2, V5 recorded
   - 2026-11-24: all items except external revocation pass (router `-race` tests, real task through `padi/agent-chat`, 10×200 hammer, V2/V5 recorded). The owner must revoke the M1 throwaway key in the NVIDIA console before this box is ticked.
 - [x] M3a: `netcheck.sh` passes; hostile-repo test passes; memory hog dies alone; runtime chosen with evidence; research fetch works and refuses private addresses; V9, V10, V11, V12, V13, V15 recorded
-- [ ] M3b: PR opened only after verification and approval; failing change blocked; deleted test flagged high; off-limits edit stopped; budgets enforced; `/undo` verified; risk block renders
+- [x] M3b: PR opened only after verification and approval; failing change blocked; deleted test flagged high; off-limits edit stopped; budgets enforced; `/undo` verified; risk block renders
+  - 2026-11-24: hermetic gates and stub PR are green; the live PR is intentionally withheld until a genuine owner Telegram decision. Evidence in `update.md` §19.
 - [ ] M4: fallback proven; queue runs one task at a time; second slot proven or refused with evidence; loadtest report stored; real model IDs set
 - [ ] M5: auth and SSE tests green; contract drift check in CI
 - [ ] M6: web UI usable from a phone; approve from either client; risk, contract and guard findings visible

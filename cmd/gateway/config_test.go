@@ -39,6 +39,21 @@ store:
 	if c.Store.DSNEnv != "MY_DSN" {
 		t.Fatalf("store cfg=%+v", c.Store)
 	}
+	if c.PoliciesFile != "config/policies.yaml" || c.ContractDefaults.WallMinutes != 45 || c.Risk.IncidentHigh != 2 {
+		t.Fatalf("m3b defaults missing: policies=%q contract=%+v risk=%+v", c.PoliciesFile, c.ContractDefaults, c.Risk)
+	}
+	ttl, err := c.ApprovalTTL()
+	if err != nil || ttl.String() != "30m0s" {
+		t.Fatalf("approval ttl=%v err=%v", ttl, err)
+	}
+}
+
+func TestValidateRejectsBadApprovalTTL(t *testing.T) {
+	c := defaults()
+	c.Approvals.TTL = "soon"
+	if err := c.validate(); err == nil {
+		t.Fatal("expected invalid TTL error")
+	}
 }
 
 func TestValidateRejectsConcurrency(t *testing.T) {

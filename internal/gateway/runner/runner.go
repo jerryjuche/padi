@@ -6,6 +6,8 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -141,12 +143,33 @@ func (r *Runner) hardenedSpec(spec ContainerSpec) ContainerSpec {
 // StartVerify starts a fresh, short-lived container on a quarantine checkout.
 // It never runs in the agent's container and is removed by the caller on exit.
 func (r *Runner) StartVerify(ctx context.Context, taskID, checkoutDir string) (Handle, error) {
+	return r.StartVerifyWithOutput(ctx, taskID, checkoutDir, "")
+}
+
+// StartVerifyWithOutput is the M3b form: the verifier writes its JSON verdict
+// to a gateway-owned directory outside the read-only checkout. The output bind
+// is writable only to the short-lived verify container.
+func (r *Runner) StartVerifyWithOutput(ctx context.Context, taskID, checkoutDir, outputDir string) (Handle, error) {
 	if taskID == "" || strings.ContainsAny(taskID, "/\\..") || checkoutDir == "" {
 		return Handle{}, fmt.Errorf("runner: invalid verify request %q / %q", taskID, checkoutDir)
 	}
 	if err := r.Docker.EnsureNetwork(ctx, r.Cfg.Network, r.Cfg.InternalNetwork); err != nil {
 		return Handle{}, err
 	}
+	binds := []string{checkoutDir + ":/workspace:ro"}
+	cmd := []string{"--format", "json", "--timeout", "10m"}
+	if outputDir != "" {
+		clean := filepath.Clean(outputDir)
+		if !filepath.IsAbs(clean) || clean == "/" || strings.Contains(clean, "..") {
+			return Handle{}, fmt.Errorf("runner: unsafe verify output directory %q", outputDir)
+		}
+		if err := os.MkdirAll(clean, 0o700); err != nil {
+			return Handle{}, err
+		}
+		binds = append(binds, clean+":/tmp/padi-out:rw")
+		cmd = append(cmd, "--output", "/tmp/padi-out/verdict.json")
+	}
+	cmd = append(cmd, "/workspace")
 	spec := r.hardenedSpec(ContainerSpec{
 		Name:  "padi-verify-" + taskID,
 		Image: r.Cfg.Image,
@@ -155,7 +178,7 @@ func (r *Runner) StartVerify(ctx context.Context, taskID, checkoutDir string) (H
 			"PADI_TASK_ID=" + taskID, "TASK_ID=" + taskID, "HOME=/home/agent",
 			"GOCACHE=/tmp/go-build", "GOMODCACHE=/tmp/go-mod", "XDG_CACHE_HOME=/tmp/cache",
 		},
-		Binds:    []string{checkoutDir + ":/workspace:ro"},
+		Binds:    binds,
 		Network:  r.Cfg.Network,
 		MemoryMB: r.Cfg.MemoryMB, CPUs: r.Cfg.CPUs, Pids: r.Cfg.Pids,
 		ExposePort: "4097/tcp",
@@ -165,7 +188,7 @@ func (r *Runner) StartVerify(ctx context.Context, taskID, checkoutDir string) (H
 			"padi_role":     "verify",
 		},
 		Entrypoint: []string{"/usr/local/bin/agent-verify"},
-		Cmd:        []string{"--format", "json", "--timeout", "10m", "/workspace"},
+		Cmd:        cmd,
 	})
 	id, err := r.Docker.Create(ctx, spec)
 	if err != nil {

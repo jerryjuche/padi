@@ -1,0 +1,67 @@
+# M3b gateway policy. No secrets belong here.
+# Lockfiles changed without a matching manifest are an approval trigger. This
+# is the mandatory CONTRACT.md §3.1 reconciliation, encoded as pairs so the
+# check is mechanical in internal/gateway/{contract,approvals}.
+protected_paths:
+  - ".github/workflows/**"
+  - "Dockerfile*"
+  - "docker-compose*"
+  - ".env*"
+  - "**/secrets/**"
+  - "AGENTS.md"
+  - "LICENSE"
+  - "go.sum"
+  - "package-lock.json"
+  - "pnpm-lock.yaml"
+  - "yarn.lock"
+  - "Cargo.lock"
+  - "poetry.lock"
+
+lockfile_pairs:
+  go.sum: go.mod
+  package-lock.json: package.json
+  pnpm-lock.yaml: package.json
+  yarn.lock: package.json
+  Cargo.lock: Cargo.toml
+  poetry.lock: pyproject.toml
+
+sensitive_tags:
+  auth:
+    - "**/auth/**"
+    - "**/login*"
+    - "**/session*"
+  payments:
+    - "**/payment*/**"
+    - "**/billing/**"
+  migrations:
+    - "**/migrations/**"
+    - "**/*.sql"
+  config:
+    - "**/config/**"
+    - "**/*.yaml"
+    - "**/*.toml"
+
+test_patterns:
+  - "*_test.go"
+  - "*.test.*"
+  - "*.spec.*"
+  - "test_*.py"
+  - "tests/**"
+  - "__tests__/**"
+
+actions:
+  task_contract: ask
+  plan_new_app: ask
+  edit_protected_path: ask
+  delete_dir_or_many: ask
+  push_branch: ask
+  open_pr: ask
+  start_preview: ask
+  new_domain: ask
+  web_research: auto
+  install_dependency: auto
+  log_incident: ask
+  browser_interactive: ask
+  routine_contract: auto_readonly
+  credential_use: ask
+  touch_default_branch: deny

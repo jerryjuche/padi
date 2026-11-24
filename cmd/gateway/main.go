@@ -16,8 +16,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jerryjuche/padi/internal/gateway/approvals"
+	"github.com/jerryjuche/padi/internal/gateway/contract"
 	"github.com/jerryjuche/padi/internal/gateway/gitops"
 	"github.com/jerryjuche/padi/internal/gateway/opencode"
+	"github.com/jerryjuche/padi/internal/gateway/pipeline"
+	"github.com/jerryjuche/padi/internal/gateway/risk"
 	"github.com/jerryjuche/padi/internal/gateway/runner"
 	"github.com/jerryjuche/padi/internal/gateway/store"
 	"github.com/jerryjuche/padi/internal/gateway/telegram"
@@ -31,7 +35,7 @@ const (
 
 	// chatStyle is prepended to every agent prompt so replies read like a
 	// conversational collaborator, not a tool transcript or a generic menu.
-	chatStyle = "Reply in 2-4 short sentences: the answer, what you verified, then one concrete next step tied to this request. Never re-ask a settled question; use what you already learned in this conversation. Ask a question only when a file-changing choice is genuinely blocked, and offer concrete options when you do. If a next step needs approval, end with exactly one line `PROPOSAL: <goal; files; steps; risk>`; the owner will get an Execute button carrying that exact plan. Never mention tool parameter names such as oldString, newString or replaceAll. M1 cannot push or open a PR: say so once, then finish the local work. Keep replies under 600 characters.\n\n"
+	chatStyle = "Reply in 2-4 short sentences: the answer, what you verified, then one concrete next step tied to this request. Never re-ask a settled question; use what you already learned in this conversation. Ask a question only when a file-changing choice is genuinely blocked, and offer concrete options when you do. If a next step needs approval, end with exactly one line `PROPOSAL: <goal; files; steps; risk>`; the owner will get an Execute button carrying that exact plan. Never mention tool parameter names such as oldString, newString or replaceAll. Publishing and pull requests happen only after verification and owner approval; finish the local work first. Keep replies under 600 characters.\n\n"
 )
 
 var userFacingSecret = regexp.MustCompile(`(?i)(authorization:\s*bearer\s+)\S+|(?i)(authorization:\s*basic\s+)[A-Za-z0-9+/=]+|\b(?:ghs|gho|ghu|ghr|github_pat)_[A-Za-z0-9_]+\b|\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b`)
@@ -66,6 +70,17 @@ func run() error {
 	if err := db.Migrate(ctx); err != nil {
 		return err
 	}
+	policy, err := approvals.Load(cfg.PoliciesFile)
+	if err != nil {
+		return err
+	}
+	approvalTTL, err := cfg.ApprovalTTL()
+	if err != nil {
+		return err
+	}
+	approvalManager := &approvals.Manager{
+		Policy: policy, Store: db, TTL: approvalTTL, OwnerID: 0,
+	}
 
 	botToken, err := secretFromEnv("TELEGRAM_BOT_TOKEN", "Telegram bot token")
 	if err != nil {
@@ -79,6 +94,7 @@ func run() error {
 	if _, err := fmt.Sscan(ownerRaw, &ownerID); err != nil || ownerID <= 0 {
 		return fmt.Errorf("gateway: Telegram owner ID must be a positive integer")
 	}
+	approvalManager.OwnerID = ownerID
 	// M2: the only credential that reaches a session container is the router
 	// token. Provider keys stay with the router on the host.
 	routerToken, err := secretFromEnv(cfg.OpenCode.RouterTokenEnv, "router token")
@@ -111,8 +127,17 @@ func run() error {
 	git := &gitops.Git{
 		CacheDir: cfg.Git.CacheDir, WorkspacesDir: cfg.Git.WorkspacesDir,
 		QuarantineDir: cfg.Git.QuarantineDir, VerifyDir: cfg.Git.VerifyDir,
-		BundleMaxMB: cfg.Container.BundleMaxMB,
+		BundleMaxMB:  cfg.Container.BundleMaxMB,
+		APIURL:       cfg.GitHub.APIURL,
+		DefaultDraft: cfg.GitHub.DefaultDraft,
 	}
+	analyzer := risk.New(risk.Thresholds{
+		StaleDays: cfg.Risk.StaleDays, HighFixDensity: cfg.Risk.HighFixDensity,
+		HighCommits90d: cfg.Risk.HighCommits90d, HighChangeSize: cfg.Risk.HighChangeSize,
+		MediumChangeSize: cfg.Risk.MediumChangeSize, IncidentMedium: cfg.Risk.IncidentMedium,
+		IncidentHigh: cfg.Risk.IncidentHigh,
+	})
+	trust := newTrustPipeline(cfg, approvalManager, db, r, git, analyzer)
 	tg := &telegram.Client{
 		BaseURL:     os.Getenv("TELEGRAM_API_BASE"),
 		Token:       botToken,
@@ -130,11 +155,24 @@ func run() error {
 
 	app := &application{
 		cfg: cfg, db: db, runner: r, git: git, tg: tg, renderer: renderer,
-		pending: make(map[int64]string),
-		modes:   make(map[int64]string),
-		chats:   make(map[int64]*chatSession),
-		actions: make(map[string]time.Time),
+		policy: policy, approvals: approvalManager, pipeline: trust,
+		risk:             analyzer,
+		protection:       protectionFromPolicy(policy),
+		contractDefaults: contractDefaultsFromConfig(cfg),
+		checkpointEvery:  time.Duration(cfg.ContractDefaults.CheckpointEveryMin) * time.Minute,
+		pending:          make(map[int64]string),
+		modes:            make(map[int64]string),
+		chats:            make(map[int64]*chatSession),
+		actions:          make(map[string]time.Time),
+		resumes:          make(map[uuid.UUID]resumeTask),
+		proposals:        make(map[uuid.UUID]pipeline.Proposal),
+		budgets:          make(map[uuid.UUID]contract.Budget),
+		budgetStop:       make(map[uuid.UUID]bool),
+		checkpoints:      make(map[uuid.UUID]int),
+		publishing:       make(map[uuid.UUID]bool),
+		waits:            make(map[uuid.UUID]chan bool),
 	}
+	go approvalManager.ExpireLoop(ctx)
 	poller := &telegram.Poller{
 		Client:  tg,
 		Store:   db,
@@ -306,6 +344,16 @@ type application struct {
 	tg       *telegram.Client
 	renderer *telegram.Renderer
 
+	// M3b trust path. policy is the strict policy file; approvals is the gate;
+	// pipeline composes export, quarantine, verify, guard, risk and publish.
+	policy           *approvals.Policy
+	approvals        *approvals.Manager
+	pipeline         *pipeline.Service
+	risk             *risk.Analyzer
+	protection       contract.Protection
+	contractDefaults contract.Budget
+	checkpointEvery  time.Duration
+
 	// pending remembers a repo chosen by "clone <repo>" for the next message.
 	// modes is a sticky build/plan/research choice per chat.
 	mu      sync.Mutex
@@ -316,6 +364,16 @@ type application struct {
 	// actions de-duplicates button taps. A second tap on the same task-scoped
 	// action returns the already running task instead of creating a duplicate.
 	actions map[string]time.Time
+
+	// M3b per-task state used to resume after owner decisions and to avoid
+	// publishing from a duplicate callback.
+	resumes     map[uuid.UUID]resumeTask
+	proposals   map[uuid.UUID]pipeline.Proposal
+	budgets     map[uuid.UUID]contract.Budget
+	budgetStop  map[uuid.UUID]bool
+	checkpoints map[uuid.UUID]int
+	publishing  map[uuid.UUID]bool
+	waits       map[uuid.UUID]chan bool
 }
 
 // markAction records a tap and returns false when the same action was already
@@ -340,10 +398,12 @@ func (a *application) markAction(key string) bool {
 	return true
 }
 
-func (a *application) event(ctx context.Context, sessionID uuid.UUID, taskID *uuid.UUID, typ string, data any) {
+func (a *application) event(ctx context.Context, sessionID uuid.UUID, taskID *uuid.UUID, typ string, data any) bool {
+	exceeded := a.trackUsage(taskID, typ, data)
 	if _, err := a.db.AppendEvent(ctx, sessionID, taskID, typ, data); err != nil {
 		log.Printf("gateway: append event %s: %v", typ, scrubForUser(err))
 	}
+	return exceeded
 }
 
 // command is the parsed form of one owner message.
@@ -560,6 +620,8 @@ func (a *application) handleUpdate(ctx context.Context, u telegram.Update) error
 		return a.help(ctx, chatID)
 	case strings.HasPrefix(text, "/status"):
 		return a.status(ctx, chatID)
+	case strings.HasPrefix(text, "/undo"):
+		return a.undo(ctx, chatID, strings.TrimSpace(strings.TrimPrefix(text, "/undo")))
 	case strings.HasPrefix(text, "/new"):
 		a.closeChat(chatID)
 		a.forgetRepo(chatID)
@@ -633,16 +695,18 @@ func (a *application) handleCallback(ctx context.Context, q *telegram.CallbackQu
 			chat.mode = mode
 			chat.mu.Unlock()
 		}
-		return a.replyKeyboard(ctx, chatID, mode+" mode on. Tell me what you want me to "+modeVerb(mode)+".", a.buttonsForChat(chatID))
+		return a.replyToCallback(ctx, q, mode+" mode on. Tell me what you want me to "+modeVerb(mode)+".", a.buttonsForChat(chatID))
 	case data == "new":
 		a.closeChat(chatID)
 		a.forgetRepo(chatID)
 		a.rememberMode(chatID, modeBuild)
-		return a.replyKeyboard(ctx, chatID, "New topic. Tell me what you'd like to work on, or send clone <repo> to open a repository.", contextButtons("empty", ""))
+		return a.replyToCallback(ctx, q, "New topic. Tell me what you'd like to work on, or send clone <repo> to open a repository.", contextButtons("empty", ""))
 	case data == "status":
-		return a.status(ctx, chatID)
+		return a.replyToCallback(ctx, q, a.statusText(chatID), a.buttonsForChat(chatID))
 	case data == "help":
-		return a.help(ctx, chatID)
+		return a.replyToCallback(ctx, q, a.helpText(), a.buttonsForChat(chatID))
+	case strings.HasPrefix(data, "ap:"):
+		return a.handleApprovalCallback(ctx, chatID, q, data)
 	case strings.HasPrefix(data, "exec:"):
 		taskID := strings.TrimPrefix(data, "exec:")
 		chat := a.getChat(chatID)
@@ -659,6 +723,8 @@ func (a *application) handleCallback(ctx context.Context, q *telegram.CallbackQu
 		chat.setProposal(nil)
 		repo, _, _, _, _ := chat.detail()
 		return a.startTask(ctx, chatID, command{repo: repo, prompt: p.Prompt}, "exec:"+taskID, false)
+	case strings.HasPrefix(data, "undo:"):
+		return a.undoCallback(ctx, chatID, data)
 	case strings.HasPrefix(data, "a:"):
 		parts := strings.Split(data, ":")
 		if len(parts) != 3 {
@@ -716,8 +782,8 @@ func (a *application) runAction(ctx context.Context, chatID int64, taskID, actio
 	return a.startTask(ctx, chatID, command{repo: repo, prompt: prompt}, "cb:"+taskID+":"+action, false)
 }
 
-func (a *application) help(ctx context.Context, chatID int64) error {
-	text := "Padi chat\n\n" +
+func (a *application) helpText() string {
+	return "Padi chat\n\n" +
 		"Just write naturally. I keep the repository and conversation open between messages, so you can ask follow-ups or ask me to clarify anything.\n\n" +
 		"Commands:\n" +
 		"• clone <repo> — open a GitHub repo (URLs work)\n" +
@@ -725,12 +791,16 @@ func (a *application) help(ctx context.Context, chatID int64) error {
 		"• /plan — investigate and propose a plan before editing\n" +
 		"• /research — read, search and report; no edits\n" +
 		"• /status — show the active workspace\n" +
+		"• /undo [n] — restore a saved checkpoint\n" +
 		"• /new — close this workspace and start fresh\n\n" +
 		"Buttons offer next steps for this conversation. Use /build, /plan or /research when you want to switch mode."
-	return a.replyKeyboard(ctx, chatID, text, a.buttonsForChat(chatID))
 }
 
-func (a *application) status(ctx context.Context, chatID int64) error {
+func (a *application) help(ctx context.Context, chatID int64) error {
+	return a.replyKeyboard(ctx, chatID, a.helpText(), a.buttonsForChat(chatID))
+}
+
+func (a *application) statusText(chatID int64) string {
 	chat := a.getChat(chatID)
 	text := "No active workspace. Send a request, or clone <repo> to open a repository."
 	if chat != nil {
@@ -742,7 +812,25 @@ func (a *application) status(ctx context.Context, chatID int64) error {
 		text = fmt.Sprintf("Workspace: %s\nMode: %s\nState: %s\nSession: %s\nLast used: %s ago",
 			repo, mode, state, sessionID.String(), time.Since(last).Round(time.Second))
 	}
-	return a.replyKeyboard(ctx, chatID, text, a.buttonsForChat(chatID))
+	return text
+}
+
+func (a *application) status(ctx context.Context, chatID int64) error {
+	return a.replyKeyboard(ctx, chatID, a.statusText(chatID), a.buttonsForChat(chatID))
+}
+
+// replyToCallback edits the tapped message when Telegram supplied a message ID,
+// so a button press does not stack another card in the chat. Stubbed callbacks
+// in tests have no message ID and fall back to a normal reply.
+func (a *application) replyToCallback(ctx context.Context, q *telegram.CallbackQuery, text string, rows [][]telegram.InlineButton) error {
+	if q != nil && q.Message != nil && q.Message.MessageID != 0 {
+		return a.tg.EditMessageTextKeyboard(ctx, q.Message.Chat.ID, q.Message.MessageID, html.EscapeString(text), rows)
+	}
+	chatID := int64(0)
+	if q != nil && q.Message != nil {
+		chatID = q.Message.Chat.ID
+	}
+	return a.replyKeyboard(ctx, chatID, text, rows)
 }
 
 // startTask creates the audit task and either opens a fresh workspace or reuses
@@ -777,15 +865,30 @@ func (a *application) startTask(ctx context.Context, chatID int64, c command, ke
 		session = created
 	}
 
+	// A replayed callback or polled update must never start a second agent run.
+	// CreateTask is idempotent, but the existing row is only visible after the
+	// insert; check first so a live task is left untouched.
+	if existing, err := a.db.GetTaskByKey(ctx, key); err == nil {
+		if existing.State == store.StateDone || existing.State == store.StateFailed ||
+			existing.State == store.StateCancelled || existing.State == store.StateTimedOut {
+			return a.reply(ctx, chatID, "I already handled that message.")
+		}
+		return a.reply(ctx, chatID, "That message is already being handled.")
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return a.reportError(ctx, chatID, err)
+	}
 	task, err := a.db.CreateTask(ctx, store.NewTask{
 		SessionID: session.ID, Repo: c.repo, Prompt: c.prompt, IdempotencyKey: key,
 	})
 	if err != nil {
 		return a.reportError(ctx, chatID, err)
 	}
-	if task.State == store.StateDone || task.State == store.StateFailed {
-		return a.reply(ctx, chatID, "I already handled that message.")
+	a.mu.Lock()
+	if a.budgets == nil {
+		a.budgets = make(map[uuid.UUID]contract.Budget)
 	}
+	a.budgets[task.ID] = a.contractDefaults
+	a.mu.Unlock()
 	// Capture the previous task before this one becomes current; it is injected
 	// into the agent prompt so follow-ups do not re-open settled questions.
 	var priorContext string
@@ -795,6 +898,18 @@ func (a *application) startTask(ctx context.Context, chatID int64, c command, ke
 	a.event(ctx, session.ID, &task.ID, "status", map[string]string{"state": "QUEUED", "mode": mode})
 	if err := a.db.Transition(ctx, task.ID, store.StateQueued, store.StatePreparing, ""); err != nil {
 		return a.reportError(ctx, chatID, err)
+	}
+
+	agreed := contract.Draft(c.prompt, contract.RepoSettings{}, a.budgetFor(task.ID), contractOverrides(c.prompt))
+	if err := a.db.SaveTaskContract(ctx, task.ID, agreed); err != nil {
+		return a.reportError(ctx, chatID, err)
+	}
+	accepted, err := a.contractGate(ctx, session, task, chatID, agreed)
+	if err != nil {
+		return a.reportError(ctx, chatID, err)
+	}
+	if !accepted {
+		return nil
 	}
 
 	taskCtx, taskCancel := context.WithTimeout(ctx, 20*time.Minute)
@@ -829,8 +944,14 @@ func (a *application) startTask(ctx context.Context, chatID int64, c command, ke
 			oc: oc, ocSession: ocSession, lastUsed: time.Now(), busy: true,
 			state: "running", lastTask: taskRecord{ID: task.ID.String(), Prompt: c.prompt, Outcome: "running"},
 		}
+		task.Branch = branch
+		if err := a.db.SetTaskBranch(taskCtx, task.ID, branch); err != nil {
+			log.Printf("gateway: record branch task %s: %s", task.ID, scrubForUser(err))
+		}
 		a.putChat(chatID, chat)
-		a.reply(taskCtx, chatID, "Working in "+c.repo+"...")
+		if _, err := a.checkpoint(taskCtx, task.ID, session.ID, handle.ID); err != nil {
+			log.Printf("gateway: baseline checkpoint task %s: %s", task.ID, scrubForUser(err))
+		}
 	} else if !chat.begin() {
 		return a.reply(ctx, chatID, "I'm still working on the previous message. I'll pick this up next.")
 	} else {
@@ -840,14 +961,42 @@ func (a *application) startTask(ctx context.Context, chatID int64, c command, ke
 	}
 	defer chat.end()
 
-	if err := a.db.Transition(taskCtx, task.ID, store.StatePreparing, store.StateExecuting, ""); err != nil {
+	if err := a.beginExecution(taskCtx, task.ID); err != nil {
 		return a.reportError(ctx, chatID, err)
 	}
+	stopCheckpoints := a.checkpointLoop(taskCtx, task.ID, session.ID, chat.handle.ID)
 	summary, err := a.runTask(taskCtx, chat, session, task, chatID, c.prompt, mode, priorContext)
+	stopCheckpoints()
 	if err != nil {
+		if errors.Is(err, errBudgetExceeded) || errors.Is(err, errOffLimits) {
+			if _, cpErr := a.checkpoint(taskCtx, task.ID, session.ID, chat.handle.ID); cpErr != nil {
+				log.Printf("gateway: abort checkpoint task %s: %s", task.ID, scrubForUser(cpErr))
+			}
+			a.closeChat(chatID)
+		}
+		a.clearBudgetStop(task.ID)
 		a.fail(taskCtx, session, task, chatID, err)
 		return nil
 	}
+	a.clearBudgetStop(task.ID)
+	if _, err := a.checkpoint(taskCtx, task.ID, session.ID, chat.handle.ID); err != nil {
+		log.Printf("gateway: final checkpoint task %s: %s", task.ID, scrubForUser(err))
+	}
+
+	// Publish only build-mode work that actually changed files. Chat replies,
+	// research and plans finish locally; they never create approval cards.
+	if mode == modeBuild && a.hasWorkspaceChanges(taskCtx, chat.handle.ID) {
+		if err := a.publishTask(taskCtx, chat, session, task, chatID, c.prompt); err != nil {
+			a.fail(taskCtx, session, task, chatID, err)
+			return nil
+		}
+		chat.setState("awaiting_approval")
+		chat.setLastTask(taskRecord{ID: task.ID.String(), Prompt: c.prompt, Outcome: "awaiting approval", Evidence: summary})
+		chat.setProposal(nil)
+		a.event(taskCtx, session.ID, &task.ID, "status", map[string]string{"state": "AWAITING_PUSH_APPROVAL"})
+		return nil
+	}
+
 	if err := a.db.Transition(taskCtx, task.ID, store.StateExecuting, store.StateDone, ""); err != nil {
 		return a.reportError(ctx, chatID, err)
 	}
@@ -865,6 +1014,27 @@ func (a *application) startTask(ctx context.Context, chatID int64, c command, ke
 	return nil
 }
 
+// beginExecution starts the agent from whichever state the contract gate
+// left behind. Auto-approved tasks stay PREPARING; owner-approved contracts
+// pass through AWAITING_PLAN_APPROVAL.
+func (a *application) beginExecution(ctx context.Context, taskID uuid.UUID) error {
+	if a == nil || a.db == nil {
+		return errors.New("gateway: store is not configured")
+	}
+	current, err := a.db.GetTask(ctx, taskID)
+	if err != nil {
+		return err
+	}
+	switch current.State {
+	case store.StateAwaitingPlanApproval:
+		return a.db.Transition(ctx, taskID, store.StateAwaitingPlanApproval, store.StateExecuting, "")
+	case store.StatePreparing:
+		return a.db.Transition(ctx, taskID, store.StatePreparing, store.StateExecuting, "")
+	default:
+		return fmt.Errorf("%w: %s -> %s", store.ErrBadState, current.State, store.StateExecuting)
+	}
+}
+
 func (a *application) runTask(ctx context.Context, chat *chatSession, session store.Session, task store.Task, chatID int64, prompt, mode, priorContext string) (string, error) {
 	feedCtx, feedCancel := context.WithCancel(ctx)
 	defer feedCancel()
@@ -873,8 +1043,16 @@ func (a *application) runTask(ctx context.Context, chat *chatSession, session st
 		return "", err
 	}
 	normalized := make(chan opencode.Event, 128)
+	abortHit := make(chan error, 1)
 	go func() {
 		defer close(normalized)
+		signalAbort := func(cause error) {
+			select {
+			case abortHit <- cause:
+			default:
+			}
+			feedCancel()
+		}
 		for raw := range rawEvents {
 			ev, ok := opencode.Translate(raw)
 			if !ok {
@@ -883,9 +1061,18 @@ func (a *application) runTask(ctx context.Context, chat *chatSession, session st
 			if ev.SessionID != "" && ev.SessionID != chat.ocSession {
 				continue
 			}
-			a.event(feedCtx, session.ID, &task.ID, ev.Type, map[string]string{
+			if a.event(feedCtx, session.ID, &task.ID, ev.Type, map[string]string{
 				"text": ev.Text, "tool": ev.Tool, "message": ev.Message,
-			})
+			}) {
+				signalAbort(errBudgetExceeded)
+				return
+			}
+			if ev.Type == "file_change" {
+				if violation := a.contractViolation(feedCtx, task.ID, ev.Text); violation != nil {
+					signalAbort(violation)
+					return
+				}
+			}
 			select {
 			case normalized <- ev:
 			case <-feedCtx.Done():
@@ -905,6 +1092,11 @@ func (a *application) runTask(ctx context.Context, chat *chatSession, session st
 		return "", err
 	}
 	summary, err := a.renderer.RelayWithKeyboard(ctx, chatID, session.ID, &task.ID, normalized, contextButtons("done", task.ID.String()))
+	select {
+	case cause := <-abortHit:
+		return "", cause
+	default:
+	}
 	if err != nil {
 		return "", err
 	}
@@ -1086,14 +1278,20 @@ func contextButtons(kind, taskID string) [][]telegram.InlineButton {
 		return telegram.InlineButton{Text: label, CallbackData: "a:" + taskID + ":" + action}
 	}
 	switch kind {
-	case "running":
+	case "running", "awaiting_approval":
 		return [][]telegram.InlineButton{{{Text: "Status", CallbackData: "status"}, {Text: "New topic", CallbackData: "new"}}}
 	case "decision":
 		return [][]telegram.InlineButton{{{Text: "Execute", CallbackData: "exec:" + taskID}, act("Revise", "revise"), {Text: "New topic", CallbackData: "new"}}}
 	case "done":
-		return [][]telegram.InlineButton{{act("Run checks", "checks"), act("Explain this", "explain"), act("Show diff", "diff")}, {{Text: "New topic", CallbackData: "new"}}}
+		return [][]telegram.InlineButton{
+			{act("Run checks", "checks"), act("Explain this", "explain"), act("Show diff", "diff")},
+			{{Text: "Undo last", CallbackData: "undo:" + taskID + ":latest"}, {Text: "New topic", CallbackData: "new"}},
+		}
 	case "failed":
-		return [][]telegram.InlineButton{{act("Continue locally", "continue"), act("Run checks", "checks")}, {{Text: "New topic", CallbackData: "new"}}}
+		return [][]telegram.InlineButton{
+			{act("Continue locally", "continue"), act("Run checks", "checks"), {Text: "Undo last", CallbackData: "undo:" + taskID + ":latest"}},
+			{{Text: "New topic", CallbackData: "new"}},
+		}
 	default:
 		return [][]telegram.InlineButton{{act("Summarize", "summary"), act("Run checks", "checks")}, {{Text: "New topic", CallbackData: "new"}}}
 	}

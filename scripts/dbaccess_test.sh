@@ -7,7 +7,7 @@ set -eu
 : "${SUPABASE_ANON_KEY:?set SUPABASE_ANON_KEY to the project anon key}"
 
 base="${SUPABASE_URL%/}/rest/v1"
-tables="sessions repos tasks events approvals login_tokens web_sessions telegram_state telegram_messages system_flags llm_usage audit_log provider_keys risk_cache"
+tables="sessions repos tasks events approvals login_tokens web_sessions telegram_state telegram_messages system_flags llm_usage audit_log provider_keys risk_cache egress_allow session_checkpoints"
 failed=0
 
 for table in $tables; do

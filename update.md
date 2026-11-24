@@ -980,7 +980,7 @@ count of tasks.kind/contract/budget_used = 3
 ### Open items
 
 - V9 rootless Docker cgroup delegation and V10 gVisor on arm64 remain pending until the ARM VM (owner Option B).
-- V15 large-repository bundle cap timing remains M3b; the small round trip and a 1 MB cap test are green.
+- V15 large-repository bundle cap timing was resolved in M3b; the small round trip and a 1 MB cap test are green.
 - The gateway currently has no HTTP/UI listener; if one is added, gate it from the session network before exposure (comment recorded in `deploy/docker-compose.yml`).
 - M2 box stays unticked until the owner revokes the M1 NVIDIA throwaway key in the NVIDIA console.
 - M4 must wire the full router alias set (`agent-build`, `agent-plan`, `agent-small`, `agent-vision`, `agent-embed`) with unverified IDs left as `<placeholder>` and disabled.
@@ -988,3 +988,91 @@ count of tasks.kind/contract/budget_used = 3
 ### Next
 
 Awaiting the owner's go-ahead for M4 Router v2 / agent-eval.
+
+---
+
+## 19. M3b Trust report (`BUILD_SPEC.md` §2.5)
+
+### Done
+
+- Added `config/policies.yaml` and `internal/gateway/approvals`: strict action decisions, protected paths, lockfile pairs, sensitive tags, expiry, short-ID lookup, audit-safe decisions and the `ap:` Telegram callback namespace.
+- Added `internal/gateway/contract`: contract drafting, four countable budgets, 80% warning and 100% abort, fixed-script checkpoint save/rewind.
+- Added `internal/gateway/risk`: churn, co-change and author-history signals computed strictly from the gateway quarantine repository through `gitexec.Run`; never from `workspaces/*/repo`.
+- Added `internal/verify/guard` and `internal/gateway/pipeline`: verifier verdict handling, test-tampering findings, risk card, approval requests, two-gate publish release and blocked-publish downgrade.
+- Hardened `gitops.PushAgentBranch` and added `gitops.OpenPRDraft`: `agent/` prefix required, `main`, `master` and the cache default branch rejected before any git call, and GitHub App auth passed only through `GIT_CONFIG_KEY_0` / `GIT_CONFIG_VALUE_0` with no credential in argv.
+- Added `sql/004_checkpoints.sql`, `store` methods for approvals, checkpoints, contracts, branch and PR URL; applied it to Supabase and extended `scripts/dbaccess_test.sh` to 16 tables.
+- Added `deploy/session/padi-checkpoint` and rebuilt `sandbox-agent-session:latest` so both fixed scripts and `agent-verify` are executable in the session image.
+- Fixed the reported Telegram repetition: replaced the stale live binary with one process, made button callbacks edit the tapped message, removed the duplicate "Working in …" send, made task creation replay-safe with `GetTaskByKey`, and added task-scoped `Show diff` and `Undo last` actions.
+- Added `scripts/m3b-smoke.sh`: local bare remote, checkpoint save/rollback, real verifier pass/fail, stub GitHub API, branch push gate, contract/guard/risk/approval gates and Telegram callback contracts.
+- Closed the post-implementation audit findings: both push/PR approvals are required before the single publish, resumes survive a pending second tap, a pending-gate notice edits the same approval card, 100% budgets abort the run with a checkpoint, owner off-limits paths stop the task on a `file_change`, contract approval uses `AWAITING_PLAN_APPROVAL`, and verifier output is cleared with any non-zero wait treated as `unverifiable`.
+
+### Evidence
+
+```
+$ gofmt -l cmd internal
+(no output)
+
+$ GOPROXY=off go vet ./...
+(no output)
+
+$ GOPROXY=off go test -race -count=1 ./...
+ok  github.com/jerryjuche/padi/cmd/gateway            1.107s
+ok  github.com/jerryjuche/padi/internal/gateway/...   (all ok)
+ok  github.com/jerryjuche/padi/internal/verify/...    (all ok)
+(all other packages ok)
+
+$ scripts/m3b-smoke.sh
+m3b-smoke: local bare remote accepts agent/* and retains main
+m3b-smoke: checkpoint save/rollback restores the expected tree
+m3b-smoke: real verification emits pass and fail verdicts
+m3b-smoke: stub GitHub API and branch push gate passed
+m3b-smoke: contract, guard, risk, approval and expiry gates passed
+m3b-smoke: task-scoped buttons, callback dedupe and trust regressions passed
+m3b-smoke: PASS M3b smoke (no live PR, no secrets used)
+```
+
+Audit regression tests in `cmd/gateway/m3b_test.go`: `TestContractOverridesAndHardViolation`, `TestTrackUsageSignalsBudgetAbort`, `TestReadVerifyVerdictRejectsNonZeroExit`, `TestMaybePublishKeepsResumeUntilBothGates`. `internal/gateway/store/store_test.go` covers the `AWAITING_PLAN_APPROVAL` transitions.
+
+```
+$ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f sql/004_checkpoints.sql
+NOTICE: relation "session_checkpoints" already exists, skipping
+NOTICE: relation "session_checkpoints_task_n_idx" already exists, skipping
+NOTICE: relation "session_checkpoints_session_idx" already exists, skipping
+
+$ sh scripts/dbaccess_test.sh
+PASS  session_checkpoints    HTTP 404 (no exposure)
+dbaccess_test: anon key cannot read any agent table (16 checked)
+```
+
+```
+$ docker image inspect sandbox-agent-session:latest --format '{{.Id}}'
+sha256:6c745ef9dfbacd8fafa920139c67bbcee44293b946d2ce9b642e667980a410da
+
+$ docker run --rm --entrypoint sh sandbox-agent-session:latest -c '...'
+image_fixed_scripts=ok
+```
+
+```
+old_pid=381913 stopped=yes new_pid=387722
+live gateway count: 1
+2026/11/24 18:23:14 gateway: ready (model=padi/agent-chat, network=agent-session-net)
+```
+
+### Deviations
+
+- `sql/004_checkpoints.sql` is used instead of putting M3b DDL into the already-applied `003_harness.sql`; the migration is idempotent.
+- M10 incident rows move to the planned `sql/005_incidents.sql`; M3b risk uses history-only signals and an empty incident set.
+- Trust composition lives in `internal/gateway/pipeline/` so each gate package stays independently testable.
+- `deploy/session/padi-checkpoint` plus an explicit `Dockerfile` install are in scope because the contract code calls `/usr/local/bin/padi-checkpoint`.
+- The local live gateway keeps `/tmp/opencode/padi-agent` paths and the existing plain bridge because this host has no `egress-proxy` service or `/srv/agent` tree; the deployable `config/gateway.yaml` still uses the internal network and proxy.
+
+### Open items
+
+- No live PR was opened: a genuine owner Telegram decision and target repository installation are required, and no approval was forged in code, tests or the local run.
+- V10 arm64/rootless/gVisor verification remains pending the owner-provisioned ARM VM.
+- The M2 checkbox stays unticked until the owner revokes the M1 NVIDIA throwaway key.
+- M10 incident confirmation and `005_incidents.sql` remain for their milestone.
+
+### Next
+
+Owner decision on a real push/PR target if a live PR is wanted now; otherwise proceed to M4 only after the owner's go-ahead.

@@ -1683,6 +1683,7 @@ Internal session network, `egress-proxy` (build allowlist, SSRF guard, research 
 ### Phase 3b: Trust (M3b)
 Task contract and budget enforcement, checkpoints and `/undo`, `agent-verify` in a fresh container, test-tampering guard, approvals (Telegram buttons), git-history risk card, push and PR from quarantine, audit log, full state machine.
 **Accept:** a real PR opens only after verification and approval; a deliberately failing change is blocked; a deleted test is flagged high risk; an off-limits edit is stopped; the risk block renders; no secret exists in the container.
+**Implementation status (2026-11-24):** the trust gates, contract, checkpoints, `/undo`, risk card, approval buttons and quarantine push/PR adapters are built and hermetically verified; the live PR is intentionally left for a genuine owner decision. Evidence is in `update.md` §19.
 
 ### Phase 4: Router hardening, queue and capacity (M4)
 Circuit breakers, cooldown handling, queue with one-task-at-a-time admission, memory admission with the keepalive credit, load test for a second slot, agent-eval benchmark that chooses real model IDs.

@@ -25,6 +25,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("agent-verify", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	format := fs.String("format", "json", "output format: json, text or markdown")
+	outputPath := fs.String("output", "", "optional host-visible file for the JSON verdict")
 	diffPath := fs.String("diff", "", "optional path to a unified diff for the tampering guard")
 	timeout := fs.Duration("timeout", 0, "total verification timeout (default 10m)")
 	if err := fs.Parse(args); err != nil {
@@ -71,11 +72,21 @@ func run(args []string, stdout, stderr io.Writer) int {
 			Steps:    verdict.Steps,
 			Findings: findings,
 		}
-		enc := json.NewEncoder(stdout)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(out); err != nil {
+		payload, err := json.MarshalIndent(out, "", "  ")
+		if err != nil {
 			fmt.Fprintf(stderr, "agent-verify: encode verdict: %v\n", err)
 			return 2
+		}
+		payload = append(payload, '\n')
+		if _, err := stdout.Write(payload); err != nil {
+			fmt.Fprintf(stderr, "agent-verify: write verdict: %v\n", err)
+			return 2
+		}
+		if *outputPath != "" {
+			if err := os.WriteFile(*outputPath, payload, 0o600); err != nil {
+				fmt.Fprintf(stderr, "agent-verify: write output: %v\n", err)
+				return 2
+			}
 		}
 	case "text":
 		fmt.Fprint(stdout, report.RenderText(verdict, findings))

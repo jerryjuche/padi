@@ -35,8 +35,9 @@ COPY deploy/session/opencode.base.json /opt/agent/opencode.base.json
 COPY deploy/session/AGENTS.target.md /opt/agent/AGENTS.target.md
 COPY deploy/session/entrypoint.sh /entrypoint.sh
 COPY deploy/session/padi-export-bundle /usr/local/bin/padi-export-bundle
+COPY deploy/session/padi-checkpoint /usr/local/bin/padi-checkpoint
 COPY --from=verifybuild /agent-verify /usr/local/bin/agent-verify
-RUN chmod 755 /entrypoint.sh /usr/local/bin/padi-export-bundle /usr/local/bin/agent-verify \
+RUN chmod 755 /entrypoint.sh /usr/local/bin/padi-export-bundle /usr/local/bin/padi-checkpoint /usr/local/bin/agent-verify \
     && chown -R agent:agent /opt/agent /entrypoint.sh
 
 USER agent

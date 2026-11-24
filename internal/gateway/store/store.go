@@ -20,13 +20,43 @@ import (
 type State string
 
 const (
-	StateQueued    State = "QUEUED"
-	StatePreparing State = "PREPARING"
-	StateExecuting State = "EXECUTING"
-	StateDone      State = "DONE"
-	StateFailed    State = "FAILED"
-	StateCancelled State = "CANCELLED"
+	StateQueued               State = "QUEUED"
+	StatePreparing            State = "PREPARING"
+	StatePlanning             State = "PLANNING"
+	StateAwaitingPlanApproval State = "AWAITING_PLAN_APPROVAL"
+	StateExecuting            State = "EXECUTING"
+	StateVerifying            State = "VERIFYING"
+	StateFixing               State = "FIXING"
+	StateAwaitingPushApproval State = "AWAITING_PUSH_APPROVAL"
+	StatePushing              State = "PUSHING"
+	StatePROpened             State = "PR_OPENED"
+	StatePreviewing           State = "PREVIEWING"
+	StateDone                 State = "DONE"
+	StateFailed               State = "FAILED"
+	StateCancelled            State = "CANCELLED"
+	StateTimedOut             State = "TIMED_OUT"
 )
+
+// terminalStates are fixed by BUILD_SPEC.md §5.1. No transition may leave one.
+var terminalStates = map[State]bool{
+	StateDone: true, StateFailed: true, StateCancelled: true, StateTimedOut: true,
+}
+
+var allowedTransitions = map[State]map[State]bool{
+	StateQueued:               {StatePreparing: true, StateCancelled: true},
+	StatePreparing:            {StatePlanning: true, StateAwaitingPlanApproval: true, StateExecuting: true, StateFailed: true, StateCancelled: true},
+	StatePlanning:             {StateAwaitingPlanApproval: true, StateExecuting: true, StateFailed: true, StateCancelled: true, StateTimedOut: true},
+	StateAwaitingPlanApproval: {StateExecuting: true, StateCancelled: true, StateTimedOut: true},
+	// Direct EXECUTING -> DONE is retained for read-only M1 plan/research and
+	// quick-action tasks that never enter the publish pipeline.
+	StateExecuting:            {StateVerifying: true, StateDone: true, StateFailed: true, StateCancelled: true, StateTimedOut: true},
+	StateVerifying:            {StateAwaitingPushApproval: true, StateFixing: true, StateFailed: true, StateCancelled: true, StateTimedOut: true},
+	StateFixing:               {StateExecuting: true, StateFailed: true},
+	StateAwaitingPushApproval: {StatePushing: true, StateExecuting: true, StateCancelled: true, StateTimedOut: true},
+	StatePushing:              {StatePROpened: true, StateFailed: true},
+	StatePROpened:             {StatePreviewing: true, StateDone: true},
+	StatePreviewing:           {StateDone: true, StateFailed: true},
+}
 
 var (
 	ErrStaleState  = errors.New("stale task state")
@@ -268,6 +298,16 @@ func (p *PG) GetTask(ctx context.Context, taskID uuid.UUID) (Task, error) {
 	return p.taskBy(ctx, "id", taskID)
 }
 
+// GetTaskByKey returns the task previously created with an idempotency key.
+// It lets the gateway recognise a replayed Telegram update before touching the
+// agent again. ErrNotFound means the key has not been used.
+func (p *PG) GetTaskByKey(ctx context.Context, key string) (Task, error) {
+	if key == "" {
+		return Task{}, ErrIDakeyEmpty
+	}
+	return p.taskBy(ctx, "idempotency_key", key)
+}
+
 func (p *PG) taskBy(ctx context.Context, column string, value any) (Task, error) {
 	query := `select id, session_id, coalesce(repo,''), coalesce(branch,''), state,
 		coalesce(fail_reason,''), prompt, created_at, finished_at
@@ -295,16 +335,10 @@ func nullable(s string) any {
 
 // ValidTransition is pure so it can be table-tested without a database.
 func ValidTransition(from, to State) bool {
-	switch from {
-	case StateQueued:
-		return to == StatePreparing || to == StateCancelled
-	case StatePreparing:
-		return to == StateExecuting || to == StateFailed || to == StateCancelled
-	case StateExecuting:
-		return to == StateDone || to == StateFailed || to == StateCancelled
-	default:
+	if terminalStates[from] {
 		return false
 	}
+	return allowedTransitions[from][to]
 }
 
 func (p *PG) Transition(ctx context.Context, taskID uuid.UUID, from, to State, reason string) error {

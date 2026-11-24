@@ -39,6 +39,17 @@ func (g *Git) quarantinePath(repo, branch string) string {
 	return filepath.Join(g.quarantineRoot(), fmt.Sprintf("%x", sum[:12])+".git")
 }
 
+// IsSafeDir gates host-side git helpers: only an absolute gateway-owned path
+// without traversal or NUL bytes may be used. Callers still restrict it to
+// quarantine or cache paths; this is the shared shape check.
+func IsSafeDir(dir string) bool {
+	if dir == "" || !filepath.IsAbs(dir) || strings.ContainsAny(dir, "\x00\r\n") {
+		return false
+	}
+	clean := filepath.Clean(dir)
+	return clean != "/" && !strings.Contains(clean, "..")
+}
+
 // Quarantine verifies a bundle and fetches exactly one validated branch into a
 // gateway-owned bare repository. All git invocations use gitexec.Run with
 // hooks disabled and object checking enabled; the agent workspace is untouched.
