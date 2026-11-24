@@ -66,6 +66,26 @@ func (c *Client) client() *http.Client {
 	return &http.Client{Timeout: time.Duration(c.PollSeconds+10) * time.Second}
 }
 
+// redactedError hides the bot token that net/http embeds in transport errors
+// while keeping the original error unwrap-able for errors.Is.
+type redactedError struct {
+	err   error
+	token string
+}
+
+func (e *redactedError) Error() string {
+	if e.token == "" {
+		return e.err.Error()
+	}
+	return strings.ReplaceAll(e.err.Error(), e.token, "<redacted>")
+}
+
+func (e *redactedError) Unwrap() error { return e.err }
+
+func (c *Client) redact(err error) error {
+	return &redactedError{err: err, token: c.Token}
+}
+
 func (c *Client) call(ctx context.Context, method string, params url.Values, out any) error {
 	base := strings.TrimRight(c.BaseURL, "/")
 	if base == "" {
@@ -77,7 +97,7 @@ func (c *Client) call(ctx context.Context, method string, params url.Values, out
 	if len(params) > 0 {
 		req, err = http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(params.Encode()))
 		if err != nil {
-			return err
+			return c.redact(err)
 		}
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	} else {
@@ -88,7 +108,7 @@ func (c *Client) call(ctx context.Context, method string, params url.Values, out
 	}
 	resp, err := c.client().Do(req)
 	if err != nil {
-		return fmt.Errorf("telegram: %s: %w", method, err)
+		return fmt.Errorf("telegram: %s: %w", method, c.redact(err))
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))

@@ -111,19 +111,25 @@ func TestModesAndButtons(t *testing.T) {
 	if !validMode(modeResearch) || validMode("nonsense") {
 		t.Fatal("validMode is wrong")
 	}
-	rows := chatButtons(modePlan)
-	want := map[string]bool{"mode:build": false, "mode:plan": false, "mode:research": false, "act:summary": false, "status": false, "new": false}
-	for _, row := range rows {
-		for _, b := range row {
-			if _, ok := want[b.CallbackData]; ok {
-				want[b.CallbackData] = true
+	want := map[string][]string{
+		"empty":     {"help", "status"},
+		"workspace": {"act:summary", "act:checks", "new"},
+		"done":      {"act:explain", "act:checks", "new"},
+		"failed":    {"act:continue", "status", "new"},
+	}
+	for kind, expected := range want {
+		rows := contextButtons(kind)
+		if len(rows) != 1 || len(rows[0]) != len(expected) {
+			t.Fatalf("%s rows=%v", kind, rows)
+		}
+		for i, b := range rows[0] {
+			if b.CallbackData != expected[i] {
+				t.Errorf("%s button %d=%q want %q", kind, i, b.CallbackData, expected[i])
 			}
 		}
 	}
-	for data, seen := range want {
-		if !seen {
-			t.Errorf("missing button %q", data)
-		}
+	if !strings.Contains(modePrompt(modeBuild, "check auth"), chatStyle) {
+		t.Fatal("build prompt is missing the chat style contract")
 	}
 }
 

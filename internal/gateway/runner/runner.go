@@ -12,16 +12,15 @@ import (
 
 // Config is supplied from config/gateway.yaml plus environment-only secrets.
 type Config struct {
-	Image        string
-	Network      string
-	MemoryMB     int
-	CPUs         float64
-	Pids         int
-	Model        string
-	ModelKeyEnv  string // name of the env key OpenCode expects, e.g. OPENAI_API_KEY
-	ModelKey     string // value read from the host environment at runtime
-	ModelBaseURL string // optional local fake provider for the spike
-	TaskIDHeader string // optional per-provider header value source
+	Image         string
+	Network       string
+	MemoryMB      int
+	CPUs          float64
+	Pids          int
+	Model         string
+	RouterToken   string // only credential passed to the session container
+	RouterBaseURL string // OpenAI-compatible router endpoint, always /v1
+	TaskIDHeader  string // optional per-provider header value source
 }
 
 // Handle is the live container plus the address/password of its OpenCode API.
@@ -51,7 +50,8 @@ func randomPassword() (string, error) {
 }
 
 // Start clones no code itself: workDir is the gateway-owned independent clone.
-// The model key is passed only as a process environment variable.
+// The router token is the only secret passed into the container, as a process
+// environment variable; provider keys never leave the router host.
 func (r *Runner) Start(ctx context.Context, taskID, workDir string) (Handle, error) {
 	if taskID == "" || strings.ContainsAny(taskID, "/\\..") {
 		return Handle{}, fmt.Errorf("runner: invalid task id %q", taskID)
@@ -67,10 +67,10 @@ func (r *Runner) Start(ctx context.Context, taskID, workDir string) (Handle, err
 		"OPENCODE_PASSWORD=" + password,
 		"PADI_TASK_ID=" + taskID,
 		"PADI_MODEL=" + r.Cfg.Model,
-		"PADI_MODEL_BASE_URL=" + r.Cfg.ModelBaseURL,
+		"PADI_MODEL_BASE_URL=" + r.Cfg.RouterBaseURL,
 	}
-	if r.Cfg.ModelKeyEnv != "" && r.Cfg.ModelKey != "" {
-		env = append(env, r.Cfg.ModelKeyEnv+"="+r.Cfg.ModelKey)
+	if r.Cfg.RouterToken != "" {
+		env = append(env, "ROUTER_TOKEN="+r.Cfg.RouterToken)
 	}
 	spec := ContainerSpec{
 		Name:       "padi-task-" + taskID,

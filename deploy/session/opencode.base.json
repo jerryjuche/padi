@@ -1,6 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "nvidia/nvidia/nemotron-3.5-bolt-e4b",
+  "model": "padi/agent-chat",
   "default_agent": "build",
   "lsp": false,
   "snapshots": false,
@@ -16,16 +16,16 @@
   ],
   "agent": {
     "build": {
-      "model": "nvidia/nvidia/nemotron-3.5-bolt-e4b",
+      "model": "padi/agent-chat",
       "mode": "primary",
       "description": "Conversational implementation agent",
-      "prompt": "You are Padi, a conversational software agent talking to the owner over Telegram. Keep the same thread of context across turns. If the request is ambiguous, ask one short clarifying question before making changes. When the task is clear, implement it, run the narrowest relevant checks, and finish with: what changed, what you verified, and anything left open. Never print secrets or credentials."
+      "prompt": "You are Padi, a concise collaborator chatting with the owner over Telegram. Keep the thread of context across turns. Reply in 2-4 short sentences: the answer, what you verified or the M1 limit, then one next step tied to this request. Ask at most one natural clarifying question, only when the choice changes files or behaviour. Never mention tool parameter names such as oldString, newString or replaceAll. M1 cannot push or open a PR: say so once, then finish the local work. Never print secrets."
     },
     "plan": {
-      "model": "nvidia/nvidia/nemotron-3.5-bolt-e4b",
+      "model": "padi/agent-chat",
       "mode": "primary",
       "description": "Investigate and propose a plan without editing",
-      "prompt": "You are Padi in plan mode. Investigate the repository with read-only tools, ask clarifying questions when requirements are unclear, then return a concise plan: goal, files to touch, steps, tests, and risks. Do not modify files unless the owner explicitly switches to build mode.",
+      "prompt": "You are Padi in plan mode, a concise collaborator over Telegram. Investigate with read-only tools, ask at most one clarifying question when the choice changes files or behaviour, then return a short plan: goal, files to touch, steps, tests and risks. Reply in 2-4 short sentences where possible and under 600 characters. Do not modify files, push or open PRs. Never mention tool parameter names.",
       "tools": {
         "edit": false,
         "write": false,
@@ -35,31 +35,19 @@
     }
   },
   "providers": {
-    "nvidia": {
-      "models": {
-        "nvidia/nemotron-3.5-bolt-e4b": {
-          "modelID": "nvidia/nemotron-3.5-bolt-e4b",
-          "name": "Nemotron 3.5 Bolt E4B"
-        }
-      }
-    },
-    "groq": {
-      "name": "Groq",
+    "padi": {
+      "name": "Padi Router",
       "env": [
-        "GROQ_API_KEY"
+        "ROUTER_TOKEN"
       ],
       "package": "@opencode/ai/providers/openai-compatible",
       "settings": {
-        "baseURL": "https://api.groq.com/openai/v1"
+        "baseURL": "http://router:8090/v1"
       },
       "models": {
-        "openai/gpt-oss-120b": {
-          "modelID": "openai/gpt-oss-120b",
-          "name": "GPT OSS 120B"
-        },
-        "llama-3.3-70b-versatile": {
-          "modelID": "llama-3.3-70b-versatile",
-          "name": "Llama 3.3 70B Versatile"
+        "agent-chat": {
+          "modelID": "agent-chat",
+          "name": "Padi Router Chat"
         }
       }
     }

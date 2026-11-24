@@ -58,7 +58,7 @@ func TestStartWaitStop(t *testing.T) {
 	r := New(docker, Config{
 		Image: "session:latest", Network: "agent-session-net", MemoryMB: 2560,
 		CPUs: 1, Pids: 512, Model: "openai/gpt-5-nano",
-		ModelKeyEnv: "OPENAI_API_KEY", ModelKey: "throwaway",
+		RouterToken: "router-only-token", RouterBaseURL: "http://router:8090/v1",
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -79,9 +79,14 @@ func TestStartWaitStop(t *testing.T) {
 	}
 	env := create["Env"].([]any)
 	joined := fmt.Sprint(env)
-	for _, want := range []string{"OPENAI_API_KEY=throwaway", "PADI_TASK_ID=task-0001", "OPENCODE_PASSWORD="} {
+	for _, want := range []string{"ROUTER_TOKEN=router-only-token", "PADI_MODEL_BASE_URL=http://router:8090/v1", "PADI_TASK_ID=task-0001", "OPENCODE_PASSWORD="} {
 		if !bytes.Contains([]byte(joined), []byte(want)) {
 			t.Fatalf("env missing %q: %v", want, env)
+		}
+	}
+	for _, forbidden := range []string{"NVIDIA_API_KEY=", "GROQ_API_KEY=", "PADI_MODEL_API_KEY="} {
+		if bytes.Contains([]byte(joined), []byte(forbidden)) {
+			t.Fatalf("direct provider key leaked into container env: %v", env)
 		}
 	}
 	if code, err := r.Wait(ctx, h.ID); err != nil || code != 0 {

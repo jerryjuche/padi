@@ -17,10 +17,10 @@ Authoritative summary lives in `README.md` §17 and `BUILD_SPEC.md` §8[cite: 2,
 | # | Target | Milestone | Status | Date | Evidence |
 |---|---|---|---|---|---|
 | V1 | OpenCode `serve` endpoints, event names, auth options, per-message model override | M1, M7 | Resolved (model override is **per-session**, not per-message) | 2026-11-23 | Real binary `opencode v2.4.0`. `opencode serve --help` flags: `--hostname`, `--port`, `--cors`, `--service`, `--stdio` (no auth flag). Live `/openapi.json`: `POST /api/session`, `POST /api/session/{id}/prompt` (body requires `text`; **no `model` field**), `GET /api/event` (`text/event-stream`, frames `{event,data}`, types include `session.text.delta`, `session.idle`, `session.execution.*`, `permission.asked`), `GET /api/session/{id}/message`, `POST /api/session/{id}/model` with body `{"model":{"id":"...","providerID":"..."}}`. Auth probe: `OPENCODE_PASSWORD=probe-pass opencode serve --hostname 127.0.0.1 --port 4599` then `curl http://127.0.0.1:4599/api/info` -> **401**; `curl -u opencode:probe-pass ...` -> **200** with `{"version":"2.4.0",...}`. Basic username is always `opencode`; the password comes from `OPENCODE_PASSWORD` (or is generated and printed on startup). Consequence: M7 alias switching must call the per-session model endpoint before a prompt; M1 relays `session.text.delta` into Telegram and treats `session.idle` as completion. Live-loop correction: v2.4.0 SSE frames are **data-only** (no `event:` line) with `type` inside the JSON; the observed successful run emitted `session.text.ended` and `session.execution.succeeded`, not `session.idle`. `translate.go` therefore maps `session.text.ended`/`session.idle` to `done` and `session.execution.failed`/`session.step.failed` to terminal errors; `client.go` accepts data-only frames. Real-model confirmation: with the owner's NVIDIA key and the repo base config, a live `opencode v2.4.0` prompt returned the exact requested text and emitted `session.text.ended` plus `session.execution.succeeded`; a 22-second gateway smoke test started cleanly with the same key and polled 38 times via a local Telegram stub. |
-| V2 | OpenCode custom-provider config accepts router as OpenAI-compatible provider + tool calls | M2 | Pending | — | — |
+| V2 | OpenCode custom-provider config accepts router as OpenAI-compatible provider + tool calls | M2 | Resolved | 2026-11-24 | Real `opencode v2.4.0`, `providers.padi` package `@opencode/ai/providers/openai-compatible`, `baseURL=http://127.0.0.1:18082/v1`, `ROUTER_TOKEN`, `X-Task-Id`/`X-Session-Id`. Fake upstream saw `stream=true`, `model=agent-chat`, `tools=0` then `tools=14`, then `roles=[system,user,assistant,tool]`; assistant finished with `V2_OK tool result received.`. See M2 pre-code verification below. |
 | V3 | `modalities` image input works for `agent-vision` | M8 | Pending | — | — |
 | V4 | Supabase connectivity from localhost/VM (direct vs Session Pooler) & free-project pause rule | M0 | Recorded (localhost; VM pending) | 2026-11-23 | From localhost: `psql "$DATABASE_URL" -Atc 'select current_user, current_database()'` -> `postgres|postgres`; `scripts/dbaccess_test.sh` -> 14/14 tables HTTP 404 for anon/publishable key; JWKS endpoint HTTP 200. Pause rule (official docs): Free projects are paused after 7 days of low database activity; a few user queries per day is normally enough; a warning email arrives ~1 week before pausing; restore is possible within 1 year. The nightly `db_touch` step in `scripts/nightly.sh` supplies this activity. VM-side direct connection not yet tested. |
-| V5 | Current free-tier limits and model IDs per provider (`agent-eval`) | M2, M4 | Pending | — | — |
+| V5 | Current free-tier limits and model IDs per provider (`agent-eval`) | M2, M4 | Recorded (live NVIDIA only; others official docs) | 2026-11-24 | Live NVIDIA chat completion with `nvidia/nemotron-3.5-bolt-e4b` returned HTTP 200 and `V5_OK`. Groq/OpenRouter/DeepSeek limits and IDs are recorded from official docs only; no keys for those providers are present on this host, so their `router.yaml` IDs stay `<placeholder>` and disabled. See M2 pre-code verification below. |
 | V6 | Oracle Always Free idle-reclaim thresholds & OCI Monitoring memory utilization metric | M0 | Recorded (reclaim rule; OCI metric detail pending) | 2026-11-23 | Official Always Free docs: an instance is idle if, over a 7-day period, CPU utilization at the 95th percentile is <20%, network utilization is <20%, and (A1 shapes only) memory utilization is <20%; idle Always Free instances may be reclaimed. This validates the memory-floor `keepalive` design. The exact OCI Monitoring "memory utilization" computation for this instance still needs a live tenancy check. |
 | V7 | Repo cache `clone_mode: partial` offline compatibility in container (optional) | M3a | Pending | — | — |
 | V8 | Tenancy Always Free Arm allowance (2 OCPU / 12 GB vs 4 OCPU / 24 GB) | M0 | Recorded | 2026-11-23 | Owner confirmed 2 OCPU / 12 GB envelope; system sized to fit it. Current Oracle docs state 1,500 OCPU-hours and 9,000 GB-hours per month for A1 (equivalent to 2 OCPU / 12 GB), and confirm 200 GB total block storage and 5 free volume backups. The older 3,000 / 18,000 figure quoted in `README.md` V8 and `BUILD_SPEC.md` V8 appears stale; this does not change the design because it is already sized to the smaller envelope. |
@@ -40,6 +40,59 @@ Authoritative summary lives in `README.md` §17 and `BUILD_SPEC.md` §8[cite: 2,
 | V22 | `gitleaks` and `osv-scanner` arm64 builds, CLI flags, offline DB refresh | M14 | Pending | — | — |
 | V23 | `npm`, `go`, and `pip` base-URL overrides through credential injection routes | M16 | Pending | — | — |
 | V24 | Telegram owner chat can run a conversational plan/research/build agent with inline buttons using existing credentials | M1 | Resolved | 2026-11-24 | `opencode v2.4.0` exposes `POST /api/session/{id}/agent` and emits `session.agent.selected`; built-in primary agents are `build` and `plan` (`general`/`explore` are subagents). Ad-hoc custom agents in `opencode.base.json` were ignored in this build, so the config overrides `build` and `plan`, disables `edit`/`write`/`patch`/`bash` tools for `plan`, and the gateway prefixes research/plan instructions to the prompt. Telegram `sendMessage`/`editMessageText` accept `reply_markup.inline_keyboard`; `callback_query` is allowed only from the configured owner's private chat. A per-chat long-lived container + OpenCode session preserves context across follow-ups and is reaped after 30 minutes idle. No new secrets: existing `TELEGRAM_BOT_TOKEN` and `PADI_MODEL_API_KEY`/`NVIDIA_API_KEY` are reused; Groq switch remains unchanged. |
+
+## M2 pre-code verification (2026-11-24)
+
+### V2 — OpenCode through an OpenAI-compatible router
+
+A temporary project config declared `padi/agent-chat` as an OpenAI-compatible provider:
+
+```json
+{
+  "model": "padi/agent-chat",
+  "providers": {
+    "padi": {
+      "name": "Padi Router",
+      "env": ["ROUTER_TOKEN"],
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": {"baseURL": "http://127.0.0.1:18082/v1"},
+      "headers": {"X-Task-Id": "v2-task", "X-Session-Id": "v2-session"},
+      "models": {"agent-chat": {"modelID": "agent-chat", "name": "Agent Chat"}}
+    }
+  }
+}
+```
+
+`opencode v2.4.0 serve` accepted the config; authenticated `GET /api/config` showed `model={"providerID":"padi","model":"agent-chat"}` and the `padi` provider. The prompt `Use your tools to list markdown files, then tell me what you found.` produced three requests to the fake upstream:
+
+1. `stream=true`, `model=agent-chat`, `tools=0`, headers `x-task-id=v2-task` and `x-session-id=ses_...`.
+2. `stream=true`, `model=agent-chat`, `tools=14` — the tool definitions were passed through unchanged.
+3. `roles=[system,user,assistant,tool]` — the `glob` tool result returned to the provider; upstream ID `call_v2_glob` was preserved.
+
+The final assistant content was `V2_OK tool result received.` and the session ended with `idle/outcome=succeeded`. Conclusion: the router can be a single OpenAI-compatible custom provider, tool calls pass through, and per-task/session headers are sent. No real provider key was used in this probe.
+
+### V5 — free-tier facts and verified IDs
+
+Live on this host with the existing M1 key: `POST https://integrate.api.nvidia.com/v1/chat/completions` for `nvidia/nemotron-3.5-bolt-e4b` returned HTTP 200 and exactly `V5_OK`. This is the only model ID enabled in M2's initial `router.yaml`.
+
+Official documentation checked on 2026-11-24:
+
+- **Groq** free limits: `openai/gpt-oss-120b`, `openai/gpt-oss-20b`, `qwen/qwen3.8-27b` are 30 RPM / 1K RPD / 8K TPM / 200K TPD; `openai/gpt-oss-safeguard-20b` is 3 RPM / 1K RPD / 2K TPM / 200K TPD. `llama-3.1-8b-instant` and `llama-3.3-70b-versatile` are now enterprise, not free. Sources: Groq rate-limits, models and OpenAI-compatibility docs.
+- **OpenRouter**: IDs ending `:free` get 20 RPM / 50 RPD below 10 purchased credits and 20 RPM / 1000 RPD at or above 10. `openrouter/free` routes only to free models unless paid fallbacks are added. Sources: OpenRouter limits, free-variant and free-router docs.
+- **DeepSeek**: no standing free tier; `deepseek-flash` and `deepseek-v4-pro` are priced per million tokens with account concurrency limits. Source: DeepSeek pricing and rate-limit docs.
+
+No Groq, OpenRouter or DeepSeek key exists on this host, so those model IDs were not verified live and their M2 targets remain `<placeholder>` / disabled. The NVIDIA numeric free cap is not published officially (NVIDIA staff describe it as variable by model, use case and traffic), so the router's conservative RPM comes from configuration, not an assumed quota.
+
+## M2 implementation decisions and acceptance (2026-11-24)
+
+- **Router-only routing.** `config/gateway.yaml` now names `padi/agent-chat` and `http://router:8090/v1`. `deploy/session/opencode.base.json` defines exactly one provider, `padi`, using `@opencode/ai/providers/openai-compatible`, `ROUTER_TOKEN` and the router base URL. NVIDIA/Groq providers and their keys were removed from session containers; the gateway injects only `ROUTER_TOKEN` and the router base URL.
+- **Concurrency queues instead of rejecting.** `limiter.Sem.Acquire(ctx)` blocks until a slot is free (bounded by `queue_max_wait`). The first hammer run with concurrency 1 produced 9×503 because `TryAcquire` rejected parallel requests; after this fix the same 10-request hammer returned 10×200. Delays, never failures, as the spec requires.
+- **429 cooldown escalation.** No `Retry-After` → configured steps `1s, 2s, 5s, 15s, 1m`, one step per 429 response. With `Retry-After` present, the upstream value wins. Total exhaustion returns 503 with the soonest cooldown end in `Retry-After`.
+- **Breaker isolated.** Circuit-breaker state lives in `internal/router/breaker` with its own `-race` table tests; only retryable failures count. 429 uses the cooldown map, 4xx never opens the breaker.
+- **Chat style.** Owner chose concise collaborator, one natural clarifying question, contextual buttons, and "say the M1 limit, then do the local part". This is enforced in `AGENTS.target.md`, both agent prompts, `modePrompt` and a renderer filter that drops tool-parameter jargon from final replies.
+- **Router URL must be container-reachable.** A local override of `http://127.0.0.1:8090/v1` made session tasks fail with `ECONNREFUSED`; inside a container that address is itself. Production uses the compose service name `router:8090`; local runs use the bridge gateway `172.20.0.1:8090`.
+- **Telegram tokens never in logs.** `net/http` transport errors include the full `api.telegram.org/bot<token>/...` URL. A `redactedError` wrapper scrubs the token while keeping `errors.Is` working.
+- **Placeholder discipline.** Only `agent-chat` → NVIDIA `nvidia/nemotron-3.5-bolt-e4b` is enabled. `agent-vision`, `agent-eval`, Groq, OpenRouter and DeepSeek targets remain `<placeholder>` and are disabled at startup with warnings. `/status` exposes counters only; no token, key or base URL.
 
 ## M0 VM-only deferral — owner Option B (2026-11-23)
 

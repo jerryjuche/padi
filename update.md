@@ -785,3 +785,108 @@ The earlier Bearer-extraheader attempt failed with git's anonymous username prom
 Live messages such as `hi`, `hello`, `why is this failing` and `3` were finishing their agent work but then failing with `telegram: editMessageText: HTTP 400 ... message is not modified`. Telegram returns this when the final text and reply markup are identical to the last streamed edit; the gateway was treating that benign no-op as a task failure.
 
 `telegram.Client` now treats Telegram's `message is not modified` response to `editMessageText` as success. The renderer also tracks the last text/keyboard it sent and skips redundant edits. A stub that deliberately returned the exact HTTP 400 for unchanged edits then ran the same two-turn real-provider flow: both tasks reached `DONE` in one session, with no gateway errors. `go vet ./...` and `go test -race -count=1 ./...` are green.
+
+## 17. M2 Router v1 report (`BUILD_SPEC.md` §2.5)
+
+### Done
+
+- Created `cmd/router/main.go`, `config/router.yaml`, and `internal/router/{handler,health,status,models}.go` plus `config`, `route`, `limiter`, `upstream` and `breaker` packages with table-driven `-race` tests.
+- Added `scripts/router-hammer.sh` (parallel chat requests, token never printed or written to disk).
+- Rewired `config/gateway.yaml`, `cmd/gateway/{config,main}.go`, `internal/gateway/runner/runner.go` and `deploy/session/opencode.base.json` so OpenCode only sees `padi/agent-chat` at `http://router:8090/v1` with `ROUTER_TOKEN`. No `NVIDIA_API_KEY`, `GROQ_API_KEY` or `PADI_MODEL_API_KEY` is injected into session containers.
+- Chat style: owner-selected concise collaborator contract added to `AGENTS.target.md`, both agent prompts and `modePrompt`; contextual buttons replaced the mode-only grid; `cleanReply` drops tool-parameter jargon from Telegram replies.
+- Defaulted `deploy/session/entrypoint.sh` to `padi/agent-chat` and rebuilt `sandbox-agent-session:latest`.
+- Recorded V2/V5 evidence and M2 decisions in `docs/decisions.md`.
+
+### Evidence
+
+```
+$ go vet ./... && go test -race -count=1 ./...
+ok  	github.com/jerryjuche/padi/cmd/gateway	1.091s
+ok  	github.com/jerryjuche/padi/internal/gateway/gitops	1.314s
+ok  	github.com/jerryjuche/padi/internal/gateway/opencode	1.058s
+ok  	github.com/jerryjuche/padi/internal/gateway/runner	1.289s
+ok  	github.com/jerryjuche/padi/internal/gateway/store	1.089s
+ok  	github.com/jerryjuche/padi/internal/gateway/telegram	1.753s
+ok  	github.com/jerryjuche/padi/internal/keepalive	3.427s
+ok  	github.com/jerryjuche/padi/internal/router	1.049s
+ok  	github.com/jerryjuche/padi/internal/router/breaker	1.022s
+ok  	github.com/jerryjuche/padi/internal/router/config	1.045s
+ok  	github.com/jerryjuche/padi/internal/router/limiter	1.023s
+ok  	github.com/jerryjuche/padi/internal/router/route	1.024s
+ok  	github.com/jerryjuche/padi/internal/router/upstream	1.340s
+```
+
+Router startup (real NVIDIA key sourced from `.env.local`, never printed):
+
+```
+router: warning: provider deepseek: DEEPSEEK_API_KEY is empty; provider disabled
+router: warning: provider groq: GROQ_API_KEY is empty; provider disabled
+router: warning: provider openrouter: OPENROUTER_API_KEY is empty; provider disabled
+router: warning: alias agent-vision target nvidia has <placeholder>; target disabled
+router: warning: alias agent-vision has no enabled targets
+router: warning: alias agent-eval has no enabled targets
+router ready (listen=:8090, aliases=[agent-chat])
+```
+
+`GET /healthz` → `{"ok":true}`. `GET /v1/models` with the router token → only `agent-chat`. `GET /status` → per-provider counters only, no token, key or base URL.
+
+Hammer, first run before the concurrency-queue fix:
+
+```
+      1 200
+      9 503
+router-hammer: at least one request failed
+```
+
+`limiter.Sem.Acquire(ctx)` replaced the non-blocking acquire. Same hammer after the fix, on a restarted router:
+
+```
+     10 200
+router-hammer: ok (10 requests, all 2xx)
+```
+
+Real OpenCode task through the router (host-side probe using the rendered session config, `PADI_ROUTER_BASE_URL=http://127.0.0.1:8090/v1`):
+
+```
+state=idle after 3s
+model {'id': 'agent-chat', 'providerID': 'padi'}
+text ROUTER_LIVE_OK
+```
+
+A second probe with tool use produced a `glob` tool call (`pattern: *.md`) sent and returned through the provider; the local `glob` run timed out in the temporary fixture, but the session still ended `idle/outcome=succeeded`. Tool-call passthrough was already proven deterministically in the V2 fake-upstream verification.
+
+Live gateway after the switch:
+
+```
+gateway: ready (model=padi/agent-chat, network=agent-session-net)
+gateway env: ROUTER_TOKEN=<present>
+direct key in gateway env? absent
+image: sha256:3c3b852973b033b2e96e5c478fb6b0835080027a9c16cdf8c6c82b2f03b3bcbd
+```
+
+The first live Telegram task after the switch failed with `ECONNREFUSED`: the session container inherited `http://127.0.0.1:8090/v1`, which is the container itself, not the host router. The Docker bridge gateway is `172.20.0.1`; the local override now uses `http://172.20.0.1:8090/v1`, and a container probe returned `{"ok":true}` from `/healthz` there while `127.0.0.1:8090` refused the connection. Production config keeps the compose service name `http://router:8090/v1`.
+
+A Telegram transport error also leaked the full bot URL, including the bot token, into the gateway log. `internal/gateway/telegram/api.go` now wraps those errors in a `redactedError` that replaces the token with `<redacted>` while preserving `errors.Is`; `TestCallRedactsBotToken` covers both properties.
+
+After the bridge-URL fix, a real owner task sent over Telegram (`Find vulnerability, and report all to me`) completed through the router:
+
+```
+2026-11-24 13:01:14.666917+00 | DONE | Find vulnerability, and report all to me
+router nvidia: limiter_used 0 -> 3 after the fix
+```
+
+### Deviations
+
+- `internal/router/breaker/breaker.go` is a separate package (as in `BUILD_SPEC.md` §3.2 and §7) instead of an unexported type inside `handler.go`.
+- `usage` rows are still not written; the spec assigns that to M4.
+- The live gateway on this host uses `PADI_ROUTER_BASE_URL=http://172.20.0.1:8090/v1` (Docker bridge gateway) because there is no `router` compose service locally; production containers use `http://router:8090/v1` from config.
+
+### Open items
+
+- External revocation of the M1 NVIDIA throwaway key must be done in the NVIDIA console by the owner. The key is no longer referenced by gateway config or session containers; `/status` and test output contain no secret values.
+- M0 VM-only drills remain deferred by owner Option B; M3a/M3b work is still out of scope.
+- Groq/OpenRouter/DeepSeek targets stay `<placeholder>` and disabled until keys and live model IDs are verified.
+
+### Next
+
+Awaiting the owner's go-ahead for the next milestone.

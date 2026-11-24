@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,41 @@ import (
 	"github.com/google/uuid"
 	"github.com/jerryjuche/padi/internal/gateway/opencode"
 )
+
+func TestCallRedactsBotToken(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	base := srv.URL
+	srv.Close() // transport error includes the full bot URL
+	c := &Client{Token: "super-secret-token", BaseURL: base, PollSeconds: 1}
+	err := c.call(context.Background(), "getMe", nil, nil)
+	if err == nil {
+		t.Fatal("expected transport error")
+	}
+	if strings.Contains(err.Error(), c.Token) {
+		t.Fatalf("token leaked in error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "<redacted>") {
+		t.Fatalf("error not redacted: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = c.call(ctx, "getMe", nil, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("errors.Is lost after redaction: %v", err)
+	}
+}
+
+func TestCleanReplyDropsToolJargon(t *testing.T) {
+	in := "Updated the file and ran the checks.\noldString: foo\nnewString: bar\nreplaceAll: true\nSend it when you're ready."
+	want := "Updated the file and ran the checks.\nSend it when you're ready."
+	if got := cleanReply(in); got != want {
+		t.Fatalf("cleanReply=%q want %q", got, want)
+	}
+	if got := cleanReply("oldString: only"); got != "" {
+		t.Fatalf("cleanReply fallback=%q", got)
+	}
+}
 
 func TestAllowed(t *testing.T) {
 	cases := []struct {

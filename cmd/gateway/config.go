@@ -39,11 +39,11 @@ type Config struct {
 		BundleMaxMB int     `yaml:"bundle_max_mb"`
 	} `yaml:"container"`
 	OpenCode struct {
-		Model        string `yaml:"model"`
-		ModelKeyEnv  string `yaml:"model_key_env"`
-		ModelBaseURL string `yaml:"model_base_url"`
-		LSP          bool   `yaml:"lsp"`
-		Snapshots    bool   `yaml:"snapshots"`
+		Model          string `yaml:"model"`
+		RouterBaseURL  string `yaml:"router_base_url"`
+		RouterTokenEnv string `yaml:"router_token_env"`
+		LSP            bool   `yaml:"lsp"`
+		Snapshots      bool   `yaml:"snapshots"`
 	} `yaml:"opencode"`
 	Git struct {
 		CacheDir      string `yaml:"cache_dir"`
@@ -73,8 +73,9 @@ func defaults() Config {
 	c.Container.Pids = 512
 	c.Container.Network = "agent-session-net"
 	c.Container.BundleMaxMB = 200
-	c.OpenCode.Model = "nvidia/nvidia/nemotron-3.5-bolt-e4b"
-	c.OpenCode.ModelKeyEnv = "NVIDIA_API_KEY"
+	c.OpenCode.Model = "padi/agent-chat"
+	c.OpenCode.RouterBaseURL = "http://router:8090/v1"
+	c.OpenCode.RouterTokenEnv = "ROUTER_TOKEN"
 	c.OpenCode.LSP = false
 	c.OpenCode.Snapshots = false
 	c.Git.CacheDir = "/srv/agent/cache/repos"
@@ -111,8 +112,11 @@ func (c Config) validate() error {
 	if c.OpenCode.Model == "" || !strings.Contains(c.OpenCode.Model, "/") {
 		return fmt.Errorf("gateway: opencode.model must be provider/id")
 	}
-	if c.OpenCode.ModelKeyEnv == "" {
-		return fmt.Errorf("gateway: opencode.model_key_env is required")
+	if c.OpenCode.RouterBaseURL == "" || !strings.Contains(c.OpenCode.RouterBaseURL, "://") {
+		return fmt.Errorf("gateway: opencode.router_base_url must be an http(s) URL")
+	}
+	if c.OpenCode.RouterTokenEnv == "" {
+		return fmt.Errorf("gateway: opencode.router_token_env is required")
 	}
 	if c.Git.CacheDir == "" || c.Git.WorkspacesDir == "" {
 		return fmt.Errorf("gateway: git cache/workspace dirs are required")

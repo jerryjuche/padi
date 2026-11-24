@@ -36,11 +36,11 @@ func TestEntrypointRendersConfigWithoutKey(t *testing.T) {
 		"PATH="+bin+":"+os.Getenv("PATH"),
 		"FAKE_ARGS="+argsFile,
 		"OPENCODE_BASE_CONFIG="+filepath.Join(root, "deploy", "session", "opencode.base.json"),
-		"PADI_MODEL=openai/gpt-5-nano",
+		"PADI_MODEL=padi/agent-chat",
 		"PADI_TASK_ID=task-42",
 		"SESSION_ID=ses-42",
-		"PADI_MODEL_BASE_URL=http://fake-provider:9999/v1",
-		"OPENAI_API_KEY=DO_NOT_WRITE_ME",
+		"PADI_MODEL_BASE_URL=http://router:9999/v1",
+		"ROUTER_TOKEN=DO_NOT_WRITE_ME",
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -58,14 +58,23 @@ func TestEntrypointRendersConfigWithoutKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	providers := cfg["providers"].(map[string]any)
-	openai := providers["openai"].(map[string]any)
-	headers := openai["headers"].(map[string]any)
+	if len(providers) != 1 {
+		t.Fatalf("providers=%v want router only", providers)
+	}
+	padi, ok := providers["padi"].(map[string]any)
+	if !ok {
+		t.Fatalf("padi provider missing: %v", providers)
+	}
+	headers := padi["headers"].(map[string]any)
 	if headers["X-Task-Id"] != "task-42" {
 		t.Fatalf("headers=%+v", headers)
 	}
-	settings, ok := openai["settings"].(map[string]any)
-	if !ok || settings["baseURL"] != "http://fake-provider:9999/v1" {
-		t.Fatalf("settings=%+v", openai["settings"])
+	settings, ok := padi["settings"].(map[string]any)
+	if !ok || settings["baseURL"] != "http://router:9999/v1" {
+		t.Fatalf("settings=%+v", padi["settings"])
+	}
+	if cfg["model"] != "padi/agent-chat" {
+		t.Fatalf("model=%v", cfg["model"])
 	}
 	args, err := os.ReadFile(argsFile)
 	if err != nil {

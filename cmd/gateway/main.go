@@ -28,6 +28,10 @@ const (
 	modePlan     = "plan"
 	modeResearch = "research"
 	chatIdleTTL  = 30 * time.Minute
+
+	// chatStyle is prepended to every agent prompt so replies read like a
+	// conversational collaborator, not a tool transcript or a generic menu.
+	chatStyle = "Reply in 2-4 short sentences: the answer, what you verified or the M1 limit, then one next step tied to this request. Ask at most one natural question, and only when the choice changes files or behaviour. Never mention tool parameter names such as oldString, newString or replaceAll. M1 cannot push or open a PR: say so once, then finish the local work. Keep replies under 600 characters.\n\n"
 )
 
 var userFacingSecret = regexp.MustCompile(`(?i)(authorization:\s*bearer\s+)\S+|(?i)(authorization:\s*basic\s+)[A-Za-z0-9+/=]+|\b(?:ghs|gho|ghu|ghr|github_pat)_[A-Za-z0-9_]+\b|\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b`)
@@ -75,14 +79,15 @@ func run() error {
 	if _, err := fmt.Sscan(ownerRaw, &ownerID); err != nil || ownerID <= 0 {
 		return fmt.Errorf("gateway: Telegram owner ID must be a positive integer")
 	}
-	// M1 temporary deviation: a throwaway free-tier key arrives via env only.
-	modelKey, err := secretFromEnv("PADI_MODEL_API_KEY", "throwaway model key")
+	// M2: the only credential that reaches a session container is the router
+	// token. Provider keys stay with the router on the host.
+	routerToken, err := secretFromEnv(cfg.OpenCode.RouterTokenEnv, "router token")
 	if err != nil {
 		return err
 	}
-	modelBaseURL := os.Getenv("PADI_MODEL_BASE_URL")
-	if modelBaseURL == "" {
-		modelBaseURL = cfg.OpenCode.ModelBaseURL
+	routerBaseURL := os.Getenv("PADI_ROUTER_BASE_URL")
+	if routerBaseURL == "" {
+		routerBaseURL = cfg.OpenCode.RouterBaseURL
 	}
 
 	docker, err := runner.NewDocker(os.Getenv("DOCKER_HOST"))
@@ -90,15 +95,14 @@ func run() error {
 		return err
 	}
 	r := runner.New(docker, runner.Config{
-		Image:        cfg.Container.Image,
-		Network:      cfg.Container.Network,
-		MemoryMB:     cfg.Container.MemoryMB,
-		CPUs:         cfg.Container.CPUs,
-		Pids:         cfg.Container.Pids,
-		Model:        cfg.OpenCode.Model,
-		ModelKeyEnv:  cfg.OpenCode.ModelKeyEnv,
-		ModelKey:     modelKey,
-		ModelBaseURL: modelBaseURL,
+		Image:         cfg.Container.Image,
+		Network:       cfg.Container.Network,
+		MemoryMB:      cfg.Container.MemoryMB,
+		CPUs:          cfg.Container.CPUs,
+		Pids:          cfg.Container.Pids,
+		Model:         cfg.OpenCode.Model,
+		RouterToken:   routerToken,
+		RouterBaseURL: routerBaseURL,
 	})
 	git := &gitops.Git{CacheDir: cfg.Git.CacheDir, WorkspacesDir: cfg.Git.WorkspacesDir}
 	tg := &telegram.Client{
@@ -135,7 +139,7 @@ func run() error {
 			cancel()
 		}
 	}()
-	log.Printf("gateway: M1 spine ready (model=%s, network=%s)", cfg.OpenCode.Model, cfg.Container.Network)
+	log.Printf("gateway: ready (model=%s, network=%s)", cfg.OpenCode.Model, cfg.Container.Network)
 	<-ctx.Done()
 	app.Close()
 	return nil
@@ -420,7 +424,7 @@ func (a *application) handleUpdate(ctx context.Context, u telegram.Update) error
 		a.closeChat(chatID)
 		a.forgetRepo(chatID)
 		a.rememberMode(chatID, modeBuild)
-		return a.replyKeyboard(ctx, chatID, "New topic. Send a request, or clone <repo> to open a repository.", chatButtons(modeBuild))
+		return a.replyKeyboard(ctx, chatID, "New topic. Tell me what you'd like to work on, or send clone <repo> to open a repository.", contextButtons("empty"))
 	case modeFromCommand(text) != "":
 		mode := modeFromCommand(text)
 		a.rememberMode(chatID, mode)
@@ -431,7 +435,7 @@ func (a *application) handleUpdate(ctx context.Context, u telegram.Update) error
 		}
 		rest := modePromptRest(text)
 		if rest == "" {
-			return a.replyKeyboard(ctx, chatID, mode+" mode on. Tell me what you want me to "+modeVerb(mode)+".", chatButtons(mode))
+			return a.replyKeyboard(ctx, chatID, mode+" mode on. Tell me what you want me to "+modeVerb(mode)+".", contextButtons(a.contextKind(chatID)))
 		}
 		return a.continueChat(ctx, chatID, rest, fmt.Sprintf("tg-%d-%d", chatID, u.Message.MessageID), mode)
 	}
@@ -489,25 +493,33 @@ func (a *application) handleCallback(ctx context.Context, q *telegram.CallbackQu
 			chat.mode = mode
 			chat.mu.Unlock()
 		}
-		return a.replyKeyboard(ctx, chatID, mode+" mode on. Tell me what you want me to "+modeVerb(mode)+".", chatButtons(mode))
+		return a.replyKeyboard(ctx, chatID, mode+" mode on. Tell me what you want me to "+modeVerb(mode)+".", contextButtons(a.contextKind(chatID)))
 	case data == "new":
 		a.closeChat(chatID)
 		a.forgetRepo(chatID)
 		a.rememberMode(chatID, modeBuild)
-		return a.replyKeyboard(ctx, chatID, "New topic. Send a request, or clone <repo> to open a repository.", chatButtons(modeBuild))
+		return a.replyKeyboard(ctx, chatID, "New topic. Tell me what you'd like to work on, or send clone <repo> to open a repository.", contextButtons("empty"))
 	case data == "status":
 		return a.status(ctx, chatID)
 	case data == "help":
 		return a.help(ctx, chatID)
-	case data == "act:summary":
+	case strings.HasPrefix(data, "act:"):
 		chat := a.getChat(chatID)
 		if chat == nil {
 			return a.reply(ctx, chatID, "No active workspace yet. Send a request or clone <repo> first.")
 		}
 		repo, _, _, _, _ := chat.detail()
-		return a.startTask(ctx, chatID, command{
-			repo: repo, prompt: "Summarize the current state and propose the next three steps. Ask me if anything is unclear.",
-		}, fmt.Sprintf("tg-%d-cb-%s", chatID, q.ID), false)
+		prompts := map[string]string{
+			"act:summary":  "In two or three sentences, summarize the current state and suggest one next step.",
+			"act:checks":   "Run the narrowest relevant checks in this workspace and report the result in two sentences. Do not push.",
+			"act:explain":  "Explain the most recent change in two or three sentences, with one concrete next step. Do not push.",
+			"act:continue": "Continue the local work that was in progress. Finish what M1 allows and report the result in two sentences. Do not push.",
+		}
+		prompt, ok := prompts[data]
+		if !ok {
+			return &telegram.ReportedError{Err: fmt.Errorf("unknown action %q", data)}
+		}
+		return a.startTask(ctx, chatID, command{repo: repo, prompt: prompt}, fmt.Sprintf("tg-%d-cb-%s", chatID, q.ID), false)
 	default:
 		return &telegram.ReportedError{Err: fmt.Errorf("unknown callback %q", data)}
 	}
@@ -523,8 +535,8 @@ func (a *application) help(ctx context.Context, chatID int64) error {
 		"• /research — read, search and report; no edits\n" +
 		"• /status — show the active workspace\n" +
 		"• /new — close this workspace and start fresh\n\n" +
-		"Buttons switch mode or start a summary. If I need detail, I will ask before acting."
-	return a.replyKeyboard(ctx, chatID, text, chatButtons(a.currentMode(chatID)))
+		"Buttons offer next steps for this conversation. Use /build, /plan or /research when you want to switch mode."
+	return a.replyKeyboard(ctx, chatID, text, contextButtons(a.contextKind(chatID)))
 }
 
 func (a *application) status(ctx context.Context, chatID int64) error {
@@ -539,7 +551,7 @@ func (a *application) status(ctx context.Context, chatID int64) error {
 		text = fmt.Sprintf("Workspace: %s\nMode: %s\nState: %s\nSession: %s\nLast used: %s ago",
 			repo, mode, state, sessionID.String(), time.Since(last).Round(time.Second))
 	}
-	return a.replyKeyboard(ctx, chatID, text, chatButtons(a.currentMode(chatID)))
+	return a.replyKeyboard(ctx, chatID, text, contextButtons(a.contextKind(chatID)))
 }
 
 // startTask creates the audit task and either opens a fresh workspace or reuses
@@ -676,7 +688,7 @@ func (a *application) runTask(ctx context.Context, chat *chatSession, session st
 	if err := chat.oc.PromptWithAgent(ctx, chat.ocSession, modePrompt(mode, prompt), a.cfg.OpenCode.Model, modeAgent(mode)); err != nil {
 		return "", err
 	}
-	summary, err := a.renderer.RelayWithKeyboard(ctx, chatID, session.ID, &task.ID, normalized, chatButtons(mode))
+	summary, err := a.renderer.RelayWithKeyboard(ctx, chatID, session.ID, &task.ID, normalized, contextButtons("done"))
 	if err != nil {
 		return "", err
 	}
@@ -722,7 +734,7 @@ func (a *application) fail(ctx context.Context, session store.Session, task stor
 	if len(msg) > 500 {
 		msg = msg[:500]
 	}
-	if err := a.replyKeyboard(ctx, chatID, msg, chatButtons(a.currentMode(chatID))); err != nil {
+	if err := a.replyKeyboard(ctx, chatID, msg, contextButtons("failed")); err != nil {
 		log.Printf("gateway: send failure: %v", err)
 	}
 }
@@ -755,11 +767,11 @@ func modeAgent(mode string) string {
 func modePrompt(mode, prompt string) string {
 	switch mode {
 	case modePlan:
-		return "PLAN MODE: Investigate first. Ask a clarifying question if scope is unclear. Return a concise plan with files, steps, tests and risks. Do not edit files.\n\n" + prompt
+		return "PLAN MODE: Investigate first. Return a short plan with files, steps, tests and risks. Do not edit files.\n\n" + chatStyle + prompt
 	case modeResearch:
-		return "RESEARCH MODE: Read and search only. Use web tools where useful and cite sources. Ask a clarifying question if scope is broad. Do not edit files, push, or open pull requests.\n\n" + prompt
+		return "RESEARCH MODE: Read and search only. Cite sources. Do not edit files, push, or open pull requests.\n\n" + chatStyle + prompt
 	default:
-		return prompt
+		return chatStyle + prompt
 	}
 }
 
@@ -798,17 +810,39 @@ func modePromptRest(text string) string {
 	return ""
 }
 
-func chatButtons(mode string) [][]telegram.InlineButton {
-	return [][]telegram.InlineButton{
-		{
-			{Text: "Build", CallbackData: "mode:build"},
-			{Text: "Plan", CallbackData: "mode:plan"},
-			{Text: "Research", CallbackData: "mode:research"},
-		},
-		{
-			{Text: "Summary", CallbackData: "act:summary"},
+// contextButtons offers next steps that fit the current conversation instead
+// of a permanent mode-only menu. Mode commands remain available as text.
+func contextButtons(kind string) [][]telegram.InlineButton {
+	switch kind {
+	case "empty":
+		return [][]telegram.InlineButton{{
+			{Text: "How to start", CallbackData: "help"},
+			{Text: "Status", CallbackData: "status"},
+		}}
+	case "done":
+		return [][]telegram.InlineButton{{
+			{Text: "Explain this", CallbackData: "act:explain"},
+			{Text: "Run checks", CallbackData: "act:checks"},
+			{Text: "New topic", CallbackData: "new"},
+		}}
+	case "failed":
+		return [][]telegram.InlineButton{{
+			{Text: "Continue locally", CallbackData: "act:continue"},
 			{Text: "Status", CallbackData: "status"},
 			{Text: "New topic", CallbackData: "new"},
-		},
+		}}
+	default:
+		return [][]telegram.InlineButton{{
+			{Text: "Summarize", CallbackData: "act:summary"},
+			{Text: "Run checks", CallbackData: "act:checks"},
+			{Text: "New topic", CallbackData: "new"},
+		}}
 	}
+}
+
+func (a *application) contextKind(chatID int64) string {
+	if a.getChat(chatID) == nil {
+		return "empty"
+	}
+	return "workspace"
 }

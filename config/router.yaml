@@ -1,0 +1,97 @@
+# M2 router config. No secret values belong here; only environment-variable names.
+# Targets with <placeholder> model IDs are disabled at startup (BUILD_SPEC §3.2).
+
+listen: ":8090"
+router_token_env: "ROUTER_TOKEN"
+
+providers:
+  nvidia:
+    name: "NVIDIA NIM"
+    base_url: "https://integrate.api.nvidia.com/v1"
+    api_key_env: "NVIDIA_API_KEY"
+    package: "@opencode/ai/providers/openai-compatible"
+    rpm: 20
+    concurrency: 1
+    supports_stream: true
+    supports_tools: true
+    supports_images: false
+    max_context: 120000
+    daily_token_cap: 0
+
+  groq:
+    name: "Groq"
+    base_url: "https://api.groq.com/openai/v1"
+    api_key_env: "GROQ_API_KEY"
+    package: "@opencode/ai/providers/openai-compatible"
+    rpm: 30
+    concurrency: 1
+    supports_stream: true
+    supports_tools: true
+    supports_images: false
+    max_context: 128000
+    daily_token_cap: 0
+
+  openrouter:
+    name: "OpenRouter"
+    base_url: "https://openrouter.ai/api/v1"
+    api_key_env: "OPENROUTER_API_KEY"
+    package: "@opencode/ai/providers/openai-compatible"
+    rpm: 20
+    concurrency: 1
+    supports_stream: true
+    supports_tools: true
+    supports_images: false
+    max_context: 128000
+    daily_token_cap: 0
+
+  deepseek:
+    name: "DeepSeek"
+    base_url: "https://api.deepseek.com"
+    api_key_env: "DEEPSEEK_API_KEY"
+    package: "@opencode/ai/providers/openai-compatible"
+    rpm: 60
+    concurrency: 1
+    supports_stream: true
+    supports_tools: true
+    supports_images: false
+    max_context: 64000
+    daily_token_cap: 0
+
+routes:
+  agent-chat:
+    - provider: nvidia
+      model: "nvidia/nemotron-3.5-bolt-e4b"
+      priority: 1
+    - provider: groq
+      model: "<placeholder>"
+      priority: 2
+    - provider: openrouter
+      model: "<placeholder>"
+      priority: 3
+
+  agent-vision:
+    - provider: nvidia
+      model: "<placeholder>"
+      priority: 1
+
+  agent-eval:
+    - provider: groq
+      model: "<placeholder>"
+      priority: 1
+    - provider: openrouter
+      model: "<placeholder>"
+      priority: 2
+
+retry:
+  attempts: 3
+  backoff: 150ms
+
+breaker:
+  consecutive_failures: 3
+  initial_cooldown: 10s
+  max_cooldown: 2m
+
+rl_cooldown: [1s, 2s, 5s, 15s, 1m]
+queue_max_wait: 20s
+first_byte_timeout: 15s
+total_timeout: 120s

@@ -30,5 +30,5 @@ RUN chmod 755 /entrypoint.sh && chown -R agent:agent /opt/agent /entrypoint.sh
 USER agent
 WORKDIR /workspace
 
-# The throwaway model key is supplied only as a runtime env var by the gateway.
+# Only ROUTER_TOKEN is supplied at runtime; provider keys stay with the router.
 ENTRYPOINT ["/entrypoint.sh"]

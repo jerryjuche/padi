@@ -2,7 +2,7 @@
 # Render the per-task OpenCode config without ever writing a model key to disk.
 set -eu
 
-: "${PADI_MODEL:=opencode/gpt-5.4-nano}"
+: "${PADI_MODEL:=padi/agent-chat}"
 : "${PADI_TASK_ID:=unknown}"
 : "${PADI_MODEL_BASE_URL:=}"
 : "${SESSION_ID:=${PADI_SESSION_ID:-}}"
@@ -34,5 +34,5 @@ jq \
 
 chmod 600 "$CONFIG_DIR/opencode.json"
 
-# The API key stays in this process environment; OpenCode reads it from there.
+# The router token stays in this process environment; OpenCode reads it from there.
 exec opencode serve --hostname 0.0.0.0 --port 4096

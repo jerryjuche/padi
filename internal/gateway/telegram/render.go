@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"html"
+	"regexp"
 	"strings"
 	"time"
 
@@ -179,9 +180,9 @@ func (r *Renderer) RelayWithKeyboard(ctx context.Context, chatID int64, sessionI
 	}
 
 finish:
-	summary := strings.TrimSpace(answer.String())
+	summary := cleanReply(answer.String())
 	if summary == "" {
-		summary = "Task finished."
+		summary = "Done."
 	}
 	parts := Split(summary, r.maxChars())
 	if err := edit(html.EscapeString(parts[0]), rows); err != nil {
@@ -195,6 +196,22 @@ finish:
 		r.record(ctx, sessionID, taskID, chatID, id)
 	}
 	return summary, nil
+}
+
+// toolJargon matches internal tool-parameter vocabulary that should never
+// appear in a chat reply. Whole lines are dropped so surrounding prose stays.
+var toolJargon = regexp.MustCompile(`(?i)oldString|newString|replaceAll|replace_all|"tool_calls"|"finish_reason"`)
+
+func cleanReply(s string) string {
+	lines := strings.Split(s, "\n")
+	kept := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if toolJargon.MatchString(line) {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.TrimSpace(strings.Join(kept, "\n"))
 }
 
 func truncate(s string, max int) string {
