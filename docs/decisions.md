@@ -25,12 +25,12 @@ Authoritative summary lives in `README.md` §17 and `BUILD_SPEC.md` §8[cite: 2,
 | V7 | Repo cache `clone_mode: partial` offline compatibility in container (optional) | M3a | Pending | — | — |
 | V8 | Tenancy Always Free Arm allowance (2 OCPU / 12 GB vs 4 OCPU / 24 GB) | M0 | Recorded | 2026-11-23 | Owner confirmed 2 OCPU / 12 GB envelope; system sized to fit it. Current Oracle docs state 1,500 OCPU-hours and 9,000 GB-hours per month for A1 (equivalent to 2 OCPU / 12 GB), and confirm 200 GB total block storage and 5 free volume backups. The older 3,000 / 18,000 figure quoted in `README.md` V8 and `BUILD_SPEC.md` V8 appears stale; this does not change the design because it is already sized to the smaller envelope. |
 | V9 | Rootless Docker cgroup v2 delegation (`cpu memory pids`), OOM kill at limit, unprivileged ports | M0, M3a | Pending | — | — |
-| V10 | gVisor (`runsc`) on arm64 with rootless Docker vs hardened `runc` | M3a | Pending | — | — |
-| V11 | Network topology isolation (`scripts/netcheck.sh` from inside session container) | M3a | Pending | — | — |
+| V10 | gVisor (`runsc`) on arm64 with rootless Docker vs hardened `runc` | M3a | Partial (host only) | 2026-11-24 | `command -v runsc` is empty; Docker 29.4.0 uses `runc`, cgroup v2 with `systemd` driver, seccomp+AppArmor enabled. Hardened probe `docker run --runtime runc --security-opt no-new-privileges --cap-drop ALL --read-only --tmpfs /tmp --memory 128m --cpus 0.5 --pids-limit 64` returned `CapEff: 0000000000000000`, rootfs `ro`, `memory.max=134217728`, `cpu.max=50000 100000`, `pids.max=64`. This host uses `/var/run/docker.sock` (not rootless) and amd64; gVisor on arm64/rootless stays unverified until the VM. Select hardened `runc` for M3a and re-test `runsc` on the VM. |
+| V11 | Network topology isolation (`scripts/netcheck.sh` from inside session container) | M3a | Resolved (probe; script pending) | 2026-11-24 | Internal network `m3a-probe-internal` with fake `router` and `egress-proxy` services, session container on that network only: `router:8090 -> 200`, `egress-proxy:3129 -> 200`, `https://api.telegram.org -> 000`, host bridge `172.20.0.1:8090 -> 000`. `scripts/netcheck.sh` will encode this probe in M3a. |
 | V12 | OpenCode headless `lsp`, `snapshot`, custom headers (`X-Task-Id`), MCP / custom tools | M1, M3a | Resolved | 2026-11-23 | Real `opencode v2.4.0` plus official `https://opencode.ai/config.json`. Schema keys: `lsp` (bool or per-server overrides), `snapshot` (**deprecated**) and `snapshots` (bool, authoritative), `provider` (deprecated) and `providers.<id>.headers` (string map), `mcp.servers.<name>` with `type: remote` + `url` (+ optional `headers`) or `type: local` + `command` array. There is **no config key for custom tools**; extension is via `plugins` / `plugin` (deprecated) or MCP servers, and built-in tools are gated by `tools` (deprecated) / `permissions`. Live probe: a temp project `opencode.json` with `lsp:false`, `snapshot:false`, `providers.probe.headers.x-probe:yes` and `mcp.servers.probe-remote` was accepted by `opencode serve`; authenticated `GET /api/config` returned `lsp:false`, `snapshots:false`, `providers:["probe"]`, `mcp:["servers"]`. M1 sets `lsp:false` and `snapshots:false` in `opencode.base.json`; per-provider headers are available for M2's router and `X-Task-Id`; MCP/tools work is deferred to M3a/M12 as specified. Live-loop evidence: the fake provider received `x-task-id=<task-id>` and `x-session-id=<session-id>` headers, and `settings.baseURL` pointed at the local fake provider. Provider override probe (same binary): `providers.<id>.models.<modelID>` with `modelID` is accepted (`id` also works); a custom provider needs `name`, `env`, `package: "@opencode/ai/providers/openai-compatible"`, `settings.baseURL` and `models`. `opencode models` then lists `nvidia/nvidia/nemotron-3.5-bolt-e4b` and the declared `groq/...` models, and `opencode serve` starts with both declared and no keys present. NVIDIA's API docs confirm the upstream ID `nvidia/nemotron-3.5-bolt-e4b`; models.dev does not yet ship it, hence the explicit override. |
-| V13 | Search provider configuration (`none` vs `searxng`) | M3a | Pending | — | — |
+| V13 | Search provider configuration (`none` vs `searxng`) | M3a | Resolved (`none`) | 2026-11-24 | No searxng config, service, URL or credential exists in `config/`, `deploy/`, `scripts/` or host (`grep -rn searxng` returned only this VERIFY row). Choose `provider: none`; research search returns `search_unavailable` and tells the agent to fetch known documentation URLs. Revisit when M12 has an acceptable free-tier provider. |
 | V14 | Object Storage upload from arm64 (S3-compatible API / CLI without Python), boot backups, external monitors | M0 | Design resolved; live drill pending (VM not ready) | 2026-11-23 | Use **rclone's native `oracleobjectstorage` backend** (single static Go binary, arm64 build, no Python/OCI CLI) with `provider = instance_principal_auth`: certificates come from instance metadata, so **no credentials are stored on the VM** (Hard Rule 2). Config needs `namespace`, `region`, and (only for bucket listing) `compartment`; a dynamic group containing the instance plus an Object Storage policy are the only tenancy-side requirements. The S3-compatible alternative works but requires long-lived Customer Secret Keys on the VM, so it is rejected. Boot-volume backups: Oracle supports policy-based automatic backups; Always Free includes 5 free volume backups. External monitors: Healthchecks.io Hobbyist is USD 0/month with 20 checks (dead-man's switch via `HEALTHCHECK_PING_URL`); UptimeRobot has a free tier for HTTPS uptime. Live upload/alert drill awaits the ARM64 VM. See `update.md` §11 for the ordered VM command checklist. |
-| V15 | `git bundle` round trip, `--no-hardlinks` offline clone, bundle size cap on large repos | M3a, M3b | Pending | — | — |
+| V15 | `git bundle` round trip, `--no-hardlinks` offline clone, bundle size cap on large repos | M3a, M3b | Resolved (small fixture) | 2026-11-24 | In `/tmp/opencode/m3a-v15`: `git -C source bundle create /tmp/opencode/m3a-v15/repo.bundle --all` then `git clone --no-hardlinks repo.bundle offline-clone` produced byte-identical `README.md` and `docs/note.txt`, `git rev-list --count HEAD = 1`, bundle 447 bytes (`cap_ok` against 200 MB). Large-repo cap behaviour still needs M3b evidence. |
 | V16 | Chromium/Playwright on arm64 within 2 GB cap + remote MCP browser server | M11 | Pending | — | — |
 | V17 | `/dev/kvm` presence on VM (`ls /dev/kvm`) | M16 | Pending | — | — |
 | V18 | OpenCode skills discovery paths, config key, per-skill permissions, `question` event surfacing | M12 | Pending | — | — |
@@ -93,6 +93,49 @@ No Groq, OpenRouter or DeepSeek key exists on this host, so those model IDs were
 - **Router URL must be container-reachable.** A local override of `http://127.0.0.1:8090/v1` made session tasks fail with `ECONNREFUSED`; inside a container that address is itself. Production uses the compose service name `router:8090`; local runs use the bridge gateway `172.20.0.1:8090`.
 - **Telegram tokens never in logs.** `net/http` transport errors include the full `api.telegram.org/bot<token>/...` URL. A `redactedError` wrapper scrubs the token while keeping `errors.Is` working.
 - **Placeholder discipline.** Only `agent-chat` → NVIDIA `nvidia/nemotron-3.5-bolt-e4b` is enabled. `agent-vision`, `agent-eval`, Groq, OpenRouter and DeepSeek targets remain `<placeholder>` and are disabled at startup with warnings. `/status` exposes counters only; no token, key or base URL.
+
+## M3a pre-code verification (2026-11-24)
+
+Real commands run on this host before any M3a code was written. No secrets appear in the output.
+
+```
+$ command -v runc; command -v runsc
+/usr/bin/runc
+(no runsc)
+
+$ docker info --format '{{json .SecurityOptions}} {{.CgroupDriver}} {{.CgroupVersion}} {{.DefaultRuntime}}'
+["name=apparmor","name=seccomp,profile=builtin","name=cgroupns"] systemd 2 runc
+
+$ docker run --rm --runtime runc --security-opt no-new-privileges --cap-drop ALL \
+    --read-only --tmpfs /tmp:rw,nosuid,size=16m --memory 128m --cpus 0.5 --pids-limit 64 \
+    --entrypoint /bin/sh sandbox-agent-session:latest -c '<cgroup/caps probe>'
+CapEff: 0000000000000000
+overlay / overlay ro,...
+134217728
+50000 100000
+64
+```
+
+Network topology (V11), internal network with fake services, session container attached only to it:
+
+```
+allowed http://router:8090/ -> 200
+allowed http://egress-proxy:3129/ -> 200
+blocked https://api.telegram.org/ -> 000
+blocked http://172.20.0.1:8090/healthz -> 000
+```
+
+Bundle round trip (V15):
+
+```
+$ git -C source bundle create /tmp/opencode/m3a-v15/repo.bundle --all
+$ git clone --no-hardlinks /tmp/opencode/m3a-v15/repo.bundle offline-clone
+identical
+447
+cap_ok 447 1
+```
+
+Limits: this host is amd64 with a root Docker socket, so V10's arm64/rootless/gVisor portion and the large-repository half of V15 remain open for the VM/M3b.
 
 ## M0 VM-only deferral — owner Option B (2026-11-23)
 
