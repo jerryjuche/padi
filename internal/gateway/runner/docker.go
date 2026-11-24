@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -10,6 +11,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -87,18 +90,27 @@ func (d *Docker) do(ctx context.Context, method, path string, body any) (*http.R
 	return resp, nil
 }
 
-// ContainerSpec is the subset of container creation used by M1.
+// ContainerSpec is the hardened container creation shape used from M3a.
 type ContainerSpec struct {
-	Name       string
-	Image      string
-	Env        []string
-	Binds      []string
-	Network    string
-	MemoryMB   int
-	CPUs       float64
-	Pids       int
-	Labels     map[string]string
-	ExposePort string
+	Name           string
+	Image          string
+	Env            []string
+	Binds          []string
+	Network        string
+	MemoryMB       int
+	CPUs           float64
+	Pids           int
+	Labels         map[string]string
+	ExposePort     string
+	Runtime        string
+	ReadonlyRootfs bool
+	Tmpfs          map[string]string
+	CapDrop        []string
+	SecurityOpt    []string
+	User           string
+	Entrypoint     []string
+	Cmd            []string
+	PublishPorts   bool
 }
 
 func (s ContainerSpec) body() map[string]any {
@@ -106,22 +118,46 @@ func (s ContainerSpec) body() map[string]any {
 	if port == "" {
 		port = "4096/tcp"
 	}
-	return map[string]any{
-		"Image":  s.Image,
-		"Env":    s.Env,
-		"Labels": s.Labels,
-		"ExposedPorts": map[string]any{
-			port: map[string]any{},
-		},
-		"HostConfig": map[string]any{
-			"Binds":           s.Binds,
-			"NetworkMode":     s.Network,
-			"Memory":          int64(s.MemoryMB) * 1024 * 1024,
-			"NanoCpus":        int64(s.CPUs * 1e9),
-			"PidsLimit":       s.Pids,
-			"PublishAllPorts": true,
-		},
+	host := map[string]any{
+		"Binds":           s.Binds,
+		"NetworkMode":     s.Network,
+		"Memory":          int64(s.MemoryMB) * 1024 * 1024,
+		"NanoCpus":        int64(s.CPUs * 1e9),
+		"PidsLimit":       s.Pids,
+		"PublishAllPorts": s.PublishPorts,
 	}
+	if s.Runtime != "" {
+		host["Runtime"] = s.Runtime
+	}
+	if s.ReadonlyRootfs {
+		host["ReadonlyRootfs"] = true
+	}
+	if len(s.Tmpfs) > 0 {
+		host["Tmpfs"] = s.Tmpfs
+	}
+	if len(s.CapDrop) > 0 {
+		host["CapDrop"] = s.CapDrop
+	}
+	if len(s.SecurityOpt) > 0 {
+		host["SecurityOpt"] = s.SecurityOpt
+	}
+	body := map[string]any{
+		"Image":        s.Image,
+		"Env":          s.Env,
+		"Labels":       s.Labels,
+		"ExposedPorts": map[string]any{port: map[string]any{}},
+		"HostConfig":   host,
+	}
+	if s.User != "" {
+		body["User"] = s.User
+	}
+	if len(s.Entrypoint) > 0 {
+		body["Entrypoint"] = s.Entrypoint
+	}
+	if len(s.Cmd) > 0 {
+		body["Cmd"] = s.Cmd
+	}
+	return body
 }
 
 // Create creates a stopped container and returns its ID.
@@ -169,6 +205,72 @@ func (d *Docker) Wait(ctx context.Context, id string) (int, error) {
 		return 0, fmt.Errorf("runner: decode wait: %w", err)
 	}
 	return out.StatusCode, nil
+}
+
+// ExitInfo records why a container stopped. OOMKilled comes from inspect,
+// because the Docker wait response only carries the numeric exit status.
+type ExitInfo struct {
+	ExitCode  int
+	OOMKilled bool
+}
+
+func (d *Docker) WaitInfo(ctx context.Context, id string) (ExitInfo, error) {
+	code, err := d.Wait(ctx, id)
+	if err != nil {
+		return ExitInfo{}, err
+	}
+	resp, err := d.do(ctx, http.MethodGet, "/containers/"+url.PathEscape(id)+"/json", nil)
+	if err != nil {
+		return ExitInfo{}, err
+	}
+	defer resp.Body.Close()
+	var info struct {
+		State struct {
+			OOMKilled bool `json:"OOMKilled"`
+		} `json:"State"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&info); err != nil {
+		return ExitInfo{}, fmt.Errorf("runner: decode state: %w", err)
+	}
+	return ExitInfo{ExitCode: code, OOMKilled: info.State.OOMKilled}, nil
+}
+
+// CopyOut reads exactly one regular file from a container archive stream. It
+// refuses directories and symlinks and never writes more than maxBytes.
+func (d *Docker) CopyOut(ctx context.Context, id, path, dest string, maxBytes int64) error {
+	if path == "" || dest == "" || !filepath.IsAbs(dest) {
+		return fmt.Errorf("runner: invalid copy path")
+	}
+	resp, err := d.do(ctx, http.MethodGet,
+		"/containers/"+url.PathEscape(id)+"/archive?path="+url.QueryEscape(path), nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	archive := tar.NewReader(resp.Body)
+	header, err := archive.Next()
+	if err != nil {
+		return fmt.Errorf("runner: empty archive: %w", err)
+	}
+	if header.Typeflag != tar.TypeReg || header.Size > maxBytes || header.Size < 0 {
+		return fmt.Errorf("runner: refused archive entry type=%c size=%d", header.Typeflag, header.Size)
+	}
+	var body bytes.Buffer
+	if _, err := io.CopyN(&body, archive, header.Size); err != nil {
+		return fmt.Errorf("runner: copy body: %w", err)
+	}
+	if _, err := archive.Next(); err != io.EOF {
+		return fmt.Errorf("runner: archive contains more than one entry")
+	}
+	out, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	if _, err := body.WriteTo(out); err != nil {
+		return fmt.Errorf("runner: write copy: %w", err)
+	}
+	return nil
 }
 
 func (d *Docker) Remove(ctx context.Context, id string) error {
@@ -246,7 +348,25 @@ func (d *Docker) Exec(ctx context.Context, id string, cmd []string) ([]byte, err
 		return nil, err
 	}
 	defer start.Body.Close()
-	return readMultiplexed(start.Body)
+	out, err := readMultiplexed(start.Body)
+	if err != nil {
+		return nil, err
+	}
+	state, err := d.do(ctx, http.MethodGet, "/exec/"+url.PathEscape(created.ID)+"/json", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer state.Body.Close()
+	var result struct {
+		ExitCode int `json:"ExitCode"`
+	}
+	if err := json.NewDecoder(io.LimitReader(state.Body, 1<<20)).Decode(&result); err != nil {
+		return nil, fmt.Errorf("runner: decode exec result: %w", err)
+	}
+	if result.ExitCode != 0 {
+		return out, fmt.Errorf("runner: exec exit %d: %s", result.ExitCode, strings.TrimSpace(string(out)))
+	}
+	return out, nil
 }
 
 // readMultiplexed parses Docker's 8-byte stream frame header.
@@ -301,9 +421,10 @@ func (d *Docker) ListContainers(ctx context.Context, filters string) ([]ListedCo
 	return out, nil
 }
 
-// EnsureNetwork creates the M1 bridge network if it does not exist yet.
-// It stays internal=false until M3a.
-func (d *Docker) EnsureNetwork(ctx context.Context, name string) error {
+// EnsureNetwork creates the session network if absent. From M3a it must be
+// internal (no default route); an existing non-internal network is rejected
+// rather than silently weakening the sandbox.
+func (d *Docker) EnsureNetwork(ctx context.Context, name string, internal bool) error {
 	if name == "" || name == "bridge" {
 		return nil
 	}
@@ -315,16 +436,28 @@ func (d *Docker) EnsureNetwork(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
 	if resp.StatusCode == http.StatusOK {
+		var info struct {
+			Internal bool `json:"Internal"`
+		}
+		decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&info)
+		resp.Body.Close()
+		if decodeErr != nil {
+			return decodeErr
+		}
+		if internal && !info.Internal {
+			return fmt.Errorf("runner: network %q is not internal; recreate it before starting sessions", name)
+		}
 		return nil
 	}
+	resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		return fmt.Errorf("runner: inspect network: HTTP %d", resp.StatusCode)
 	}
 	create, err := d.do(ctx, http.MethodPost, "/networks/create", map[string]any{
-		"Name":   name,
-		"Driver": "bridge",
+		"Name":     name,
+		"Driver":   "bridge",
+		"Internal": internal,
 	})
 	if err != nil {
 		return err

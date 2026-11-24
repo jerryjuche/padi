@@ -1,0 +1,82 @@
+# M3a topology. agent-session-net is INTERNAL: session containers have no
+# default route; router and egress-proxy are the only bridges outward.
+# Secrets come from deploy/.env (gitignored) or the host environment. Nothing
+# here contains a token, key or DSN.
+services:
+  router:
+    build:
+      context: ..
+      dockerfile: deploy/go/Dockerfile
+      args:
+        PKG: cmd/router
+    environment:
+      ROUTER_CONFIG: /etc/padi/router.yaml
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      ROUTER_ADMIN_TOKEN: ${ROUTER_ADMIN_TOKEN:-}
+    volumes:
+      - ../config/router.yaml:/etc/padi/router.yaml:ro
+    networks:
+      - agent-net
+      - agent-session-net
+
+  egress-proxy:
+    build:
+      context: ..
+      dockerfile: deploy/go/Dockerfile
+      args:
+        PKG: cmd/egress-proxy
+    environment:
+      EGRESS_CONFIG: /etc/padi/egress.yaml
+      ROUTER_TOKEN: ${ROUTER_TOKEN}
+      EGRESS_ADMIN_TOKEN: ${EGRESS_ADMIN_TOKEN:-}
+    volumes:
+      - ../config/egress.yaml:/etc/padi/egress.yaml:ro
+    networks:
+      - agent-net
+      - agent-session-net
+
+  gateway:
+    build:
+      context: ..
+      dockerfile: deploy/go/Dockerfile
+      args:
+        PKG: cmd/gateway
+    environment:
+      GATEWAY_CONFIG: /etc/padi/gateway.yaml
+      DATABASE_URL: ${DATABASE_URL}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_OWNER_ID: ${TELEGRAM_OWNER_ID:-${TELEGRAM_ALLOWED_USER_ID:-}}
+      ROUTER_TOKEN: ${ROUTER_TOKEN}
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      GITHUB_APP_INSTALLATION_ID: ${GITHUB_APP_INSTALLATION_ID:-${GITHUB_INSTALLATION_ID:-}}
+      GITHUB_APP_PRIVATE_KEY_PATH: /srv/agent/secrets/github-app.pem
+    volumes:
+      - ../config/gateway.yaml:/etc/padi/gateway.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /srv/agent:/srv/agent
+    # The gateway needs the session network for OpenCode HTTP and docker exec.
+    # Its own HTTP/UI listener is not part of M3a; add a host firewall rule or
+    # an interface-bound listener before exposing port 8080 to sessions.
+    networks:
+      - agent-net
+      - agent-session-net
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    networks:
+      - agent-net
+
+networks:
+  agent-net:
+    driver: bridge
+  agent-session-net:
+    driver: bridge
+    internal: true

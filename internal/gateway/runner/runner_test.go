@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -8,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -19,7 +21,7 @@ func fakeDocker(t *testing.T) (*Docker, *map[string]any) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/networks/agent-session-net":
-			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, `{"Name":"agent-session-net","Internal":false}`)
 		case r.URL.Path == "/containers/create":
 			body := map[string]any{}
 			_ = json.NewDecoder(r.Body).Decode(&body)
@@ -36,6 +38,8 @@ func fakeDocker(t *testing.T) (*Docker, *map[string]any) {
 			w.WriteHeader(http.StatusNoContent)
 		case r.URL.Path == "/containers/cid1/exec":
 			fmt.Fprint(w, `{"Id":"exec1"}`)
+		case r.URL.Path == "/exec/exec1/json":
+			fmt.Fprint(w, `{"ExitCode":0}`)
 		case r.URL.Path == "/exec/exec1/start":
 			var buf bytes.Buffer
 			buf.WriteByte(1)
@@ -56,9 +60,10 @@ func fakeDocker(t *testing.T) (*Docker, *map[string]any) {
 func TestStartWaitStop(t *testing.T) {
 	docker, last := fakeDocker(t)
 	r := New(docker, Config{
-		Image: "session:latest", Network: "agent-session-net", MemoryMB: 2560,
-		CPUs: 1, Pids: 512, Model: "openai/gpt-5-nano",
+		Image: "session:latest", Network: "agent-session-net", Runtime: "runc", MemoryMB: 2560,
+		CPUs: 1, Pids: 512, Model: "padi/agent-chat",
 		RouterToken: "router-only-token", RouterBaseURL: "http://router:8090/v1",
+		ProxyURL: "http://egress-proxy:3128", BundleMaxMB: 200,
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -77,9 +82,20 @@ func TestStartWaitStop(t *testing.T) {
 	if host["Memory"].(float64) != 2560*1024*1024 || host["NetworkMode"] != "agent-session-net" {
 		t.Fatalf("host config=%+v", host)
 	}
+	if host["ReadonlyRootfs"] != true || host["Runtime"] != "runc" || create["User"] != "agent" {
+		t.Fatalf("hardening missing: %+v", create)
+	}
+	if fmt.Sprint(host["CapDrop"]) != "[ALL]" || fmt.Sprint(host["SecurityOpt"]) != "[no-new-privileges]" {
+		t.Fatalf("capabilities not dropped: %+v", host)
+	}
+	tmpfs := host["Tmpfs"].(map[string]any)
+	if !strings.Contains(fmt.Sprint(tmpfs["/tmp"]), "exec") ||
+		!strings.Contains(fmt.Sprint(tmpfs["/home/agent/.config"]), "uid=1001") {
+		t.Fatalf("tmpfs options missing exec or agent ownership: %+v", tmpfs)
+	}
 	env := create["Env"].([]any)
 	joined := fmt.Sprint(env)
-	for _, want := range []string{"ROUTER_TOKEN=router-only-token", "PADI_MODEL_BASE_URL=http://router:8090/v1", "PADI_TASK_ID=task-0001", "OPENCODE_PASSWORD="} {
+	for _, want := range []string{"ROUTER_TOKEN=router-only-token", "PADI_MODEL_BASE_URL=http://router:8090/v1", "PADI_TASK_ID=task-0001", "OPENCODE_PASSWORD=", "HTTP_PROXY=http://egress-proxy:3128", "NO_PROXY=router,egress-proxy,localhost,127.0.0.1"} {
 		if !bytes.Contains([]byte(joined), []byte(want)) {
 			t.Fatalf("env missing %q: %v", want, env)
 		}
@@ -115,6 +131,116 @@ func TestReconcile(t *testing.T) {
 	}
 	if (*last)["removed"] != true {
 		t.Fatal("stale container was not removed")
+	}
+}
+
+func TestStartVerifyUsesFreshHardenedContainer(t *testing.T) {
+	docker, last := fakeDocker(t)
+	r := New(docker, Config{Image: "session:latest", Network: "agent-session-net", Runtime: "runc", MemoryMB: 2560, CPUs: 1, Pids: 512})
+	h, err := r.StartVerify(context.Background(), "task-0002", "/srv/agent/verify/task-0002")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.ID != "cid1" || h.Address != "" {
+		t.Fatalf("handle=%+v", h)
+	}
+	create, ok := (*last)["create"].(map[string]any)
+	if !ok {
+		t.Fatalf("create body missing: %+v", last)
+	}
+	if create["User"] != "agent" || create["Cmd"] == nil || create["Entrypoint"] == nil {
+		t.Fatalf("verify command missing: %+v", create)
+	}
+	if fmt.Sprint(create["Entrypoint"]) != `[/usr/local/bin/agent-verify]` ||
+		fmt.Sprint(create["Cmd"]) != `[--format json --timeout 10m /workspace]` {
+		t.Fatalf("unexpected verify command: %v %v", create["Entrypoint"], create["Cmd"])
+	}
+	host := create["HostConfig"].(map[string]any)
+	if !strings.Contains(fmt.Sprint(host["Binds"]), "/srv/agent/verify/task-0002:/workspace:ro") {
+		t.Fatalf("verify bind is not read-only: %v", host["Binds"])
+	}
+	if host["ReadonlyRootfs"] != true || host["PublishAllPorts"] != false {
+		t.Fatalf("verify container not isolated: %+v", host)
+	}
+}
+
+func TestOOMDetection(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/wait"):
+			fmt.Fprint(w, `{"StatusCode":137}`)
+		case strings.HasSuffix(r.URL.Path, "/json"):
+			fmt.Fprint(w, `{"State":{"OOMKilled":true}}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	r := New(&Docker{BaseURL: srv.URL, HTTP: srv.Client()}, Config{})
+	info, err := r.WaitInfo(context.Background(), "cid-oom")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.ExitCode != 137 || !info.OOMKilled || !OOMKilled(info) {
+		t.Fatalf("oom info=%+v", info)
+	}
+}
+
+func TestCopyOutRefusesNonRegularFiles(t *testing.T) {
+	cases := []struct {
+		name     string
+		typeflag byte
+		size     int64
+		wantErr  bool
+	}{
+		{"regular", tar.TypeReg, 3, false},
+		{"symlink", tar.TypeSymlink, 0, true},
+		{"directory", tar.TypeDir, 0, true},
+		{"over cap", tar.TypeReg, 64, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var buf bytes.Buffer
+				tw := tar.NewWriter(&buf)
+				_ = tw.WriteHeader(&tar.Header{Name: "file", Mode: 0o600, Size: tc.size, Typeflag: tc.typeflag})
+				if tc.typeflag == tar.TypeReg {
+					_, _ = tw.Write(make([]byte, tc.size))
+				}
+				_ = tw.Close()
+				_, _ = w.Write(buf.Bytes())
+			}))
+			defer srv.Close()
+			dest := filepath.Join(t.TempDir(), "out")
+			err := New(&Docker{BaseURL: srv.URL, HTTP: srv.Client()}, Config{}).CopyOut(context.Background(), "cid", "/tmp/file", dest, 8)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err=%v wantErr=%v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestExecRequiresZeroExitCode(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/exec") && r.Method == http.MethodPost:
+			fmt.Fprint(w, `{"Id":"eid1"}`)
+		case strings.HasSuffix(r.URL.Path, "/exec/eid1/start"):
+			var frame [8]byte
+			binary.BigEndian.PutUint32(frame[4:], 5)
+			_, _ = w.Write(frame[:])
+			_, _ = w.Write([]byte("boom!"))
+		case strings.HasSuffix(r.URL.Path, "/exec/eid1/json"):
+			fmt.Fprint(w, `{"ExitCode":7}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	r := New(&Docker{BaseURL: srv.URL, HTTP: srv.Client()}, Config{})
+	out, err := r.Exec(context.Background(), "cid", "/bin/false")
+	if err == nil || !strings.Contains(err.Error(), "exit 7") {
+		t.Fatalf("err=%v out=%q want exit 7", err, out)
 	}
 }
 

@@ -1,0 +1,61 @@
+# M3a egress proxy. Tokens are never stored here: ROUTER_TOKEN and
+# EGRESS_ADMIN_TOKEN are read from the environment at startup.
+listen: { proxy: ":3128", research: ":3129", admin: ":3130" }
+
+build_allowlist:
+  - registry.npmjs.org
+  - registry.yarnpkg.com
+  - proxy.golang.org
+  - sum.golang.org
+  - pypi.org
+  - files.pythonhosted.org
+  - crates.io
+  - static.crates.io
+  - index.crates.io
+  - github.com
+  - codeload.github.com
+  - objects.githubusercontent.com
+  - raw.githubusercontent.com
+
+deny_ranges:
+  - "0.0.0.0/8"
+  - "10.0.0.0/8"
+  - "100.64.0.0/10"
+  - "127.0.0.0/8"
+  - "169.254.0.0/16"
+  - "172.16.0.0/12"
+  - "192.168.0.0/16"
+  - "224.0.0.0/4"
+  - "::1/128"
+  - "fc00::/7"
+  - "fe80::/10"
+
+ports: [80, 443]
+
+research:
+  enabled: true
+  max_body_mb: 2
+  max_redirects: 5
+  max_chars: 40000
+  url_max_len: 512
+  query_value_max_len: 100
+  query_max_len: 200
+  entropy_threshold_bits: 4.2
+  entropy_min_len: 32
+  rate_per_min_session: 30
+  max_per_task: 150
+  search:
+    provider: none            # M12 sets searxng after V19
+    url: ""                   # e.g. "http://searxng:8080"
+    engines: []
+    max_results: 8
+    timeout_s: "8s"
+
+limits: { session_bytes_mb: 500, session_conns_per_min: 300 }
+
+credentials:                  # M16; listener stub only until services exist
+  listen: ":3131"
+  services: []
+  # - { name: npm-private, upstream: "https://registry.example.com", path_prefixes: ["/"], methods: ["GET"], header: "Authorization", value_env: "NPM_PRIVATE_TOKEN", ttl: "2h" }
+
+log_path: /var/log/agent/egress.ndjson

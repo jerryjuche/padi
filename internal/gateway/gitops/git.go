@@ -32,10 +32,14 @@ var (
 	branchPattern      = regexp.MustCompile(`^agent/[a-z0-9._-]{1,60}$`)
 )
 
-// Git is the host-side git service. Only the three M1 functions are present.
+// Git is the host-side git service. All paths are gateway-owned; no git call
+// ever uses an agent-writable workspace as its working directory.
 type Git struct {
 	CacheDir      string
 	WorkspacesDir string
+	QuarantineDir string
+	VerifyDir     string
+	BundleMaxMB   int
 	HTTPClient    *http.Client
 }
 

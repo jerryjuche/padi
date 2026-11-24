@@ -890,3 +890,101 @@ router nvidia: limiter_used 0 -> 3 after the fix
 ### Next
 
 Awaiting the owner's go-ahead for the next milestone.
+
+---
+
+## 18. M3a Isolation report (`BUILD_SPEC.md` §2.5)
+
+### Done
+
+- Added `cmd/egress-proxy` plus `internal/egress/{config,allowlist,proxy,research,search}` with `config/egress.yaml`: four default-deny listeners, in-proxy DNS/SSRF checks, allowlisted build proxy, capped research fetch/search, audit denials with no secrets.
+- Completed `internal/gateway/gitops`: `gitexec` injection/lint hardening, `bundle.go`, `quarantine.go`, `CheckoutForVerify`, hostile fixture and round-trip tests. Host git never runs in `workspaces/*/repo`.
+- Hardened `internal/gateway/runner`: internal network, `runc`, `CapDrop=ALL`, `no-new-privileges`, read-only rootfs, exec-capable tmpfs, proxy env, `StartVerify`, `CopyOut`, OOM detection and nonzero exec exit checks.
+- Applied `sql/003_harness.sql` to Supabase (syntax and idempotency already checked twice on local PG16).
+- Implemented the task-scoped Telegram action protocol (`NO_WORKSPACE → READY → RUNNING → AWAITING_DECISION → READY`), `PROPOSAL:` handoff and exact-plan Execute buttons.
+- Added `deploy/docker-compose.yml`, `deploy/go/Dockerfile`, `scripts/netcheck.sh`, `scripts/runtime-bench.sh`, `cmd/agent-verify` and `internal/verify/*`; rebuilt the session image.
+
+### Evidence
+
+```
+$ gofmt -l cmd internal
+$ GOPROXY=off go vet ./...
+$ GOPROXY=off go test -race -count=1 ./...
+ok  github.com/jerryjuche/padi/cmd/agent-verify       1.039s
+ok  github.com/jerryjuche/padi/cmd/egress-proxy       1.072s
+ok  github.com/jerryjuche/padi/cmd/gateway            1.121s
+ok  github.com/jerryjuche/padi/internal/egress/...    (all ok)
+ok  github.com/jerryjuche/padi/internal/gateway/...  (all ok)
+ok  github.com/jerryjuche/padi/internal/verify/...   (all ok)
+```
+
+```
+$ ./scripts/netcheck.sh
+allowed http://router:8090/ -> 200
+allowed http://egress-proxy:3129/ -> 200
+blocked https://api.telegram.org/ -> 000
+blocked http://169.254.169.254/latest/meta-data/ -> 000
+blocked http://172.17.0.1:8080/ -> 000
+blocked http://172.17.0.1:5432/ -> 000
+blocked http://172.22.0.2:8091/ -> 000
+blocked /var/run/docker.sock -> absent
+netcheck: 8/8 zones correct
+```
+
+```
+$ ./scripts/runtime-bench.sh
+runc: bench-ok in 634ms (hardened limits)
+runsc: unavailable (command -v runsc empty)
+```
+
+Bundle → quarantine → verify-container:
+
+```
+verify_container=bcb8f6da674adef014ca24ec1dcb990ea850b402269ae389ddeb8ba9c02eee35
+verify_exit=0 oom=false
+{"verdict":"pass","steps":[{"name":"go test","ok":true,"output_tail":"ok  \tfixture\t0.065s\n"}]}
+```
+
+Egress research (local dummy token, no real secret):
+
+```
+public fetch: title='Example Domain' chars=156
+private fetch: http=403 reason=port_not_allowed
+search: http=501 code=search_unavailable
+allowlisted proxy https://registry.npmjs.org/ -> 200
+non-allowlisted proxy https://api.telegram.org/ -> 403
+```
+
+OOM isolation:
+
+```
+control_before=200
+hog_exit=137 hog_oomkilled=true
+control_after=200
+```
+
+SQL:
+
+```
+003_harness.sql applied to Supabase
+count of tasks.kind/contract/budget_used = 3
+```
+
+### Deviations
+
+- Verifier files (`cmd/agent-verify`, `internal/verify/*`) were pulled from M3b into M3a so a real verify container could be proven now.
+- Egress packages use the owner's names (`allowlist`, `research`, `search`) instead of the spec's `allow`, `guard`, `research`.
+- `deploy/go/Dockerfile` was added as a shared minimal builder for gateway/router/egress images.
+- Netcheck uses fake router/egress services and a dummy token; it proves zones without contacting real providers.
+
+### Open items
+
+- V9 rootless Docker cgroup delegation and V10 gVisor on arm64 remain pending until the ARM VM (owner Option B).
+- V15 large-repository bundle cap timing remains M3b; the small round trip and a 1 MB cap test are green.
+- The gateway currently has no HTTP/UI listener; if one is added, gate it from the session network before exposure (comment recorded in `deploy/docker-compose.yml`).
+- M2 box stays unticked until the owner revokes the M1 NVIDIA throwaway key in the NVIDIA console.
+- M4 must wire the full router alias set (`agent-build`, `agent-plan`, `agent-small`, `agent-vision`, `agent-embed`) with unverified IDs left as `<placeholder>` and disabled.
+
+### Next
+
+Awaiting the owner's go-ahead for M4 Router v2 / agent-eval.

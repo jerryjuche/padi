@@ -1116,7 +1116,7 @@ Each item is a **real test**, not a reading exercise. Record the outcome in `doc
 - [ ] M1: container runs OpenCode; Telegram round trip; edit of an independent clone works; throwaway key noted for revocation; V1, V12 recorded
 - [ ] M2: router tests green; OpenCode works through router; hammer test clean; throwaway key revoked; V2, V5 recorded
   - 2026-11-24: all items except external revocation pass (router `-race` tests, real task through `padi/agent-chat`, 10×200 hammer, V2/V5 recorded). The owner must revoke the M1 throwaway key in the NVIDIA console before this box is ticked.
-- [ ] M3a: `netcheck.sh` passes; hostile-repo test passes; memory hog dies alone; runtime chosen with evidence; research fetch works and refuses private addresses; V9, V10, V11, V12, V13, V15 recorded
+- [x] M3a: `netcheck.sh` passes; hostile-repo test passes; memory hog dies alone; runtime chosen with evidence; research fetch works and refuses private addresses; V9, V10, V11, V12, V13, V15 recorded
 - [ ] M3b: PR opened only after verification and approval; failing change blocked; deleted test flagged high; off-limits edit stopped; budgets enforced; `/undo` verified; risk block renders
 - [ ] M4: fallback proven; queue runs one task at a time; second slot proven or refused with evidence; loadtest report stored; real model IDs set
 - [ ] M5: auth and SSE tests green; contract drift check in CI

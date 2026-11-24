@@ -31,7 +31,7 @@ const (
 
 	// chatStyle is prepended to every agent prompt so replies read like a
 	// conversational collaborator, not a tool transcript or a generic menu.
-	chatStyle = "Reply in 2-4 short sentences: the answer, what you verified or the M1 limit, then one next step tied to this request. Ask at most one natural question, and only when the choice changes files or behaviour. Never mention tool parameter names such as oldString, newString or replaceAll. M1 cannot push or open a PR: say so once, then finish the local work. Keep replies under 600 characters.\n\n"
+	chatStyle = "Reply in 2-4 short sentences: the answer, what you verified, then one concrete next step tied to this request. Never re-ask a settled question; use what you already learned in this conversation. Ask a question only when a file-changing choice is genuinely blocked, and offer concrete options when you do. If a next step needs approval, end with exactly one line `PROPOSAL: <goal; files; steps; risk>`; the owner will get an Execute button carrying that exact plan. Never mention tool parameter names such as oldString, newString or replaceAll. M1 cannot push or open a PR: say so once, then finish the local work. Keep replies under 600 characters.\n\n"
 )
 
 var userFacingSecret = regexp.MustCompile(`(?i)(authorization:\s*bearer\s+)\S+|(?i)(authorization:\s*basic\s+)[A-Za-z0-9+/=]+|\b(?:ghs|gho|ghu|ghr|github_pat)_[A-Za-z0-9_]+\b|\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b`)
@@ -95,16 +95,24 @@ func run() error {
 		return err
 	}
 	r := runner.New(docker, runner.Config{
-		Image:         cfg.Container.Image,
-		Network:       cfg.Container.Network,
-		MemoryMB:      cfg.Container.MemoryMB,
-		CPUs:          cfg.Container.CPUs,
-		Pids:          cfg.Container.Pids,
-		Model:         cfg.OpenCode.Model,
-		RouterToken:   routerToken,
-		RouterBaseURL: routerBaseURL,
+		Image:           cfg.Container.Image,
+		Network:         cfg.Container.Network,
+		Runtime:         cfg.Container.Runtime,
+		InternalNetwork: cfg.Container.InternalNetwork,
+		MemoryMB:        cfg.Container.MemoryMB,
+		CPUs:            cfg.Container.CPUs,
+		Pids:            cfg.Container.Pids,
+		Model:           cfg.OpenCode.Model,
+		RouterToken:     routerToken,
+		RouterBaseURL:   routerBaseURL,
+		ProxyURL:        cfg.Container.Proxy,
+		BundleMaxMB:     cfg.Container.BundleMaxMB,
 	})
-	git := &gitops.Git{CacheDir: cfg.Git.CacheDir, WorkspacesDir: cfg.Git.WorkspacesDir}
+	git := &gitops.Git{
+		CacheDir: cfg.Git.CacheDir, WorkspacesDir: cfg.Git.WorkspacesDir,
+		QuarantineDir: cfg.Git.QuarantineDir, VerifyDir: cfg.Git.VerifyDir,
+		BundleMaxMB: cfg.Container.BundleMaxMB,
+	}
 	tg := &telegram.Client{
 		BaseURL:     os.Getenv("TELEGRAM_API_BASE"),
 		Token:       botToken,
@@ -125,6 +133,7 @@ func run() error {
 		pending: make(map[int64]string),
 		modes:   make(map[int64]string),
 		chats:   make(map[int64]*chatSession),
+		actions: make(map[string]time.Time),
 	}
 	poller := &telegram.Poller{
 		Client:  tg,
@@ -145,6 +154,24 @@ func run() error {
 	return nil
 }
 
+// taskRecord is the minimum context a follow-up needs so the agent never has
+// to guess what "continue" or "explain" refers to.
+type taskRecord struct {
+	ID       string
+	Prompt   string
+	Outcome  string
+	Evidence string
+	Files    []string
+}
+
+// proposalRecord is a structured ask-before-acting handoff. The agent writes a
+// PROPOSAL line; the gateway turns it into one Execute button carrying the
+// exact plan, so a click cannot drift into a different task.
+type proposalRecord struct {
+	TaskID string
+	Prompt string
+}
+
 // chatSession is a long-lived workspace for one Telegram chat. Keeping the
 // container and OpenCode session alive is what makes follow-ups conversational:
 // the agent remembers what it read, changed and asked in earlier turns.
@@ -158,6 +185,9 @@ type chatSession struct {
 	ocSession string
 	lastUsed  time.Time
 	busy      bool
+	state     string
+	lastTask  taskRecord
+	proposal  *proposalRecord
 }
 
 func (c *chatSession) begin() bool {
@@ -184,6 +214,90 @@ func (c *chatSession) detail() (repo, mode string, sessionID uuid.UUID, lastUsed
 	return c.repo, c.mode, c.session.ID, c.lastUsed, c.busy
 }
 
+func (c *chatSession) setState(state string) {
+	c.mu.Lock()
+	c.state = state
+	c.mu.Unlock()
+}
+
+func (c *chatSession) setLastTask(t taskRecord) {
+	c.mu.Lock()
+	c.lastTask = t
+	c.mu.Unlock()
+}
+
+func (c *chatSession) setOutcome(outcome string) {
+	c.mu.Lock()
+	c.lastTask.Outcome = outcome
+	c.mu.Unlock()
+}
+
+func (c *chatSession) setProposal(p *proposalRecord) {
+	c.mu.Lock()
+	c.proposal = p
+	if p != nil {
+		c.state = "decision"
+	} else if c.state == "decision" {
+		c.state = "ready"
+	}
+	c.mu.Unlock()
+}
+
+func (c *chatSession) lastTaskID() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastTask.ID
+}
+
+func (c *chatSession) taskFor(taskID string) (taskRecord, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.lastTask.ID == "" || c.lastTask.ID != taskID {
+		return taskRecord{}, false
+	}
+	return c.lastTask, true
+}
+
+func (c *chatSession) hasProposal() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.proposal != nil
+}
+
+func (c *chatSession) proposalFor(taskID string) (*proposalRecord, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.proposal == nil || c.proposal.TaskID != taskID {
+		return nil, false
+	}
+	p := *c.proposal
+	return &p, true
+}
+
+// taskContext is injected ahead of every follow-up prompt. It is what stops
+// the agent from re-asking a question that was already settled in the thread.
+func (c *chatSession) taskContext() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.lastTask.ID == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("Conversation context: previous task " + c.lastTask.ID + " (" + c.lastTask.Outcome + ") was: " + c.lastTask.Prompt)
+	if len(c.lastTask.Files) > 0 {
+		b.WriteString(". Files touched: " + strings.Join(c.lastTask.Files, ", "))
+	}
+	if c.lastTask.Evidence != "" {
+		evidence := c.lastTask.Evidence
+		if len(evidence) > 240 {
+			evidence = evidence[:240]
+		}
+		b.WriteString(". Verified: " + evidence)
+	}
+	b.WriteString(". Continue from this state; do not re-ask settled questions.")
+	return b.String()
+}
+
 type application struct {
 	cfg      Config
 	db       *store.PG
@@ -198,6 +312,32 @@ type application struct {
 	pending map[int64]string
 	modes   map[int64]string
 	chats   map[int64]*chatSession
+
+	// actions de-duplicates button taps. A second tap on the same task-scoped
+	// action returns the already running task instead of creating a duplicate.
+	actions map[string]time.Time
+}
+
+// markAction records a tap and returns false when the same action was already
+// started within the dedupe window. Old entries are pruned lazily.
+func (a *application) markAction(key string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.actions == nil {
+		a.actions = make(map[string]time.Time)
+	}
+	if len(a.actions) > 256 {
+		for k, t := range a.actions {
+			if time.Since(t) > time.Minute {
+				delete(a.actions, k)
+			}
+		}
+	}
+	if last, ok := a.actions[key]; ok && time.Since(last) < 30*time.Second {
+		return false
+	}
+	a.actions[key] = time.Now()
+	return true
 }
 
 func (a *application) event(ctx context.Context, sessionID uuid.UUID, taskID *uuid.UUID, typ string, data any) {
@@ -424,7 +564,7 @@ func (a *application) handleUpdate(ctx context.Context, u telegram.Update) error
 		a.closeChat(chatID)
 		a.forgetRepo(chatID)
 		a.rememberMode(chatID, modeBuild)
-		return a.replyKeyboard(ctx, chatID, "New topic. Tell me what you'd like to work on, or send clone <repo> to open a repository.", contextButtons("empty"))
+		return a.replyKeyboard(ctx, chatID, "New topic. Tell me what you'd like to work on, or send clone <repo> to open a repository.", contextButtons("empty", ""))
 	case modeFromCommand(text) != "":
 		mode := modeFromCommand(text)
 		a.rememberMode(chatID, mode)
@@ -435,7 +575,7 @@ func (a *application) handleUpdate(ctx context.Context, u telegram.Update) error
 		}
 		rest := modePromptRest(text)
 		if rest == "" {
-			return a.replyKeyboard(ctx, chatID, mode+" mode on. Tell me what you want me to "+modeVerb(mode)+".", contextButtons(a.contextKind(chatID)))
+			return a.replyKeyboard(ctx, chatID, mode+" mode on. Tell me what you want me to "+modeVerb(mode)+".", a.buttonsForChat(chatID))
 		}
 		return a.continueChat(ctx, chatID, rest, fmt.Sprintf("tg-%d-%d", chatID, u.Message.MessageID), mode)
 	}
@@ -493,36 +633,87 @@ func (a *application) handleCallback(ctx context.Context, q *telegram.CallbackQu
 			chat.mode = mode
 			chat.mu.Unlock()
 		}
-		return a.replyKeyboard(ctx, chatID, mode+" mode on. Tell me what you want me to "+modeVerb(mode)+".", contextButtons(a.contextKind(chatID)))
+		return a.replyKeyboard(ctx, chatID, mode+" mode on. Tell me what you want me to "+modeVerb(mode)+".", a.buttonsForChat(chatID))
 	case data == "new":
 		a.closeChat(chatID)
 		a.forgetRepo(chatID)
 		a.rememberMode(chatID, modeBuild)
-		return a.replyKeyboard(ctx, chatID, "New topic. Tell me what you'd like to work on, or send clone <repo> to open a repository.", contextButtons("empty"))
+		return a.replyKeyboard(ctx, chatID, "New topic. Tell me what you'd like to work on, or send clone <repo> to open a repository.", contextButtons("empty", ""))
 	case data == "status":
 		return a.status(ctx, chatID)
 	case data == "help":
 		return a.help(ctx, chatID)
-	case strings.HasPrefix(data, "act:"):
+	case strings.HasPrefix(data, "exec:"):
+		taskID := strings.TrimPrefix(data, "exec:")
 		chat := a.getChat(chatID)
 		if chat == nil {
 			return a.reply(ctx, chatID, "No active workspace yet. Send a request or clone <repo> first.")
 		}
-		repo, _, _, _, _ := chat.detail()
-		prompts := map[string]string{
-			"act:summary":  "In two or three sentences, summarize the current state and suggest one next step.",
-			"act:checks":   "Run the narrowest relevant checks in this workspace and report the result in two sentences. Do not push.",
-			"act:explain":  "Explain the most recent change in two or three sentences, with one concrete next step. Do not push.",
-			"act:continue": "Continue the local work that was in progress. Finish what M1 allows and report the result in two sentences. Do not push.",
-		}
-		prompt, ok := prompts[data]
+		p, ok := chat.proposalFor(taskID)
 		if !ok {
+			return a.reply(ctx, chatID, "That plan is no longer active. Ask for a fresh plan and I'll prepare it.")
+		}
+		if !a.markAction(data) {
+			return a.reply(ctx, chatID, "That plan is already being executed.")
+		}
+		chat.setProposal(nil)
+		repo, _, _, _, _ := chat.detail()
+		return a.startTask(ctx, chatID, command{repo: repo, prompt: p.Prompt}, "exec:"+taskID, false)
+	case strings.HasPrefix(data, "a:"):
+		parts := strings.Split(data, ":")
+		if len(parts) != 3 {
+			return &telegram.ReportedError{Err: fmt.Errorf("malformed action %q", data)}
+		}
+		return a.runAction(ctx, chatID, parts[1], parts[2], data)
+	case strings.HasPrefix(data, "act:"):
+		// Keyboards sent before the task-scoped protocol stay harmless: map
+		// them to the current task instead of starting a generic new task.
+		chat := a.getChat(chatID)
+		if chat == nil || chat.lastTaskID() == "" {
+			return a.reply(ctx, chatID, "That button is from an older topic. Send a fresh request and I'll use the new actions.")
+		}
+		action := strings.TrimPrefix(data, "act:")
+		switch action {
+		case "explain", "checks", "continue", "summary":
+			return a.runAction(ctx, chatID, chat.lastTaskID(), action, data)
+		default:
 			return &telegram.ReportedError{Err: fmt.Errorf("unknown action %q", data)}
 		}
-		return a.startTask(ctx, chatID, command{repo: repo, prompt: prompt}, fmt.Sprintf("tg-%d-cb-%s", chatID, q.ID), false)
 	default:
 		return &telegram.ReportedError{Err: fmt.Errorf("unknown callback %q", data)}
 	}
+}
+
+// runAction resolves a task-scoped quick action and starts it with the exact
+// prior task as context. A second tap within the dedupe window is a no-op.
+func (a *application) runAction(ctx context.Context, chatID int64, taskID, action, token string) error {
+	chat := a.getChat(chatID)
+	if chat == nil {
+		return a.reply(ctx, chatID, "No active workspace yet. Send a request or clone <repo> first.")
+	}
+	t, ok := chat.taskFor(taskID)
+	if !ok {
+		return a.reply(ctx, chatID, "That button belongs to an older task. The current actions are below.")
+	}
+	_, _, _, _, busy := chat.detail()
+	if busy {
+		return a.reply(ctx, chatID, "I'm still working on the previous message. I'll pick this up next.")
+	}
+	if chat.hasProposal() && action != "revise" {
+		return a.replyKeyboard(ctx, chatID, "A plan is waiting. Use Execute to approve it or Revise to change it.", a.buttonsForChat(chatID))
+	}
+	if !chat.hasProposal() && action == "revise" {
+		return a.reply(ctx, chatID, "There's no active plan to revise. Ask for a new plan and I'll prepare one.")
+	}
+	prompt, ok := actionPrompt(action, t)
+	if !ok {
+		return &telegram.ReportedError{Err: fmt.Errorf("unknown action %q", action)}
+	}
+	if !a.markAction(token) {
+		return a.reply(ctx, chatID, "That action is already running.")
+	}
+	repo, _, _, _, _ := chat.detail()
+	return a.startTask(ctx, chatID, command{repo: repo, prompt: prompt}, "cb:"+taskID+":"+action, false)
 }
 
 func (a *application) help(ctx context.Context, chatID int64) error {
@@ -536,7 +727,7 @@ func (a *application) help(ctx context.Context, chatID int64) error {
 		"• /status — show the active workspace\n" +
 		"• /new — close this workspace and start fresh\n\n" +
 		"Buttons offer next steps for this conversation. Use /build, /plan or /research when you want to switch mode."
-	return a.replyKeyboard(ctx, chatID, text, contextButtons(a.contextKind(chatID)))
+	return a.replyKeyboard(ctx, chatID, text, a.buttonsForChat(chatID))
 }
 
 func (a *application) status(ctx context.Context, chatID int64) error {
@@ -551,7 +742,7 @@ func (a *application) status(ctx context.Context, chatID int64) error {
 		text = fmt.Sprintf("Workspace: %s\nMode: %s\nState: %s\nSession: %s\nLast used: %s ago",
 			repo, mode, state, sessionID.String(), time.Since(last).Round(time.Second))
 	}
-	return a.replyKeyboard(ctx, chatID, text, contextButtons(a.contextKind(chatID)))
+	return a.replyKeyboard(ctx, chatID, text, a.buttonsForChat(chatID))
 }
 
 // startTask creates the audit task and either opens a fresh workspace or reuses
@@ -595,6 +786,12 @@ func (a *application) startTask(ctx context.Context, chatID int64, c command, ke
 	if task.State == store.StateDone || task.State == store.StateFailed {
 		return a.reply(ctx, chatID, "I already handled that message.")
 	}
+	// Capture the previous task before this one becomes current; it is injected
+	// into the agent prompt so follow-ups do not re-open settled questions.
+	var priorContext string
+	if chat != nil {
+		priorContext = chat.taskContext()
+	}
 	a.event(ctx, session.ID, &task.ID, "status", map[string]string{"state": "QUEUED", "mode": mode})
 	if err := a.db.Transition(ctx, task.ID, store.StateQueued, store.StatePreparing, ""); err != nil {
 		return a.reportError(ctx, chatID, err)
@@ -630,18 +827,23 @@ func (a *application) startTask(ctx context.Context, chatID int64, c command, ke
 		chat = &chatSession{
 			repo: c.repo, mode: mode, session: session, handle: handle,
 			oc: oc, ocSession: ocSession, lastUsed: time.Now(), busy: true,
+			state: "running", lastTask: taskRecord{ID: task.ID.String(), Prompt: c.prompt, Outcome: "running"},
 		}
 		a.putChat(chatID, chat)
 		a.reply(taskCtx, chatID, "Working in "+c.repo+"...")
 	} else if !chat.begin() {
 		return a.reply(ctx, chatID, "I'm still working on the previous message. I'll pick this up next.")
+	} else {
+		chat.setProposal(nil)
+		chat.setState("running")
+		chat.setLastTask(taskRecord{ID: task.ID.String(), Prompt: c.prompt, Outcome: "running"})
 	}
 	defer chat.end()
 
 	if err := a.db.Transition(taskCtx, task.ID, store.StatePreparing, store.StateExecuting, ""); err != nil {
 		return a.reportError(ctx, chatID, err)
 	}
-	summary, err := a.runTask(taskCtx, chat, session, task, chatID, c.prompt, mode)
+	summary, err := a.runTask(taskCtx, chat, session, task, chatID, c.prompt, mode, priorContext)
 	if err != nil {
 		a.fail(taskCtx, session, task, chatID, err)
 		return nil
@@ -649,11 +851,21 @@ func (a *application) startTask(ctx context.Context, chatID int64, c command, ke
 	if err := a.db.Transition(taskCtx, task.ID, store.StateExecuting, store.StateDone, ""); err != nil {
 		return a.reportError(ctx, chatID, err)
 	}
+	chat.setState("done")
+	chat.setLastTask(taskRecord{ID: task.ID.String(), Prompt: c.prompt, Outcome: "completed", Evidence: summary})
+	if proposal := parseProposal(summary, task.ID.String()); proposal != nil {
+		chat.setProposal(proposal)
+		if err := a.replyKeyboard(taskCtx, chatID, "Plan ready. Execute approves it; Revise changes it.", a.buttonsForChat(chatID)); err != nil {
+			log.Printf("gateway: send plan actions: %v", scrubForUser(err))
+		}
+	} else {
+		chat.setProposal(nil)
+	}
 	a.event(taskCtx, session.ID, &task.ID, "done", map[string]string{"summary": summary})
 	return nil
 }
 
-func (a *application) runTask(ctx context.Context, chat *chatSession, session store.Session, task store.Task, chatID int64, prompt, mode string) (string, error) {
+func (a *application) runTask(ctx context.Context, chat *chatSession, session store.Session, task store.Task, chatID int64, prompt, mode, priorContext string) (string, error) {
 	feedCtx, feedCancel := context.WithCancel(ctx)
 	defer feedCancel()
 	rawEvents, err := chat.oc.Events(feedCtx)
@@ -685,10 +897,14 @@ func (a *application) runTask(ctx context.Context, chat *chatSession, session st
 		}
 	}()
 
-	if err := chat.oc.PromptWithAgent(ctx, chat.ocSession, modePrompt(mode, prompt), a.cfg.OpenCode.Model, modeAgent(mode)); err != nil {
+	agentPrompt := modePrompt(mode, prompt)
+	if priorContext != "" {
+		agentPrompt = priorContext + "\n\n" + agentPrompt
+	}
+	if err := chat.oc.PromptWithAgent(ctx, chat.ocSession, agentPrompt, a.cfg.OpenCode.Model, modeAgent(mode)); err != nil {
 		return "", err
 	}
-	summary, err := a.renderer.RelayWithKeyboard(ctx, chatID, session.ID, &task.ID, normalized, contextButtons("done"))
+	summary, err := a.renderer.RelayWithKeyboard(ctx, chatID, session.ID, &task.ID, normalized, contextButtons("done", task.ID.String()))
 	if err != nil {
 		return "", err
 	}
@@ -721,6 +937,11 @@ func (a *application) reportError(ctx context.Context, chatID int64, err error) 
 func (a *application) fail(ctx context.Context, session store.Session, task store.Task, chatID int64, cause error) {
 	reason := scrubForUser(cause)
 	log.Printf("gateway: task %s failed: %s", task.ID, reason)
+	if chat := a.getChat(chatID); chat != nil {
+		chat.setProposal(nil)
+		chat.setOutcome("failed: " + reason)
+		chat.setState("failed")
+	}
 	a.event(ctx, session.ID, &task.ID, "error", map[string]string{"message": reason})
 	current, err := a.db.GetTask(ctx, task.ID)
 	if err != nil {
@@ -734,7 +955,7 @@ func (a *application) fail(ctx context.Context, session store.Session, task stor
 	if len(msg) > 500 {
 		msg = msg[:500]
 	}
-	if err := a.replyKeyboard(ctx, chatID, msg, contextButtons("failed")); err != nil {
+	if err := a.replyKeyboard(ctx, chatID, msg, a.buttonsForChat(chatID)); err != nil {
 		log.Printf("gateway: send failure: %v", err)
 	}
 }
@@ -810,39 +1031,85 @@ func modePromptRest(text string) string {
 	return ""
 }
 
-// contextButtons offers next steps that fit the current conversation instead
-// of a permanent mode-only menu. Mode commands remain available as text.
-func contextButtons(kind string) [][]telegram.InlineButton {
-	switch kind {
-	case "empty":
+// parseProposal reads the agent's structured ask-before-acting line. Only a
+// whole line beginning with PROPOSAL: counts, so prose is never misinterpreted.
+func parseProposal(summary, taskID string) *proposalRecord {
+	for _, line := range strings.Split(summary, "\n") {
+		line = strings.TrimSpace(line)
+		if len(line) < 9 || !strings.EqualFold(line[:9], "PROPOSAL:") {
+			continue
+		}
+		body := strings.TrimSpace(line[9:])
+		if body == "" {
+			return nil
+		}
+		return &proposalRecord{
+			TaskID: taskID,
+			Prompt: "Execute this approved plan in this workspace: " + body +
+				". Make the changes, run the narrowest relevant checks, and report in two sentences. Do not push.",
+		}
+	}
+	return nil
+}
+
+// actionPrompt turns a quick action into a fully specified task. The previous
+// task's own prompt is injected, so the agent never has to guess the referent.
+func actionPrompt(action string, t taskRecord) (string, bool) {
+	switch action {
+	case "checks":
+		return "Run the narrowest relevant checks for this request: " + t.Prompt + ". Report the result in two sentences. Do not push.", true
+	case "explain":
+		return "Explain the change made for this request: " + t.Prompt + ". Two or three sentences with one concrete next step. Do not push.", true
+	case "continue":
+		return "Continue this request: " + t.Prompt + ". It ended as " + t.Outcome + ". Finish the local work only; do not push.", true
+	case "diff":
+		return "List the exact files changed for this request: " + t.Prompt + ". Summarise them in two sentences. Do not push.", true
+	case "summary":
+		return "In two or three sentences, summarise the state of this request: " + t.Prompt + ". Suggest one next step.", true
+	case "revise":
+		return "Revise the plan for this request: " + t.Prompt + ". Return a new PROPOSAL line only. Do not edit files.", true
+	default:
+		return "", false
+	}
+}
+
+// contextButtons offers actions legal in the current state. Every actionable
+// token is bound to a task ID; a stale keyboard cannot start a new task.
+func contextButtons(kind, taskID string) [][]telegram.InlineButton {
+	if taskID == "" {
 		return [][]telegram.InlineButton{{
 			{Text: "How to start", CallbackData: "help"},
 			{Text: "Status", CallbackData: "status"},
 		}}
+	}
+	act := func(label, action string) telegram.InlineButton {
+		return telegram.InlineButton{Text: label, CallbackData: "a:" + taskID + ":" + action}
+	}
+	switch kind {
+	case "running":
+		return [][]telegram.InlineButton{{{Text: "Status", CallbackData: "status"}, {Text: "New topic", CallbackData: "new"}}}
+	case "decision":
+		return [][]telegram.InlineButton{{{Text: "Execute", CallbackData: "exec:" + taskID}, act("Revise", "revise"), {Text: "New topic", CallbackData: "new"}}}
 	case "done":
-		return [][]telegram.InlineButton{{
-			{Text: "Explain this", CallbackData: "act:explain"},
-			{Text: "Run checks", CallbackData: "act:checks"},
-			{Text: "New topic", CallbackData: "new"},
-		}}
+		return [][]telegram.InlineButton{{act("Run checks", "checks"), act("Explain this", "explain"), act("Show diff", "diff")}, {{Text: "New topic", CallbackData: "new"}}}
 	case "failed":
-		return [][]telegram.InlineButton{{
-			{Text: "Continue locally", CallbackData: "act:continue"},
-			{Text: "Status", CallbackData: "status"},
-			{Text: "New topic", CallbackData: "new"},
-		}}
+		return [][]telegram.InlineButton{{act("Continue locally", "continue"), act("Run checks", "checks")}, {{Text: "New topic", CallbackData: "new"}}}
 	default:
-		return [][]telegram.InlineButton{{
-			{Text: "Summarize", CallbackData: "act:summary"},
-			{Text: "Run checks", CallbackData: "act:checks"},
-			{Text: "New topic", CallbackData: "new"},
-		}}
+		return [][]telegram.InlineButton{{act("Summarize", "summary"), act("Run checks", "checks")}, {{Text: "New topic", CallbackData: "new"}}}
 	}
 }
 
-func (a *application) contextKind(chatID int64) string {
-	if a.getChat(chatID) == nil {
-		return "empty"
+func (a *application) buttonsForChat(chatID int64) [][]telegram.InlineButton {
+	chat := a.getChat(chatID)
+	if chat == nil {
+		return contextButtons("empty", "")
 	}
-	return "workspace"
+	_, _, _, _, busy := chat.detail()
+	state := "workspace"
+	if busy {
+		state = "running"
+	} else if chat.hasProposal() {
+		state = "decision"
+	}
+	return contextButtons(state, chat.lastTaskID())
 }

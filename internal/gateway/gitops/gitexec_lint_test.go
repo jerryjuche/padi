@@ -10,8 +10,9 @@ import (
 	"testing"
 )
 
-// TestGitexecIsOnlyGitEntryPoint enforces the spec's lint rule from M1 rather
-// than waiting for M3a: no source file may call exec.Command("git", ...).
+// TestGitexecIsOnlyGitEntryPoint enforces the spec's lint rule: no source file
+// outside gitexec.go may call exec.Command, and no git call may use an
+// agent-writable workspaces/*/repo path as its working directory.
 func TestGitexecIsOnlyGitEntryPoint(t *testing.T) {
 	root, err := filepath.Abs("../..")
 	if err != nil {
@@ -32,6 +33,7 @@ func TestGitexecIsOnlyGitEntryPoint(t *testing.T) {
 		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
+		isGitexec := filepath.Base(path) == "gitexec.go"
 		fset := token.NewFileSet()
 		file, err := parser.ParseFile(fset, path, nil, 0)
 		if err != nil {
@@ -43,13 +45,20 @@ func TestGitexecIsOnlyGitEntryPoint(t *testing.T) {
 			if !ok {
 				return true
 			}
-			sel, ok := call.Fun.(*ast.SelectorExpr)
-			if !ok || sel.Sel.Name != "Command" {
-				return true
+			if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Command" {
+				pkg, ok := sel.X.(*ast.Ident)
+				if ok && pkg.Name == "exec" && !isGitexec {
+					bad = true
+				}
 			}
-			pkg, ok := sel.X.(*ast.Ident)
-			if ok && pkg.Name == "exec" {
-				bad = true
+			// Host-side git must not take a workspace clone as its dir.
+			if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "Run" && len(call.Args) > 0 {
+				if lit, ok := call.Args[0].(*ast.BasicLit); ok {
+					value := strings.ToLower(lit.Value)
+					if strings.Contains(value, "workspaces") && strings.Contains(value, "/repo") {
+						bad = true
+					}
+				}
 			}
 			return true
 		})
@@ -62,6 +71,6 @@ func TestGitexecIsOnlyGitEntryPoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(offenders) != 0 {
-		t.Fatalf("direct exec.Command found; use gitops.Run: %s", strings.Join(offenders, ", "))
+		t.Fatalf("git entry-point lint failed; use gitops.Run and gateway-owned dirs: %s", strings.Join(offenders, ", "))
 	}
 }

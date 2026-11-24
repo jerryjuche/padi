@@ -29,14 +29,15 @@ type Config struct {
 		WorkspaceMaxMB         int `yaml:"workspace_max_mb"`
 	} `yaml:"sessions"`
 	Container struct {
-		Image       string  `yaml:"image"`
-		Runtime     string  `yaml:"runtime"`
-		MemoryMB    int     `yaml:"memory_mb"`
-		CPUs        float64 `yaml:"cpus"`
-		Pids        int     `yaml:"pids"`
-		Network     string  `yaml:"network"`
-		Proxy       string  `yaml:"proxy"`
-		BundleMaxMB int     `yaml:"bundle_max_mb"`
+		Image           string  `yaml:"image"`
+		Runtime         string  `yaml:"runtime"`
+		InternalNetwork bool    `yaml:"internal_network"`
+		MemoryMB        int     `yaml:"memory_mb"`
+		CPUs            float64 `yaml:"cpus"`
+		Pids            int     `yaml:"pids"`
+		Network         string  `yaml:"network"`
+		Proxy           string  `yaml:"proxy"`
+		BundleMaxMB     int     `yaml:"bundle_max_mb"`
 	} `yaml:"container"`
 	OpenCode struct {
 		Model          string `yaml:"model"`
@@ -48,6 +49,8 @@ type Config struct {
 	Git struct {
 		CacheDir      string `yaml:"cache_dir"`
 		WorkspacesDir string `yaml:"workspaces_dir"`
+		QuarantineDir string `yaml:"quarantine_dir"`
+		VerifyDir     string `yaml:"verify_dir"`
 		DefaultRepo   string `yaml:"default_repo"`
 	} `yaml:"git"`
 	Store struct {
@@ -80,6 +83,8 @@ func defaults() Config {
 	c.OpenCode.Snapshots = false
 	c.Git.CacheDir = "/srv/agent/cache/repos"
 	c.Git.WorkspacesDir = "/srv/agent/workspaces"
+	c.Git.QuarantineDir = "/srv/agent/quarantine"
+	c.Git.VerifyDir = "/srv/agent/verify"
 	c.Store.DSNEnv = "DATABASE_URL"
 	return c
 }

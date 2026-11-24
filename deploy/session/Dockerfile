@@ -1,4 +1,13 @@
-# M1 session image. Built for TARGETARCH (amd64 locally, arm64 on the VM).
+# M3a session image. Built for TARGETARCH (amd64 locally, arm64 on the VM).
+FROM golang:1.26-alpine AS verifybuild
+ARG TARGETARCH=amd64
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/agent-verify ./cmd/agent-verify
+COPY internal/verify ./internal/verify
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -trimpath -o /agent-verify ./cmd/agent-verify
+
 FROM ubuntu:24.04
 
 ARG OPENCODE_VERSION=2.4.0
@@ -22,10 +31,13 @@ RUN curl -fsSL https://opencode.ai/v2/install -o /tmp/opencode-install.sh \
 
 ENV PATH="/home/agent/.opencode/bin:${PATH}"
 
-COPY opencode.base.json /opt/agent/opencode.base.json
-COPY AGENTS.target.md /opt/agent/AGENTS.target.md
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod 755 /entrypoint.sh && chown -R agent:agent /opt/agent /entrypoint.sh
+COPY deploy/session/opencode.base.json /opt/agent/opencode.base.json
+COPY deploy/session/AGENTS.target.md /opt/agent/AGENTS.target.md
+COPY deploy/session/entrypoint.sh /entrypoint.sh
+COPY deploy/session/padi-export-bundle /usr/local/bin/padi-export-bundle
+COPY --from=verifybuild /agent-verify /usr/local/bin/agent-verify
+RUN chmod 755 /entrypoint.sh /usr/local/bin/padi-export-bundle /usr/local/bin/agent-verify \
+    && chown -R agent:agent /opt/agent /entrypoint.sh
 
 USER agent
 WORKDIR /workspace

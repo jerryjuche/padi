@@ -32,9 +32,31 @@ func scrub(s string) string {
 // neutralises user/system git configuration, and defaults to HTTPS-only.
 // Callers that need the local file transport append the explicit
 // "-c protocol.file.allow=always" argument themselves.
+// shellMeta is rejected defensively: exec.Command never uses a shell, but
+// callers must not be able to smuggle command syntax into a git argument.
+var shellMeta = strings.NewReplacer(
+	";", "", "&", "", "|", "", "`", "", "$", "", "\n", "", "\r", "",
+	">", "", "<", "", "(", "", ")", "", "{", "", "}", "", "\x00", "",
+)
+
+func rejectShellArg(arg string) error {
+	if shellMeta.Replace(arg) != arg {
+		return fmt.Errorf("gitexec: shell metacharacter in argument %q", arg)
+	}
+	return nil
+}
+
 func Run(ctx context.Context, dir string, env []string, args ...string) ([]byte, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("gitexec: no git arguments")
+	}
+	if err := rejectShellArg(dir); err != nil {
+		return nil, err
+	}
+	for _, arg := range args {
+		if err := rejectShellArg(arg); err != nil {
+			return nil, err
+		}
 	}
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc

@@ -24,13 +24,13 @@ Authoritative summary lives in `README.md` §17 and `BUILD_SPEC.md` §8[cite: 2,
 | V6 | Oracle Always Free idle-reclaim thresholds & OCI Monitoring memory utilization metric | M0 | Recorded (reclaim rule; OCI metric detail pending) | 2026-11-23 | Official Always Free docs: an instance is idle if, over a 7-day period, CPU utilization at the 95th percentile is <20%, network utilization is <20%, and (A1 shapes only) memory utilization is <20%; idle Always Free instances may be reclaimed. This validates the memory-floor `keepalive` design. The exact OCI Monitoring "memory utilization" computation for this instance still needs a live tenancy check. |
 | V7 | Repo cache `clone_mode: partial` offline compatibility in container (optional) | M3a | Pending | — | — |
 | V8 | Tenancy Always Free Arm allowance (2 OCPU / 12 GB vs 4 OCPU / 24 GB) | M0 | Recorded | 2026-11-23 | Owner confirmed 2 OCPU / 12 GB envelope; system sized to fit it. Current Oracle docs state 1,500 OCPU-hours and 9,000 GB-hours per month for A1 (equivalent to 2 OCPU / 12 GB), and confirm 200 GB total block storage and 5 free volume backups. The older 3,000 / 18,000 figure quoted in `README.md` V8 and `BUILD_SPEC.md` V8 appears stale; this does not change the design because it is already sized to the smaller envelope. |
-| V9 | Rootless Docker cgroup v2 delegation (`cpu memory pids`), OOM kill at limit, unprivileged ports | M0, M3a | Pending | — | — |
-| V10 | gVisor (`runsc`) on arm64 with rootless Docker vs hardened `runc` | M3a | Partial (host only) | 2026-11-24 | `command -v runsc` is empty; Docker 29.4.0 uses `runc`, cgroup v2 with `systemd` driver, seccomp+AppArmor enabled. Hardened probe `docker run --runtime runc --security-opt no-new-privileges --cap-drop ALL --read-only --tmpfs /tmp --memory 128m --cpus 0.5 --pids-limit 64` returned `CapEff: 0000000000000000`, rootfs `ro`, `memory.max=134217728`, `cpu.max=50000 100000`, `pids.max=64`. This host uses `/var/run/docker.sock` (not rootless) and amd64; gVisor on arm64/rootless stays unverified until the VM. Select hardened `runc` for M3a and re-test `runsc` on the VM. |
-| V11 | Network topology isolation (`scripts/netcheck.sh` from inside session container) | M3a | Resolved (probe; script pending) | 2026-11-24 | Internal network `m3a-probe-internal` with fake `router` and `egress-proxy` services, session container on that network only: `router:8090 -> 200`, `egress-proxy:3129 -> 200`, `https://api.telegram.org -> 000`, host bridge `172.20.0.1:8090 -> 000`. `scripts/netcheck.sh` will encode this probe in M3a. |
+| V9 | Rootless Docker cgroup v2 delegation (`cpu memory pids`), OOM kill at limit, unprivileged ports | M0, M3a | Partial (host OOM proven; VM/rootless pending) | 2026-11-24 | On this host: `memory.max=268435456`, hog `exit 137`, `OOMKilled=true`, control HTTP stayed `200` before and after. Hardened flags were `--runtime runc --security-opt no-new-privileges --cap-drop ALL --read-only --tmpfs /tmp:rw,nosuid,nodev,exec,size=512m --memory 128m --cpus 0.5 --pids-limit 64`. Rootless cgroup delegation on the ARM VM still pending under owner Option B. |
+| V10 | gVisor (`runsc`) on arm64 with rootless Docker vs hardened `runc` | M3a | Partial (host only) | 2026-11-24 | `command -v runsc` is empty; Docker 29.4.0 uses `runc`, cgroup v2 with `systemd` driver, seccomp+AppArmor enabled. Hardened probe returned `CapEff: 0000000000000000`, rootfs `ro`, `memory.max=134217728`, `cpu.max=50000 100000`, `pids.max=64`. `scripts/runtime-bench.sh`: `runc: bench-ok in 634ms (hardened limits)`, `runsc: unavailable (command -v runsc empty)`. This host uses `/var/run/docker.sock` (not rootless) and amd64; gVisor on arm64/rootless stays unverified until the VM. Select hardened `runc` for M3a and re-test `runsc` on the VM. |
+| V11 | Network topology isolation (`scripts/netcheck.sh` from inside session container) | M3a | Resolved | 2026-11-24 | `./scripts/netcheck.sh` built two throwaway internal networks and ran inside a real session container: allowed `router:8090 -> 200`, `egress-proxy:3129 -> 200`; blocked public internet, cloud metadata, host bridge `:8080`/`:5432`, a container on another internal network and the Docker socket. Final output: `netcheck: 8/8 zones correct`. |
 | V12 | OpenCode headless `lsp`, `snapshot`, custom headers (`X-Task-Id`), MCP / custom tools | M1, M3a | Resolved | 2026-11-23 | Real `opencode v2.4.0` plus official `https://opencode.ai/config.json`. Schema keys: `lsp` (bool or per-server overrides), `snapshot` (**deprecated**) and `snapshots` (bool, authoritative), `provider` (deprecated) and `providers.<id>.headers` (string map), `mcp.servers.<name>` with `type: remote` + `url` (+ optional `headers`) or `type: local` + `command` array. There is **no config key for custom tools**; extension is via `plugins` / `plugin` (deprecated) or MCP servers, and built-in tools are gated by `tools` (deprecated) / `permissions`. Live probe: a temp project `opencode.json` with `lsp:false`, `snapshot:false`, `providers.probe.headers.x-probe:yes` and `mcp.servers.probe-remote` was accepted by `opencode serve`; authenticated `GET /api/config` returned `lsp:false`, `snapshots:false`, `providers:["probe"]`, `mcp:["servers"]`. M1 sets `lsp:false` and `snapshots:false` in `opencode.base.json`; per-provider headers are available for M2's router and `X-Task-Id`; MCP/tools work is deferred to M3a/M12 as specified. Live-loop evidence: the fake provider received `x-task-id=<task-id>` and `x-session-id=<session-id>` headers, and `settings.baseURL` pointed at the local fake provider. Provider override probe (same binary): `providers.<id>.models.<modelID>` with `modelID` is accepted (`id` also works); a custom provider needs `name`, `env`, `package: "@opencode/ai/providers/openai-compatible"`, `settings.baseURL` and `models`. `opencode models` then lists `nvidia/nvidia/nemotron-3.5-bolt-e4b` and the declared `groq/...` models, and `opencode serve` starts with both declared and no keys present. NVIDIA's API docs confirm the upstream ID `nvidia/nemotron-3.5-bolt-e4b`; models.dev does not yet ship it, hence the explicit override. |
 | V13 | Search provider configuration (`none` vs `searxng`) | M3a | Resolved (`none`) | 2026-11-24 | No searxng config, service, URL or credential exists in `config/`, `deploy/`, `scripts/` or host (`grep -rn searxng` returned only this VERIFY row). Choose `provider: none`; research search returns `search_unavailable` and tells the agent to fetch known documentation URLs. Revisit when M12 has an acceptable free-tier provider. |
 | V14 | Object Storage upload from arm64 (S3-compatible API / CLI without Python), boot backups, external monitors | M0 | Design resolved; live drill pending (VM not ready) | 2026-11-23 | Use **rclone's native `oracleobjectstorage` backend** (single static Go binary, arm64 build, no Python/OCI CLI) with `provider = instance_principal_auth`: certificates come from instance metadata, so **no credentials are stored on the VM** (Hard Rule 2). Config needs `namespace`, `region`, and (only for bucket listing) `compartment`; a dynamic group containing the instance plus an Object Storage policy are the only tenancy-side requirements. The S3-compatible alternative works but requires long-lived Customer Secret Keys on the VM, so it is rejected. Boot-volume backups: Oracle supports policy-based automatic backups; Always Free includes 5 free volume backups. External monitors: Healthchecks.io Hobbyist is USD 0/month with 20 checks (dead-man's switch via `HEALTHCHECK_PING_URL`); UptimeRobot has a free tier for HTTPS uptime. Live upload/alert drill awaits the ARM64 VM. See `update.md` §11 for the ordered VM command checklist. |
-| V15 | `git bundle` round trip, `--no-hardlinks` offline clone, bundle size cap on large repos | M3a, M3b | Resolved (small fixture) | 2026-11-24 | In `/tmp/opencode/m3a-v15`: `git -C source bundle create /tmp/opencode/m3a-v15/repo.bundle --all` then `git clone --no-hardlinks repo.bundle offline-clone` produced byte-identical `README.md` and `docs/note.txt`, `git rev-list --count HEAD = 1`, bundle 447 bytes (`cap_ok` against 200 MB). Large-repo cap behaviour still needs M3b evidence. |
+| V15 | `git bundle` round trip, `--no-hardlinks` offline clone, bundle size cap on large repos | M3a, M3b | Resolved (small fixture) | 2026-11-24 | Pre-code probe: `git bundle create` then `git clone --no-hardlinks` produced byte-identical files, bundle 447 bytes. M3a real drill: container-side `padi-export-bundle`, host copy-out, `gitops.Quarantine`, `CheckoutForVerify` and a fresh verify container returned `verdict: pass` with `verify_exit=0`; bundle was 466 bytes. The bundle size cap is unit-tested (`ErrExportFailed` over 1 MB); large-repo timing/cap still needs M3b evidence. |
 | V16 | Chromium/Playwright on arm64 within 2 GB cap + remote MCP browser server | M11 | Pending | — | — |
 | V17 | `/dev/kvm` presence on VM (`ls /dev/kvm`) | M16 | Pending | — | — |
 | V18 | OpenCode skills discovery paths, config key, per-skill permissions, `question` event surfacing | M12 | Pending | — | — |
@@ -136,6 +136,77 @@ cap_ok 447 1
 ```
 
 Limits: this host is amd64 with a root Docker socket, so V10's arm64/rootless/gVisor portion and the large-repository half of V15 remain open for the VM/M3b.
+
+## M3a implementation acceptance (2026-11-24)
+
+```
+$ gofmt -l cmd internal
+internal/gateway/runner/runner.go
+internal/gateway/runner/runner_test.go
+$ gofmt -w internal/gateway/runner/runner.go internal/gateway/runner/runner_test.go
+$ GOPROXY=off go vet ./...
+$ GOPROXY=off go test -race -count=1 ./...
+ok  github.com/jerryjuche/padi/... (all packages)
+```
+
+Real network drill (8/8):
+
+```
+allowed http://router:8090/ -> 200 (want 200)
+allowed http://egress-proxy:3129/ -> 200 (want 200)
+blocked https://api.telegram.org/ -> 000 (want 000)
+blocked http://169.254.169.254/latest/meta-data/ -> 000 (want 000)
+blocked http://172.17.0.1:8080/ -> 000 (want 000)
+blocked http://172.17.0.1:5432/ -> 000 (want 000)
+blocked http://172.22.0.2:8091/ -> 000 (want 000)
+blocked /var/run/docker.sock -> absent
+netcheck: 8/8 zones correct
+```
+
+Bundle → quarantine → verify-container drill (local fixture, real containers):
+
+```
+session_container=14bbe83816db7c57d499d8e258e0e138af9c368c5bfd5f16cf2ef04aabda368a
+exported_bundle=/tmp/opencode/m3a-live/exported.bundle
+quarantine_head=d2c1c6d9bcb24b4729f352e9a5dd33b862be7b3f
+verify_checkout=/tmp/opencode/m3a-live/verify/checkout
+verify_container=bcb8f6da674adef014ca24ec1dcb990ea850b402269ae389ddeb8ba9c02eee35
+verify_exit=0 oom=false
+{
+  "verdict": "pass",
+  "steps": [
+    {"name":"go test","ok":true,"duration_ms":119225,"output_tail":"ok  \tfixture\t0.065s\n"}
+  ]
+}
+```
+
+Egress research drill with a local dummy router token (no real secret used):
+
+```
+status=ok title='Example Domain' chars=156
+private fetch: http=403 {"code":"research_refused",...}
+audit reason=port_not_allowed
+search: http=501 {"code":"search_unavailable",...}
+build proxy allowlisted registry.npmjs.org -> 200
+build proxy api.telegram.org -> 403 CONNECT tunnel failed
+```
+
+OOM isolation:
+
+```
+control_before=200
+hog_exit=137 hog_oomkilled=true
+control_after=200
+```
+
+Decisions from defects found in the real drill:
+
+- Docker `exec` must inspect `/exec/{id}/json`; a nonzero exit is now an error instead of a silent success.
+- `/tmp` tmpfs needs explicit `exec` for compiled test binaries, `nosuid,nodev` retained; size raised to 512 MB for Go caches.
+- The writable tmpfs is `/home/agent/.config`, not `/home/agent`, so the installed `opencode` binary stays visible.
+- Explicit `PATH` and `HOME` are injected because the container API replaces the image environment.
+- The fixed export script writes its bundle to `/workspace/.padi-task.bundle` because Docker cannot copy out of a runtime tmpfs; it deletes that file before every export so it is never committed.
+- Image rebuilt after these changes: `sandbox-agent-session:latest` = `sha256:24ff03b73b5e4b336adea2afac2355569eb369df80092953378877a9d3bf5a84`.
 
 ## M0 VM-only deferral — owner Option B (2026-11-23)
 

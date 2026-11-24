@@ -1,0 +1,26 @@
+#!/bin/sh
+# Fixed container-side export command. Called only by gitops.ExportBundle with
+# validated arguments; it never runs in a gateway-owned repository.
+set -eu
+
+base="$1"
+branch="$2"
+out="$3"
+
+printf '%s' "$base" | grep -Eq '^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$' || exit 2
+printf '%s' "$branch" | grep -Eq '^agent/[a-z0-9._-]{1,60}$' || exit 2
+
+# The gateway owns the mounted workspace on the host, so its UID may differ
+# from the agent user. Trust only this exact path, only for this fixed script.
+# Remove the previous export artifact before inspecting status so it is never
+# committed into the next bundle.
+rm -f /workspace/.padi-task.bundle
+git -c safe.directory=/workspace -C /workspace status --porcelain > /tmp/padi-status.tmp
+if [ -s /tmp/padi-status.tmp ]; then
+  git -c safe.directory=/workspace -C /workspace add -A
+  git -c safe.directory=/workspace -C /workspace \
+    -c user.name=sandbox-agent -c user.email=noreply@sandbox.local \
+    commit --quiet -m 'agent: task changes'
+fi
+git -c safe.directory=/workspace -C /workspace \
+  bundle create "$out" "refs/heads/$branch" --not "$base"

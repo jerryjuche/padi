@@ -12,15 +12,19 @@ import (
 
 // Config is supplied from config/gateway.yaml plus environment-only secrets.
 type Config struct {
-	Image         string
-	Network       string
-	MemoryMB      int
-	CPUs          float64
-	Pids          int
-	Model         string
-	RouterToken   string // only credential passed to the session container
-	RouterBaseURL string // OpenAI-compatible router endpoint, always /v1
-	TaskIDHeader  string // optional per-provider header value source
+	Image           string
+	Network         string
+	Runtime         string // runc or runsc, chosen from runtime-bench evidence
+	InternalNetwork bool   // M3a: no default route out of the session network
+	MemoryMB        int
+	CPUs            float64
+	Pids            int
+	Model           string
+	RouterToken     string // only credential passed to the session container
+	RouterBaseURL   string // OpenAI-compatible router endpoint, always /v1
+	ProxyURL        string // egress-proxy build port
+	BundleMaxMB     int
+	TaskIDHeader    string // optional per-provider header value source
 }
 
 // Handle is the live container plus the address/password of its OpenCode API.
@@ -56,7 +60,7 @@ func (r *Runner) Start(ctx context.Context, taskID, workDir string) (Handle, err
 	if taskID == "" || strings.ContainsAny(taskID, "/\\..") {
 		return Handle{}, fmt.Errorf("runner: invalid task id %q", taskID)
 	}
-	if err := r.Docker.EnsureNetwork(ctx, r.Cfg.Network); err != nil {
+	if err := r.Docker.EnsureNetwork(ctx, r.Cfg.Network, r.Cfg.InternalNetwork); err != nil {
 		return Handle{}, err
 	}
 	password, err := randomPassword()
@@ -64,15 +68,25 @@ func (r *Runner) Start(ctx context.Context, taskID, workDir string) (Handle, err
 		return Handle{}, err
 	}
 	env := []string{
+		"PATH=/home/agent/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"HOME=/home/agent",
 		"OPENCODE_PASSWORD=" + password,
 		"PADI_TASK_ID=" + taskID,
+		"TASK_ID=" + taskID,
+		"SESSION_ID=" + taskID,
 		"PADI_MODEL=" + r.Cfg.Model,
 		"PADI_MODEL_BASE_URL=" + r.Cfg.RouterBaseURL,
+	}
+	if r.Cfg.ProxyURL != "" {
+		env = append(env, "HTTP_PROXY="+r.Cfg.ProxyURL, "HTTPS_PROXY="+r.Cfg.ProxyURL,
+			"http_proxy="+r.Cfg.ProxyURL, "https_proxy="+r.Cfg.ProxyURL,
+			"NO_PROXY=router,egress-proxy,localhost,127.0.0.1",
+			"no_proxy=router,egress-proxy,localhost,127.0.0.1")
 	}
 	if r.Cfg.RouterToken != "" {
 		env = append(env, "ROUTER_TOKEN="+r.Cfg.RouterToken)
 	}
-	spec := ContainerSpec{
+	spec := r.hardenedSpec(ContainerSpec{
 		Name:       "padi-task-" + taskID,
 		Image:      r.Cfg.Image,
 		Env:        env,
@@ -85,8 +99,10 @@ func (r *Runner) Start(ctx context.Context, taskID, workDir string) (Handle, err
 		Labels: map[string]string{
 			"sandbox-agent": "true",
 			"padi_task_id":  taskID,
+			"padi_role":     "session",
 		},
-	}
+		PublishPorts: true,
+	})
 	id, err := r.Docker.Create(ctx, spec)
 	if err != nil {
 		return Handle{}, err
@@ -103,8 +119,82 @@ func (r *Runner) Start(ctx context.Context, taskID, workDir string) (Handle, err
 	return Handle{ID: id, Address: address, Password: password, TaskID: taskID}, nil
 }
 
+// hardenedSpec applies the M3a boundary to every container. The rootfs is
+// read-only, all capabilities are dropped, no new privileges are allowed, and
+// only /tmp plus the agent home are writable tmpfs mounts.
+func (r *Runner) hardenedSpec(spec ContainerSpec) ContainerSpec {
+	spec.Runtime = r.Cfg.Runtime
+	if spec.Runtime == "" {
+		spec.Runtime = "runc"
+	}
+	spec.ReadonlyRootfs = true
+	spec.Tmpfs = map[string]string{
+		"/tmp":                "rw,nosuid,nodev,exec,size=512m",
+		"/home/agent/.config": "rw,nosuid,nodev,size=64m,uid=1001,gid=1001,mode=0700",
+	}
+	spec.CapDrop = []string{"ALL"}
+	spec.SecurityOpt = []string{"no-new-privileges"}
+	spec.User = "agent"
+	return spec
+}
+
+// StartVerify starts a fresh, short-lived container on a quarantine checkout.
+// It never runs in the agent's container and is removed by the caller on exit.
+func (r *Runner) StartVerify(ctx context.Context, taskID, checkoutDir string) (Handle, error) {
+	if taskID == "" || strings.ContainsAny(taskID, "/\\..") || checkoutDir == "" {
+		return Handle{}, fmt.Errorf("runner: invalid verify request %q / %q", taskID, checkoutDir)
+	}
+	if err := r.Docker.EnsureNetwork(ctx, r.Cfg.Network, r.Cfg.InternalNetwork); err != nil {
+		return Handle{}, err
+	}
+	spec := r.hardenedSpec(ContainerSpec{
+		Name:  "padi-verify-" + taskID,
+		Image: r.Cfg.Image,
+		Env: []string{
+			"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+			"PADI_TASK_ID=" + taskID, "TASK_ID=" + taskID, "HOME=/home/agent",
+			"GOCACHE=/tmp/go-build", "GOMODCACHE=/tmp/go-mod", "XDG_CACHE_HOME=/tmp/cache",
+		},
+		Binds:    []string{checkoutDir + ":/workspace:ro"},
+		Network:  r.Cfg.Network,
+		MemoryMB: r.Cfg.MemoryMB, CPUs: r.Cfg.CPUs, Pids: r.Cfg.Pids,
+		ExposePort: "4097/tcp",
+		Labels: map[string]string{
+			"sandbox-agent": "true",
+			"padi_task_id":  taskID,
+			"padi_role":     "verify",
+		},
+		Entrypoint: []string{"/usr/local/bin/agent-verify"},
+		Cmd:        []string{"--format", "json", "--timeout", "10m", "/workspace"},
+	})
+	id, err := r.Docker.Create(ctx, spec)
+	if err != nil {
+		return Handle{}, err
+	}
+	if err := r.Docker.Start(ctx, id); err != nil {
+		_ = r.Docker.Remove(context.Background(), id)
+		return Handle{}, err
+	}
+	return Handle{ID: id, TaskID: taskID}, nil
+}
+
 func (r *Runner) Wait(ctx context.Context, id string) (int, error) {
 	return r.Docker.Wait(ctx, id)
+}
+
+// WaitInfo reports both the exit code and OOM kill flag. OOM is always a task
+// failure, whether it happened in the session or the verify container.
+func (r *Runner) WaitInfo(ctx context.Context, id string) (ExitInfo, error) {
+	return r.Docker.WaitInfo(ctx, id)
+}
+
+func OOMKilled(info ExitInfo) bool {
+	return info.OOMKilled || info.ExitCode == 137
+}
+
+// CopyOut retrieves ONE file from a container under an explicit byte cap.
+func (r *Runner) CopyOut(ctx context.Context, id, path, dest string, maxBytes int64) error {
+	return r.Docker.CopyOut(ctx, id, path, dest, maxBytes)
 }
 
 func (r *Runner) Stop(ctx context.Context, id string) error {

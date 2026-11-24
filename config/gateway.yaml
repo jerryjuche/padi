@@ -18,12 +18,13 @@ sessions:
 
 container:
   image: "sandbox-agent-session:latest"
-  runtime: runc
+  runtime: runc                  # V10: runsc absent here; revisit on the VM
+  internal_network: true         # M3a: no default route out of the sandbox
   memory_mb: 2560
   cpus: 1.0
   pids: 512
-  network: "agent-session-net"   # plain bridge in M1; internal in M3a
-  proxy: ""                      # unused until M3a
+  network: "agent-session-net"
+  proxy: "http://egress-proxy:3128"
   bundle_max_mb: 200
 
 opencode:
@@ -39,6 +40,8 @@ opencode:
 git:
   cache_dir: "/srv/agent/cache/repos"
   workspaces_dir: "/srv/agent/workspaces"
+  quarantine_dir: "/srv/agent/quarantine"
+  verify_dir: "/srv/agent/verify"
   default_repo: ""               # optional local source for the M1 spike
 
 store:

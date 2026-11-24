@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jerryjuche/padi/internal/gateway/telegram"
 )
@@ -111,25 +112,163 @@ func TestModesAndButtons(t *testing.T) {
 	if !validMode(modeResearch) || validMode("nonsense") {
 		t.Fatal("validMode is wrong")
 	}
-	want := map[string][]string{
-		"empty":     {"help", "status"},
-		"workspace": {"act:summary", "act:checks", "new"},
-		"done":      {"act:explain", "act:checks", "new"},
-		"failed":    {"act:continue", "status", "new"},
-	}
-	for kind, expected := range want {
-		rows := contextButtons(kind)
-		if len(rows) != 1 || len(rows[0]) != len(expected) {
-			t.Fatalf("%s rows=%v", kind, rows)
-		}
-		for i, b := range rows[0] {
-			if b.CallbackData != expected[i] {
-				t.Errorf("%s button %d=%q want %q", kind, i, b.CallbackData, expected[i])
-			}
-		}
-	}
 	if !strings.Contains(modePrompt(modeBuild, "check auth"), chatStyle) {
 		t.Fatal("build prompt is missing the chat style contract")
+	}
+	rows := contextButtons("empty", "")
+	if len(rows) != 1 || len(rows[0]) != 2 || rows[0][0].CallbackData != "help" || rows[0][1].CallbackData != "status" {
+		t.Fatalf("empty buttons=%v", rows)
+	}
+}
+
+func TestButtonsAreTaskScoped(t *testing.T) {
+	const id = "task-42"
+	cases := []struct {
+		kind string
+		want []string
+	}{
+		{"running", []string{"status", "new"}},
+		{"decision", []string{"exec:task-42", "a:task-42:revise", "new"}},
+		{"done", []string{"a:task-42:checks", "a:task-42:explain", "a:task-42:diff", "new"}},
+		{"failed", []string{"a:task-42:continue", "a:task-42:checks", "new"}},
+		{"workspace", []string{"a:task-42:summary", "a:task-42:checks", "new"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.kind, func(t *testing.T) {
+			rows := contextButtons(tc.kind, id)
+			var got []string
+			for _, row := range rows {
+				for _, b := range row {
+					got = append(got, b.CallbackData)
+				}
+			}
+			if strings.Join(got, ",") != strings.Join(tc.want, ",") {
+				t.Fatalf("buttons=%q want %q", got, tc.want)
+			}
+			for _, token := range got {
+				if strings.HasPrefix(token, "act:") {
+					t.Errorf("legacy unscoped token %q", token)
+				}
+			}
+		})
+	}
+	if rows := contextButtons("done", "other-task"); strings.Contains(keyboardTokens(rows), id) {
+		t.Fatalf("stale task id leaked into buttons: %v", rows)
+	}
+}
+
+func keyboardTokens(rows [][]telegram.InlineButton) string {
+	var b strings.Builder
+	for _, row := range rows {
+		for _, button := range row {
+			b.WriteString(button.CallbackData)
+			b.WriteString(" ")
+		}
+	}
+	return b.String()
+}
+
+func TestParseProposal(t *testing.T) {
+	cases := []struct {
+		name    string
+		summary string
+		want    bool
+	}{
+		{"valid", "Here is the plan.\nPROPOSAL: add tests; internal/foo.go; run go test; low", true},
+		{"lowercase", "\tproposal: fix parser; main.go; unit tests; none", true},
+		{"inline prose is ignored", "I mentioned PROPOSAL: inline but did not end with one.", false},
+		{"empty body", "PROPOSAL:", false},
+		{"none", "Done, no approval needed.", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := parseProposal(tc.summary, "task-1")
+			if (p != nil) != tc.want {
+				t.Fatalf("proposal=%+v want=%v", p, tc.want)
+			}
+			if p != nil && (p.TaskID != "task-1" || !strings.Contains(p.Prompt, "add tests") && !strings.Contains(p.Prompt, "fix parser")) {
+				t.Fatalf("proposal lost its plan: %+v", p)
+			}
+		})
+	}
+}
+
+func TestActionPromptCarriesTaskContext(t *testing.T) {
+	task := taskRecord{ID: "task-1", Prompt: "fix the flaky test in router", Outcome: "completed"}
+	for _, action := range []string{"checks", "explain", "continue", "diff", "summary", "revise"} {
+		prompt, ok := actionPrompt(action, task)
+		if !ok || !strings.Contains(prompt, task.Prompt) {
+			t.Errorf("action %s: prompt=%q ok=%v", action, prompt, ok)
+		}
+	}
+	if _, ok := actionPrompt("unknown", task); ok {
+		t.Fatal("unknown action should be rejected")
+	}
+}
+
+func TestTaskContextDoesNotRepeatQuestions(t *testing.T) {
+	chat := &chatSession{lastTask: taskRecord{
+		ID: "task-1", Prompt: "add a retry", Outcome: "completed", Evidence: "go test passed", Files: []string{"a.go"},
+	}}
+	got := chat.taskContext()
+	for _, want := range []string{"add a retry", "completed", "a.go", "do not re-ask settled questions"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("context %q missing %q", got, want)
+		}
+	}
+	chat.setLastTask(taskRecord{})
+	if got := chat.taskContext(); got != "" {
+		t.Fatalf("empty task should have empty context, got %q", got)
+	}
+}
+
+func TestMarkActionRejectsDuplicateTap(t *testing.T) {
+	a := &application{}
+	if !a.markAction("a:task-1:checks") {
+		t.Fatal("first tap should start")
+	}
+	if a.markAction("a:task-1:checks") {
+		t.Fatal("duplicate tap should be ignored")
+	}
+	if !a.markAction("a:task-1:explain") {
+		t.Fatal("different action on same task should start")
+	}
+}
+
+func TestStaleAndUnapprovedCallbacks(t *testing.T) {
+	var mu sync.Mutex
+	var texts []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		if strings.Contains(r.URL.Path, "sendMessage") {
+			mu.Lock()
+			texts = append(texts, r.Form.Get("text"))
+			mu.Unlock()
+		}
+		fmt.Fprint(w, `{"ok":true,"result":{"message_id":1}}`)
+	}))
+	defer srv.Close()
+	a := &application{cfg: defaults(), tg: &telegram.Client{
+		BaseURL: srv.URL, Token: "test", HTTP: srv.Client(),
+	}, pending: map[int64]string{}, modes: map[int64]string{}, chats: map[int64]*chatSession{}, actions: map[string]time.Time{}}
+	chat := &chatSession{lastUsed: time.Now(), lastTask: taskRecord{ID: "task-1", Prompt: "fix parser", Outcome: "completed"}}
+	a.putChat(42, chat)
+	callback := func(data string) error {
+		return a.handleCallback(context.Background(), &telegram.CallbackQuery{
+			ID: "cb-1", From: telegram.User{ID: 42}, Data: data,
+			Message: &telegram.Message{Chat: telegram.Chat{ID: 42, Type: "private"}},
+		})
+	}
+	if err := callback("a:task-99:checks"); err != nil {
+		t.Fatal(err)
+	}
+	if err := callback("exec:task-1"); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(texts) != 2 || !strings.Contains(texts[0], "older task") || !strings.Contains(texts[1], "no longer active") {
+		t.Fatalf("replies=%q", texts)
 	}
 }
 
