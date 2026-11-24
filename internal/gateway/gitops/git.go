@@ -162,7 +162,10 @@ func (g *Git) cachePath(repo string) string {
 	return filepath.Join(g.CacheDir, cacheName(repo))
 }
 
-func (g *Git) extraheader(ctx context.Context, repo string) ([]string, error) {
+// authEnv passes the installation token through git's environment instead of
+// a `-c` argument. Command lines appear in errors, process listings and logs;
+// environment values do not. gitexec.Run additionally scrubs token patterns.
+func (g *Git) authEnv(ctx context.Context, repo string) ([]string, error) {
 	if isLocal(repo) {
 		return nil, nil
 	}
@@ -170,7 +173,29 @@ func (g *Git) extraheader(ctx context.Context, repo string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	return []string{"-c", "http.extraheader=Authorization: Bearer " + token}, nil
+	// GitHub git-over-HTTPS expects Basic auth with x-access-token as the
+	// username. A Bearer extraheader is accepted by the REST API but makes git
+	// fall back to an anonymous prompt. The base64 value stays in the process
+	// environment, never in a command line.
+	return []string{
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=http.extraheader",
+		"GIT_CONFIG_VALUE_0=" + basicAuthValue(token),
+	}, nil
+}
+
+func basicAuthValue(token string) string {
+	encoded := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token))
+	return "Authorization: Basic " + encoded
+}
+
+// gitSource returns the HTTPS URL git understands. The canonical repo key
+// stays `owner/repo` for the database, cache name and Telegram replies.
+func gitSource(repo string) string {
+	if isLocal(repo) {
+		return strings.TrimPrefix(repo, "file://")
+	}
+	return "https://github.com/" + repo
 }
 
 func isLocal(repo string) bool {
@@ -194,26 +219,23 @@ func (g *Git) EnsureCache(ctx context.Context, repo string) (string, error) {
 		return "", err
 	}
 	cache := g.cachePath(repo)
-	auth, err := g.extraheader(ctx, repo)
+	auth, err := g.authEnv(ctx, repo)
 	if err != nil {
 		return "", err
 	}
-	args := append([]string{}, append(localArgs(repo), auth...)...)
-	source := repo
-	if strings.HasPrefix(repo, "file://") {
-		source = strings.TrimPrefix(repo, "file://")
-	}
+	args := localArgs(repo)
+	source := gitSource(repo)
 	if st, err := os.Stat(cache); err == nil && st.IsDir() {
 		fetch := append([]string{}, args...)
 		fetch = append(fetch, "-C", cache, "fetch", "--prune", "origin")
-		if _, err := Run(ctx, g.CacheDir, nil, fetch...); err != nil {
+		if _, err := Run(ctx, g.CacheDir, auth, fetch...); err != nil {
 			return "", fmt.Errorf("gitops: fetch cache: %w", err)
 		}
 		return cache, nil
 	}
 	clone := append([]string{}, args...)
 	clone = append(clone, "clone", "--bare", "--no-hardlinks", "--quiet", source, cache)
-	if _, err := Run(ctx, g.CacheDir, nil, clone...); err != nil {
+	if _, err := Run(ctx, g.CacheDir, auth, clone...); err != nil {
 		return "", fmt.Errorf("gitops: clone cache: %w", err)
 	}
 	return cache, nil

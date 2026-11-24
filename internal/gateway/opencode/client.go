@@ -115,9 +115,29 @@ func (c *Client) SetModel(ctx context.Context, sessionID, model string) error {
 	return resp.Body.Close()
 }
 
-// Prompt posts a user message. model, if set, is applied to the session first.
-func (c *Client) Prompt(ctx context.Context, sessionID, text, model string) error {
+// SetAgent selects the primary agent for a session. OpenCode v2 exposes this
+// as POST /api/session/{id}/agent; the built-in plan agent and any custom
+// agents declared in opencode.base.json are valid values.
+func (c *Client) SetAgent(ctx context.Context, sessionID, agent string) error {
+	if agent == "" {
+		return nil
+	}
+	resp, err := c.do(ctx, http.MethodPost, "/api/session/"+url.PathEscape(sessionID)+"/agent",
+		map[string]any{"agent": agent})
+	if err != nil {
+		return err
+	}
+	return resp.Body.Close()
+}
+
+// Prompt posts a user message. Model and agent are applied to the session
+// first when set, so a follow-up can switch between build, plan and research
+// without losing the OpenCode conversation history.
+func (c *Client) PromptWithAgent(ctx context.Context, sessionID, text, model, agent string) error {
 	if err := c.SetModel(ctx, sessionID, model); err != nil {
+		return err
+	}
+	if err := c.SetAgent(ctx, sessionID, agent); err != nil {
 		return err
 	}
 	resp, err := c.do(ctx, http.MethodPost, "/api/session/"+url.PathEscape(sessionID)+"/prompt",
@@ -126,6 +146,11 @@ func (c *Client) Prompt(ctx context.Context, sessionID, text, model string) erro
 		return err
 	}
 	return resp.Body.Close()
+}
+
+// Prompt posts a user message with the session's current agent.
+func (c *Client) Prompt(ctx context.Context, sessionID, text, model string) error {
+	return c.PromptWithAgent(ctx, sessionID, text, model, "")
 }
 
 // Abort interrupts a running session (POST .../interrupt in v2).

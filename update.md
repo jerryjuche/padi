@@ -720,3 +720,62 @@ The poller also now waits 2 seconds after a failed handler before replaying the 
 - Gateway restarted with real credentials: `M1 spine ready (model=nvidia/nvidia/nemotron-3.5-bolt-e4b, network=agent-session-net)`, no handler errors.
 - Cursor advanced `0` → `374300394`; `getUpdates` now reports zero pending updates.
 - No new session or task was created by the queued `/start`, `Hi`, `Hello` messages — they only received the escaped help/no-repo hint. The gateway is still running in the background with pid recorded in `/tmp/opencode/gateway-live.pid`.
+
+### 16.4 Silent task failures — `tasks_repo_fkey`
+
+The next queued messages (`Clone GitHub.com/jerryjuche/koder`, then its prompt) created tasks but failed before a container started. The database error was:
+
+```
+store: create task: ERROR: insert or update on table "tasks" violates foreign key constraint "tasks_repo_fkey" (SQLSTATE 23503)
+```
+
+`agent.tasks.repo` references `agent.repos.full_name`; the bot only inserted into `agent.tasks`. Errors were logged but never returned to the owner, so Telegram looked dead. Fixes:
+
+- `store.EnsureRepo` inserts `agent.repos(full_name, default_branch)` with `on conflict do nothing` before task creation.
+- `normalizeRepo` converts `GitHub.com/owner/repo`, HTTPS URLs, `.git` and scp-style forms into the canonical `owner/repo` key.
+- `application.reportError` returns `telegram.ReportedError`, so the user gets a short error reply and the poller advances instead of replaying the same update forever.
+- User-visible failure messages are escaped and capped; full details stay in the server log.
+
+### 16.5 GitHub token leak and clone URL fix
+
+A synthetic end-to-end probe produced this failure detail:
+
+```
+git -c http.extraheader=Authorization: Bearer <installation-token> clone --bare ...
+fatal: repository 'jerryjuche/koder' does not exist
+```
+
+Two defects were fixed:
+
+1. **Credential exposure.** The installation token was passed as a git `-c` argument, so a git failure echoed it into the error, the server log and `agent.tasks.fail_reason`. The token is short-lived and was scrubbed from all local logs and stored task failures. `gitops.authEnv` now supplies `GIT_CONFIG_KEY_0=http.extraheader` / `GIT_CONFIG_VALUE_0=Authorization: Basic ...` through the process environment; command lines no longer contain the token. GitHub git-over-HTTPS requires `x-access-token:<token>` as Basic auth — a Bearer extraheader works for the REST API but makes git fall back to an anonymous username prompt. `gitexec.Run` and `cmd/gateway` additionally redact bearer, basic, installation-token and JWT-shaped strings before logging or replying.
+2. **Wrong clone source.** The canonical DB key `owner/repo` was handed to git as a local path. `gitSource` now maps it to `https://github.com/owner/repo` while keeping `owner/repo` as the repo key, cache name and Telegram label.
+
+M1 still performs no host `git` inside `workspaces/*/repo`; all git calls continue through `gitexec.Run`.
+
+### 16.6 Professional conversational chat
+
+The bot is no longer a one-shot `clone` wrapper. It now keeps one container and one OpenCode session per Telegram chat for up to 30 minutes idle:
+
+- Plain follow-ups reuse the same repo, workspace, container and OpenCode conversation, so the agent can remember earlier findings and answers.
+- `Build` (default) implements and verifies changes.
+- `Plan` uses OpenCode's built-in primary `plan` agent and a read-only prompt; it investigates, asks clarifying questions and returns a plan instead of editing.
+- `Research` uses the same read-only agent with a research directive: read/search, cite evidence, ask when scope is broad, never edit.
+- Inline buttons switch mode, request a summary, show status or start a new topic. `/build`, `/plan`, `/research`, `/status`, `/new` and `/help` are also available.
+- OpenCode v2.4.0 ignored ad-hoc custom agent definitions in `opencode.base.json`; the working configuration overrides the built-in `build` and `plan` agents, gates `plan` tools (`edit`, `write`, `patch`, `bash` off), and puts mode-specific instructions at the front of the prompt.
+
+No new credentials are required. Telegram buttons use the existing `TELEGRAM_BOT_TOKEN`; conversation and research use the existing NVIDIA key (`PADI_MODEL_API_KEY` → `NVIDIA_API_KEY`). Groq remains switchable via `GROQ_API_KEY` and `config/gateway.yaml` as documented in §14.
+
+### 16.7 Local config note
+
+`config/gateway.yaml` keeps VM-valid `/srv/agent/...` paths. On this development host those directories are not writable, so `.env.local` points `GATEWAY_CONFIG` at `/tmp/opencode/gateway.local.yaml`, which overrides only `cache_dir` and `workspaces_dir` to `/tmp/opencode/padi-agent/...`. The committed config is unchanged.
+
+### 16.8 Two-turn verification with real providers
+
+A local Telegram stub injected two owner messages while the real Supabase DB, GitHub App, Docker image and NVIDIA key were used:
+
+1. `clone jerryjuche/koder and List the top-level files in one short sentence`
+2. `Now summarize what you found and ask me one clarifying question.`
+
+Result: both tasks reached `DONE`, both used the **same** `agent.sessions` row (`4fc78801-8d6d-4748-820d-b0c3876431af`), and the session recorded 4 `done`, 5 `status`, 16 `token`, 2 `tool_call` and 1 `tool_result` events. That confirms the follow-up reused the workspace and OpenCode conversation instead of starting a new task. The gateway stopped its session container cleanly at shutdown; only the pre-existing Postgres container remained. The shared Telegram cursor was restored to `374300401`, so no real queued update was consumed by the test.
+
+The earlier Bearer-extraheader attempt failed with git's anonymous username prompt; with `x-access-token:<token>` encoded as Basic auth, `git ls-remote https://github.com/jerryjuche/koder` succeeded and the two-turn clone passed. No credential value appears in command lines, logs, task failures or this record.

@@ -111,6 +111,12 @@ func (r *Renderer) record(ctx context.Context, sessionID uuid.UUID, taskID *uuid
 // assistant summary. A done event closes the relay; a terminal error fails it
 // after showing the failure in the same message; transport errors abort.
 func (r *Renderer) Relay(ctx context.Context, chatID int64, sessionID uuid.UUID, taskID *uuid.UUID, events <-chan opencode.Event) (string, error) {
+	return r.RelayWithKeyboard(ctx, chatID, sessionID, taskID, events, nil)
+}
+
+// RelayWithKeyboard is Relay with an inline keyboard attached to the final
+// message, so follow-up actions are one tap away.
+func (r *Renderer) RelayWithKeyboard(ctx context.Context, chatID int64, sessionID uuid.UUID, taskID *uuid.UUID, events <-chan opencode.Event, rows [][]InlineButton) (string, error) {
 	statusID, err := r.Client.SendMessage(ctx, chatID, html.EscapeString("Working..."))
 	if err != nil {
 		return "", err
@@ -161,7 +167,7 @@ finish:
 		summary = "Task finished."
 	}
 	parts := Split(summary, r.maxChars())
-	if err := r.Client.EditMessageText(ctx, chatID, statusID, html.EscapeString(parts[0])); err != nil {
+	if err := r.Client.EditMessageTextKeyboard(ctx, chatID, statusID, html.EscapeString(parts[0]), rows); err != nil {
 		return "", err
 	}
 	for _, part := range parts[1:] {

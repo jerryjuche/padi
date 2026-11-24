@@ -52,6 +52,13 @@ type CallbackQuery struct {
 	Data    string   `json:"data"`
 }
 
+// InlineButton is one Telegram inline-keyboard button. CallbackData is sent
+// back verbatim in a callback_query, never displayed to the user.
+type InlineButton struct {
+	Text         string `json:"text"`
+	CallbackData string `json:"callback_data"`
+}
+
 func (c *Client) client() *http.Client {
 	if c.HTTP != nil {
 		return c.HTTP
@@ -123,10 +130,23 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64) ([]Update, error)
 
 // SendMessage sends an HTML message and returns its message ID.
 func (c *Client) SendMessage(ctx context.Context, chatID int64, text string) (int64, error) {
+	return c.SendMessageKeyboard(ctx, chatID, text, nil)
+}
+
+// SendMessageKeyboard sends an HTML message with an optional inline keyboard.
+// Each inner slice is one row of buttons.
+func (c *Client) SendMessageKeyboard(ctx context.Context, chatID int64, text string, rows [][]InlineButton) (int64, error) {
 	params := url.Values{}
 	params.Set("chat_id", strconv.FormatInt(chatID, 10))
 	params.Set("text", text)
 	params.Set("parse_mode", "HTML")
+	if len(rows) > 0 {
+		raw, err := json.Marshal(map[string]any{"inline_keyboard": rows})
+		if err != nil {
+			return 0, err
+		}
+		params.Set("reply_markup", string(raw))
+	}
 	var msg Message
 	if err := c.call(ctx, "sendMessage", params, &msg); err != nil {
 		return 0, err
@@ -136,11 +156,23 @@ func (c *Client) SendMessage(ctx context.Context, chatID int64, text string) (in
 
 // EditMessageText updates a message in place; used for streamed tokens.
 func (c *Client) EditMessageText(ctx context.Context, chatID, messageID int64, text string) error {
+	return c.EditMessageTextKeyboard(ctx, chatID, messageID, text, nil)
+}
+
+// EditMessageTextKeyboard updates a message and its optional inline keyboard.
+func (c *Client) EditMessageTextKeyboard(ctx context.Context, chatID, messageID int64, text string, rows [][]InlineButton) error {
 	params := url.Values{}
 	params.Set("chat_id", strconv.FormatInt(chatID, 10))
 	params.Set("message_id", strconv.FormatInt(messageID, 10))
 	params.Set("text", text)
 	params.Set("parse_mode", "HTML")
+	if len(rows) > 0 {
+		raw, err := json.Marshal(map[string]any{"inline_keyboard": rows})
+		if err != nil {
+			return err
+		}
+		params.Set("reply_markup", string(raw))
+	}
 	return c.call(ctx, "editMessageText", params, nil)
 }
 

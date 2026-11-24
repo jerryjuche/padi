@@ -8,8 +8,32 @@
     "/opt/agent/AGENTS.target.md"
   ],
   "permissions": [
-    { "action": "*", "resource": "*", "effect": "allow" }
+    {
+      "action": "*",
+      "resource": "*",
+      "effect": "allow"
+    }
   ],
+  "agent": {
+    "build": {
+      "model": "nvidia/nvidia/nemotron-3.5-bolt-e4b",
+      "mode": "primary",
+      "description": "Conversational implementation agent",
+      "prompt": "You are Padi, a conversational software agent talking to the owner over Telegram. Keep the same thread of context across turns. If the request is ambiguous, ask one short clarifying question before making changes. When the task is clear, implement it, run the narrowest relevant checks, and finish with: what changed, what you verified, and anything left open. Never print secrets or credentials."
+    },
+    "plan": {
+      "model": "nvidia/nvidia/nemotron-3.5-bolt-e4b",
+      "mode": "primary",
+      "description": "Investigate and propose a plan without editing",
+      "prompt": "You are Padi in plan mode. Investigate the repository with read-only tools, ask clarifying questions when requirements are unclear, then return a concise plan: goal, files to touch, steps, tests, and risks. Do not modify files unless the owner explicitly switches to build mode.",
+      "tools": {
+        "edit": false,
+        "write": false,
+        "patch": false,
+        "bash": false
+      }
+    }
+  },
   "providers": {
     "nvidia": {
       "models": {
@@ -21,9 +45,13 @@
     },
     "groq": {
       "name": "Groq",
-      "env": ["GROQ_API_KEY"],
+      "env": [
+        "GROQ_API_KEY"
+      ],
       "package": "@opencode/ai/providers/openai-compatible",
-      "settings": { "baseURL": "https://api.groq.com/openai/v1" },
+      "settings": {
+        "baseURL": "https://api.groq.com/openai/v1"
+      },
       "models": {
         "openai/gpt-oss-120b": {
           "modelID": "openai/gpt-oss-120b",

@@ -5,11 +5,28 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 )
 
 const defaultGitTimeout = 60 * time.Second
+
+var secretPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)(authorization:\s*bearer\s+)\S+`),
+	regexp.MustCompile(`(?i)(authorization:\s*basic\s+)[A-Za-z0-9+/=]+`),
+	regexp.MustCompile(`\b(?:ghs|gho|ghu|ghr|github_pat)_[A-Za-z0-9_]+\b`),
+	regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b`),
+}
+
+// scrub removes credential-shaped strings before git output reaches an error,
+// a database failure_reason or a Telegram reply.
+func scrub(s string) string {
+	for _, re := range secretPatterns {
+		s = re.ReplaceAllString(s, "[REDACTED]")
+	}
+	return s
+}
 
 // Run is the ONLY way the gateway invokes git. It never uses a shell, always
 // neutralises user/system git configuration, and defaults to HTTPS-only.
@@ -56,7 +73,8 @@ func Run(ctx context.Context, dir string, env []string, args ...string) ([]byte,
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return out, fmt.Errorf("gitexec: git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		detail := scrub(strings.TrimSpace(string(out)))
+		return []byte(detail), fmt.Errorf("gitexec: git %s: %w: %s", strings.Join(args, " "), err, detail)
 	}
 	return out, nil
 }

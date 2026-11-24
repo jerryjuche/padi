@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -79,8 +80,10 @@ type Event struct {
 type Store interface {
 	Migrate(ctx context.Context) error
 	CreateSession(ctx context.Context, channel, title string) (Session, error)
+	GetSession(ctx context.Context, sessionID uuid.UUID) (Session, error)
 	AppendEvent(ctx context.Context, sessionID uuid.UUID, taskID *uuid.UUID, typ string, data any) (int64, error)
 	EventsAfter(ctx context.Context, sessionID uuid.UUID, after int64, limit int) ([]Event, error)
+	EnsureRepo(ctx context.Context, fullName, defaultBranch string) error
 	CreateTask(ctx context.Context, in NewTask) (Task, error)
 	Transition(ctx context.Context, taskID uuid.UUID, from, to State, reason string) error
 	GetTask(ctx context.Context, taskID uuid.UUID) (Task, error)
@@ -140,6 +143,23 @@ func (p *PG) CreateSession(ctx context.Context, channel, title string) (Session,
 		channel, title).Scan(&s.ID, &s.CreatedAt, &s.Channel, &s.Title, &mode, &s.LastSeq)
 	if err != nil {
 		return Session{}, fmt.Errorf("store: create session: %w", err)
+	}
+	s.Mode = mode
+	return s, nil
+}
+
+func (p *PG) GetSession(ctx context.Context, sessionID uuid.UUID) (Session, error) {
+	var s Session
+	var mode string
+	err := p.pool.QueryRow(ctx, `
+		select id, created_at, channel, coalesce(title, ''), mode, last_seq
+		from agent.sessions where id=$1`, sessionID).
+		Scan(&s.ID, &s.CreatedAt, &s.Channel, &s.Title, &mode, &s.LastSeq)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Session{}, ErrNotFound
+	}
+	if err != nil {
+		return Session{}, fmt.Errorf("store: get session: %w", err)
 	}
 	s.Mode = mode
 	return s, nil
@@ -207,6 +227,25 @@ func (p *PG) EventsAfter(ctx context.Context, sessionID uuid.UUID, after int64, 
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+// EnsureRepo registers a repo in agent.repos before a task references it.
+// tasks.repo has a foreign key to repos.full_name, so an unknown repo would
+// otherwise fail with SQLSTATE 23503 and leave the user with no reply.
+func (p *PG) EnsureRepo(ctx context.Context, fullName, defaultBranch string) error {
+	if strings.TrimSpace(fullName) == "" {
+		return errors.New("store: empty repo name")
+	}
+	if defaultBranch == "" {
+		defaultBranch = "main"
+	}
+	_, err := p.pool.Exec(ctx, `
+		insert into agent.repos (full_name, default_branch) values ($1, $2)
+		on conflict (full_name) do nothing`, fullName, defaultBranch)
+	if err != nil {
+		return fmt.Errorf("store: ensure repo: %w", err)
+	}
+	return nil
 }
 
 func (p *PG) CreateTask(ctx context.Context, in NewTask) (Task, error) {

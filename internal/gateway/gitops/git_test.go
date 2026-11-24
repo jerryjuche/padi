@@ -2,12 +2,55 @@ package gitops
 
 import (
 	"context"
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestGitSource(t *testing.T) {
+	cases := map[string]string{
+		"jerryjuche/koder":                  "https://github.com/jerryjuche/koder",
+		"owner/repo":                        "https://github.com/owner/repo",
+		"/tmp/opencode/padi-m1-loop/source": "/tmp/opencode/padi-m1-loop/source",
+		"file:///tmp/source":                "/tmp/source",
+	}
+	for in, want := range cases {
+		if got := gitSource(in); got != want {
+			t.Errorf("gitSource(%q)=%q want %q", in, got, want)
+		}
+	}
+}
+
+func TestBasicAuthValue(t *testing.T) {
+	got := basicAuthValue("SECRET")
+	const prefix = "Authorization: Basic "
+	if !strings.HasPrefix(got, prefix) {
+		t.Fatalf("bad prefix: %q", got)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(got, prefix))
+	if err != nil || string(decoded) != "x-access-token:SECRET" {
+		t.Fatalf("decoded=%q err=%v", decoded, err)
+	}
+}
+
+func TestScrubRemovesCredentials(t *testing.T) {
+	cases := []string{
+		"clone Authorization: Bearer ghs_SECRET123 failed: fatal: repository not found",
+		"clone Authorization: Basic eC1hY2Nlc3MtdG9rZW46Z2hzX1NFQ1JFVA== failed",
+	}
+	for _, in := range cases {
+		got := scrub(in)
+		if strings.Contains(got, "ghs_SECRET123") || strings.Contains(got, "eC1hY2Nlc3MtdG9rZW46Z2hzX1NFQ1JFVA==") {
+			t.Fatalf("credential still present: %q", got)
+		}
+		if !strings.Contains(got, "[REDACTED]") {
+			t.Fatalf("missing redaction marker: %q", got)
+		}
+	}
+}
 
 func TestBranchName(t *testing.T) {
 	cases := []struct {

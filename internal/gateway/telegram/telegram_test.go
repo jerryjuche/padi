@@ -24,7 +24,10 @@ func TestAllowed(t *testing.T) {
 		{"owner private", Update{Message: &Message{Chat: Chat{Type: "private"}, From: User{ID: 7}}}, 7, true},
 		{"other user", Update{Message: &Message{Chat: Chat{Type: "private"}, From: User{ID: 8}}}, 7, false},
 		{"group", Update{Message: &Message{Chat: Chat{Type: "group"}, From: User{ID: 7}}}, 7, false},
-		{"callback only", Update{CallbackQuery: &CallbackQuery{From: User{ID: 7}}}, 7, false},
+		{"callback without message", Update{CallbackQuery: &CallbackQuery{From: User{ID: 7}}}, 7, false},
+		{"owner callback", Update{CallbackQuery: &CallbackQuery{
+			From: User{ID: 7}, Message: &Message{Chat: Chat{ID: 3, Type: "private"}}, Data: "mode:plan",
+		}}, 7, true},
 		{"zero owner", Update{Message: &Message{Chat: Chat{Type: "private"}, From: User{ID: 7}}}, 0, false},
 	}
 	for _, tc := range cases {
@@ -114,6 +117,58 @@ func TestPollerCursorAndAllowlist(t *testing.T) {
 	}
 	if state.id != 5 {
 		t.Fatalf("cursor=%d want 5", state.id)
+	}
+}
+
+func TestSendMessageKeyboard(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		got = r.Form.Get("reply_markup")
+		fmt.Fprint(w, `{"ok":true,"result":{"message_id":1}}`)
+	}))
+	defer srv.Close()
+	c := &Client{BaseURL: srv.URL, Token: "t", HTTP: srv.Client()}
+	rows := [][]InlineButton{{{Text: "Plan", CallbackData: "mode:plan"}, {Text: "Research", CallbackData: "mode:research"}}}
+	if _, err := c.SendMessageKeyboard(context.Background(), 7, "Choose", rows); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, `"inline_keyboard"`) || !strings.Contains(got, `"callback_data":"mode:plan"`) {
+		t.Fatalf("reply_markup=%q", got)
+	}
+}
+
+func TestPollerAdvancesOnReportedError(t *testing.T) {
+	page := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page++
+		if page == 1 {
+			fmt.Fprint(w, `{"ok":true,"result":[{"update_id":9,"message":{"message_id":1,"chat":{"id":7,"type":"private"},"from":{"id":7},"text":"bad"}}]}`)
+			return
+		}
+		fmt.Fprint(w, `{"ok":true,"result":[]}`)
+	}))
+	defer srv.Close()
+	state := &memoryState{id: 8}
+	var handled int
+	p := &Poller{
+		Client: &Client{BaseURL: srv.URL, Token: "t", HTTP: srv.Client()},
+		Store:  state, OwnerID: 7,
+		Handle: func(_ context.Context, _ Update) error {
+			handled++
+			return &ReportedError{Err: fmt.Errorf("already told the owner")}
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if err := p.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if handled != 1 {
+		t.Fatalf("handled %d times, want 1 (no replay)", handled)
+	}
+	if state.id != 9 {
+		t.Fatalf("cursor=%d want 9", state.id)
 	}
 }
 

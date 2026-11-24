@@ -84,18 +84,18 @@ func TestSecretFromEnvAny(t *testing.T) {
 }
 
 func TestParseRepo(t *testing.T) {
-	a := &application{cfg: defaults()}
+	a := &application{cfg: defaults(), pending: make(map[int64]string)}
 	a.cfg.Git.DefaultRepo = "/srv/local/default"
 	cases := []struct {
 		text, repo, prompt string
 	}{
-		{"clone /tmp/source and add a line", "/tmp/source", "clone /tmp/source and add a line"},
+		{"clone /tmp/source and add a line", "/tmp/source", "add a line"},
 		{"add a line to README", "/srv/local/default", "add a line to README"},
 	}
 	for _, tc := range cases {
-		repo, prompt := a.parseRepo(tc.text)
-		if repo != tc.repo || prompt != tc.prompt {
-			t.Fatalf("parseRepo(%q)=%q,%q want %q,%q", tc.text, repo, prompt, tc.repo, tc.prompt)
+		got := a.parseCommand(7, tc.text)
+		if got.repo != tc.repo || got.prompt != tc.prompt {
+			t.Fatalf("parseCommand(%q)=%q,%q want %q,%q", tc.text, got.repo, got.prompt, tc.repo, tc.prompt)
 		}
 	}
 }

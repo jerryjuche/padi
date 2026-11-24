@@ -39,6 +39,7 @@ Authoritative summary lives in `README.md` §17 and `BUILD_SPEC.md` §8[cite: 2,
 | V21 | `whisper.cpp` on arm64 latency & RSS on 2 OCPU (optional voice) | M15 | Pending | — | — |
 | V22 | `gitleaks` and `osv-scanner` arm64 builds, CLI flags, offline DB refresh | M14 | Pending | — | — |
 | V23 | `npm`, `go`, and `pip` base-URL overrides through credential injection routes | M16 | Pending | — | — |
+| V24 | Telegram owner chat can run a conversational plan/research/build agent with inline buttons using existing credentials | M1 | Resolved | 2026-11-24 | `opencode v2.4.0` exposes `POST /api/session/{id}/agent` and emits `session.agent.selected`; built-in primary agents are `build` and `plan` (`general`/`explore` are subagents). Ad-hoc custom agents in `opencode.base.json` were ignored in this build, so the config overrides `build` and `plan`, disables `edit`/`write`/`patch`/`bash` tools for `plan`, and the gateway prefixes research/plan instructions to the prompt. Telegram `sendMessage`/`editMessageText` accept `reply_markup.inline_keyboard`; `callback_query` is allowed only from the configured owner's private chat. A per-chat long-lived container + OpenCode session preserves context across follow-ups and is reaped after 30 minutes idle. No new secrets: existing `TELEGRAM_BOT_TOKEN` and `PADI_MODEL_API_KEY`/`NVIDIA_API_KEY` are reused; Groq switch remains unchanged. |
 
 ## M0 VM-only deferral — owner Option B (2026-11-23)
 

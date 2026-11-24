@@ -12,7 +12,7 @@ import (
 )
 
 func TestClientEndpoints(t *testing.T) {
-	var gotModel, gotPrompt map[string]any
+	var gotModel, gotPrompt, gotAgent map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if u, p, ok := r.BasicAuth(); !ok || u != "opencode" || p != "throwaway" {
 			w.WriteHeader(http.StatusUnauthorized)
@@ -27,6 +27,9 @@ func TestClientEndpoints(t *testing.T) {
 			fmt.Fprint(w, `{"data":{"id":"ses_test1"}}`)
 		case strings.HasSuffix(r.URL.Path, "/model"):
 			_ = json.NewDecoder(r.Body).Decode(&gotModel)
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(r.URL.Path, "/agent"):
+			_ = json.NewDecoder(r.Body).Decode(&gotAgent)
 			w.WriteHeader(http.StatusOK)
 		case strings.HasSuffix(r.URL.Path, "/prompt"):
 			_ = json.NewDecoder(r.Body).Decode(&gotPrompt)
@@ -49,8 +52,11 @@ func TestClientEndpoints(t *testing.T) {
 	if err != nil || id != "ses_test1" {
 		t.Fatalf("CreateSession=%q err=%v", id, err)
 	}
-	if err := c.Prompt(ctx, id, "add a line", "openai/gpt-5-nano"); err != nil {
+	if err := c.PromptWithAgent(ctx, id, "add a line", "openai/gpt-5-nano", "plan"); err != nil {
 		t.Fatal(err)
+	}
+	if gotAgent["agent"] != "plan" {
+		t.Fatalf("agent body=%+v", gotAgent)
 	}
 	model, _ := gotModel["model"].(map[string]any)
 	if model["providerID"] != "openai" || model["id"] != "gpt-5-nano" {

@@ -2,10 +2,18 @@ package telegram
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"time"
 )
+
+// ReportedError marks a handler failure that was already sent to the user.
+// The poller advances past it instead of replaying the same update forever.
+type ReportedError struct{ Err error }
+
+func (e *ReportedError) Error() string { return e.Err.Error() }
+func (e *ReportedError) Unwrap() error { return e.Err }
 
 // StateStore persists the Telegram update cursor (M0 agent.telegram_state).
 type StateStore interface {
@@ -14,11 +22,29 @@ type StateStore interface {
 }
 
 // Allowed is true only for a private chat from the configured owner.
+// Inline-keyboard callbacks count as updates from the same private chat.
 func Allowed(u Update, ownerID int64) bool {
-	if ownerID == 0 || u.Message == nil {
+	if ownerID == 0 {
+		return false
+	}
+	if q := u.CallbackQuery; q != nil {
+		return q.From.ID == ownerID && q.Message != nil && q.Message.Chat.Type == "private"
+	}
+	if u.Message == nil {
 		return false
 	}
 	return u.Message.Chat.Type == "private" && u.Message.From.ID == ownerID
+}
+
+// ChatID returns the private chat an update belongs to, or zero.
+func ChatID(u Update) int64 {
+	if q := u.CallbackQuery; q != nil && q.Message != nil {
+		return q.Message.Chat.ID
+	}
+	if u.Message != nil {
+		return u.Message.Chat.ID
+	}
+	return 0
 }
 
 // Handler processes one authorised update.
@@ -75,6 +101,15 @@ func (p *Poller) Run(ctx context.Context) error {
 				continue
 			}
 			if err := p.Handle(ctx, u); err != nil {
+				var reported *ReportedError
+				if errors.As(err, &reported) {
+					// The user already saw the failure; do not replay it.
+					last = u.UpdateID
+					if err := p.Store.SaveLastUpdateID(ctx, last); err != nil {
+						return fmt.Errorf("telegram: save cursor: %w", err)
+					}
+					continue
+				}
 				// Keep the cursor unchanged for at-least-once replay, but back
 				// off so a permanently bad message cannot spin the poller.
 				log.Printf("telegram handle update %d: %v", u.UpdateID, err)

@@ -9,7 +9,9 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -20,6 +22,15 @@ import (
 	"github.com/jerryjuche/padi/internal/gateway/store"
 	"github.com/jerryjuche/padi/internal/gateway/telegram"
 )
+
+const (
+	modeBuild    = "build"
+	modePlan     = "plan"
+	modeResearch = "research"
+	chatIdleTTL  = 30 * time.Minute
+)
+
+var userFacingSecret = regexp.MustCompile(`(?i)(authorization:\s*bearer\s+)\S+|(?i)(authorization:\s*basic\s+)[A-Za-z0-9+/=]+|\b(?:ghs|gho|ghu|ghr|github_pat)_[A-Za-z0-9_]+\b|\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b`)
 
 func main() {
 	if err := run(); err != nil {
@@ -107,6 +118,9 @@ func run() error {
 
 	app := &application{
 		cfg: cfg, db: db, runner: r, git: git, tg: tg, renderer: renderer,
+		pending: make(map[int64]string),
+		modes:   make(map[int64]string),
+		chats:   make(map[int64]*chatSession),
 	}
 	poller := &telegram.Poller{
 		Client:  tg,
@@ -114,6 +128,7 @@ func run() error {
 		OwnerID: ownerID,
 		Handle:  app.handleUpdate,
 	}
+	go app.reapIdle(ctx)
 	go func() {
 		if err := poller.Run(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			log.Printf("gateway: poller stopped: %v", err)
@@ -122,7 +137,47 @@ func run() error {
 	}()
 	log.Printf("gateway: M1 spine ready (model=%s, network=%s)", cfg.OpenCode.Model, cfg.Container.Network)
 	<-ctx.Done()
+	app.Close()
 	return nil
+}
+
+// chatSession is a long-lived workspace for one Telegram chat. Keeping the
+// container and OpenCode session alive is what makes follow-ups conversational:
+// the agent remembers what it read, changed and asked in earlier turns.
+type chatSession struct {
+	mu        sync.Mutex
+	repo      string
+	mode      string
+	session   store.Session
+	handle    runner.Handle
+	oc        *opencode.Client
+	ocSession string
+	lastUsed  time.Time
+	busy      bool
+}
+
+func (c *chatSession) begin() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.busy {
+		return false
+	}
+	c.busy = true
+	c.lastUsed = time.Now()
+	return true
+}
+
+func (c *chatSession) end() {
+	c.mu.Lock()
+	c.busy = false
+	c.lastUsed = time.Now()
+	c.mu.Unlock()
+}
+
+func (c *chatSession) detail() (repo, mode string, sessionID uuid.UUID, lastUsed time.Time, busy bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.repo, c.mode, c.session.ID, c.lastUsed, c.busy
 }
 
 type application struct {
@@ -132,24 +187,221 @@ type application struct {
 	git      *gitops.Git
 	tg       *telegram.Client
 	renderer *telegram.Renderer
+
+	// pending remembers a repo chosen by "clone <repo>" for the next message.
+	// modes is a sticky build/plan/research choice per chat.
+	mu      sync.Mutex
+	pending map[int64]string
+	modes   map[int64]string
+	chats   map[int64]*chatSession
 }
 
 func (a *application) event(ctx context.Context, sessionID uuid.UUID, taskID *uuid.UUID, typ string, data any) {
 	if _, err := a.db.AppendEvent(ctx, sessionID, taskID, typ, data); err != nil {
-		log.Printf("gateway: append event %s: %v", typ, err)
+		log.Printf("gateway: append event %s: %v", typ, scrubForUser(err))
 	}
 }
 
-// parseRepo accepts "clone <repo> and <prompt>" or the configured default.
-func (a *application) parseRepo(text string) (repo, prompt string) {
+// command is the parsed form of one owner message.
+type command struct {
+	repo           string
+	prompt         string
+	askRepo        bool
+	awaitingPrompt bool
+}
+
+// parseCommand supports a short conversation:
+//
+//	clone owner/repo and <prompt>  -> start immediately
+//	clone owner/repo               -> remember repo, ask what to do next
+//	<prompt>                       -> use the remembered or default repo
+func (a *application) parseCommand(chatID int64, text string) command {
 	fields := strings.Fields(text)
 	if len(fields) >= 2 && strings.EqualFold(fields[0], "clone") {
-		return fields[1], text
+		repo := normalizeRepo(fields[1])
+		if !validRepo(repo) {
+			return command{askRepo: true}
+		}
+		rest := strings.TrimSpace(strings.TrimPrefix(text, fields[0]))
+		rest = strings.TrimSpace(strings.TrimPrefix(rest, fields[1]))
+		if len(rest) >= 3 && strings.EqualFold(rest[:3], "and") &&
+			(len(rest) == 3 || rest[3] == ' ' || rest[3] == '\n' || rest[3] == '\t') {
+			rest = strings.TrimSpace(rest[3:])
+		}
+		if rest == "" {
+			return command{repo: repo, awaitingPrompt: true}
+		}
+		return command{repo: repo, prompt: rest}
 	}
-	return a.cfg.Git.DefaultRepo, text
+	if repo := a.forgetRepo(chatID); repo != "" {
+		return command{repo: repo, prompt: text}
+	}
+	if a.cfg.Git.DefaultRepo != "" {
+		return command{repo: a.cfg.Git.DefaultRepo, prompt: text}
+	}
+	return command{askRepo: true}
+}
+
+// normalizeRepo turns the forms people actually type into an owner/repo key.
+// Absolute paths are preserved for the local M1 spike.
+func normalizeRepo(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	if strings.HasPrefix(s, "/") {
+		return strings.TrimRight(s, "/")
+	}
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+	}
+	if colon, at := strings.IndexByte(s, ':'), strings.LastIndexByte(s, '@'); at >= 0 && colon > at {
+		s = s[colon+1:] // scp style: git@github.com:owner/repo.git
+	}
+	if at := strings.LastIndexByte(s, '@'); at >= 0 {
+		if slash := strings.IndexByte(s, '/'); slash < 0 || at < slash {
+			s = s[at+1:] // credentials in an https URL
+		}
+	}
+	if i := strings.IndexByte(s, '/'); i > 0 && strings.Contains(s[:i], ".") {
+		s = s[i+1:] // github.com/owner/repo or GitHub.com/owner/repo
+	}
+	s = strings.Trim(s, "/")
+	s = strings.TrimSuffix(s, ".git")
+	return s
+}
+
+func validRepo(repo string) bool {
+	if repo == "" || strings.ContainsAny(repo, " \t\n") {
+		return false
+	}
+	if strings.HasPrefix(repo, "/") {
+		return true
+	}
+	return strings.Count(repo, "/") >= 1
+}
+
+func (a *application) rememberRepo(chatID int64, repo string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.pending == nil {
+		a.pending = make(map[int64]string)
+	}
+	a.pending[chatID] = repo
+}
+
+func (a *application) forgetRepo(chatID int64) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	repo := a.pending[chatID]
+	delete(a.pending, chatID)
+	return repo
+}
+
+func (a *application) rememberMode(chatID int64, mode string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.modes == nil {
+		a.modes = make(map[int64]string)
+	}
+	a.modes[chatID] = mode
+}
+
+func (a *application) currentMode(chatID int64) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if mode := a.modes[chatID]; mode != "" {
+		return mode
+	}
+	return modeBuild
+}
+
+func (a *application) putChat(chatID int64, chat *chatSession) {
+	a.mu.Lock()
+	a.chats[chatID] = chat
+	a.mu.Unlock()
+}
+
+func (a *application) getChat(chatID int64) *chatSession {
+	a.mu.Lock()
+	chat := a.chats[chatID]
+	if chat != nil {
+		_, _, _, last, busy := chat.detail()
+		if !busy && time.Since(last) > chatIdleTTL {
+			delete(a.chats, chatID)
+			go a.stopChat(chat)
+			chat = nil
+		}
+	}
+	a.mu.Unlock()
+	return chat
+}
+
+func (a *application) closeChat(chatID int64) {
+	a.mu.Lock()
+	chat := a.chats[chatID]
+	delete(a.chats, chatID)
+	a.mu.Unlock()
+	if chat != nil {
+		a.stopChat(chat)
+	}
+}
+
+func (a *application) stopChat(chat *chatSession) {
+	chat.mu.Lock()
+	handle := chat.handle
+	chat.mu.Unlock()
+	if handle.ID == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := a.runner.Stop(ctx, handle.ID); err != nil {
+		log.Printf("gateway: stop container %s: %v", handle.ID, scrubForUser(err))
+	}
+}
+
+func (a *application) Close() {
+	a.mu.Lock()
+	ids := make([]int64, 0, len(a.chats))
+	for id := range a.chats {
+		ids = append(ids, id)
+	}
+	a.mu.Unlock()
+	for _, id := range ids {
+		a.closeChat(id)
+	}
+}
+
+func (a *application) reapIdle(ctx context.Context) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			a.mu.Lock()
+			var stale []*chatSession
+			for id, chat := range a.chats {
+				_, _, _, last, busy := chat.detail()
+				if !busy && time.Since(last) > chatIdleTTL {
+					delete(a.chats, id)
+					stale = append(stale, chat)
+				}
+			}
+			a.mu.Unlock()
+			for _, chat := range stale {
+				a.stopChat(chat)
+			}
+		}
+	}
 }
 
 func (a *application) handleUpdate(ctx context.Context, u telegram.Update) error {
+	if q := u.CallbackQuery; q != nil {
+		return a.handleCallback(ctx, q)
+	}
 	if u.Message == nil {
 		return nil
 	}
@@ -158,97 +410,253 @@ func (a *application) handleUpdate(ctx context.Context, u telegram.Update) error
 	if text == "" {
 		return nil
 	}
-	if strings.HasPrefix(text, "/status") || strings.HasPrefix(text, "/help") {
-		_, err := a.tg.SendMessage(ctx, chatID, html.EscapeString("M1 spine: send 'clone <repo> and <prompt>' to start one task."))
-		return err
+
+	switch {
+	case strings.HasPrefix(text, "/start"), strings.HasPrefix(text, "/help"):
+		return a.help(ctx, chatID)
+	case strings.HasPrefix(text, "/status"):
+		return a.status(ctx, chatID)
+	case strings.HasPrefix(text, "/new"):
+		a.closeChat(chatID)
+		a.forgetRepo(chatID)
+		a.rememberMode(chatID, modeBuild)
+		return a.replyKeyboard(ctx, chatID, "New topic. Send a request, or clone <repo> to open a repository.", chatButtons(modeBuild))
+	case modeFromCommand(text) != "":
+		mode := modeFromCommand(text)
+		a.rememberMode(chatID, mode)
+		if chat := a.getChat(chatID); chat != nil {
+			chat.mu.Lock()
+			chat.mode = mode
+			chat.mu.Unlock()
+		}
+		rest := modePromptRest(text)
+		if rest == "" {
+			return a.replyKeyboard(ctx, chatID, mode+" mode on. Tell me what you want me to "+modeVerb(mode)+".", chatButtons(mode))
+		}
+		return a.continueChat(ctx, chatID, rest, fmt.Sprintf("tg-%d-%d", chatID, u.Message.MessageID), mode)
 	}
 
-	repo, prompt := a.parseRepo(text)
-	if repo == "" {
-		_, err := a.tg.SendMessage(ctx, chatID, html.EscapeString("No repository. Use: clone <repo> and <prompt>"))
-		return err
+	// A plain message in an active workspace is a follow-up: same repo, same
+	// OpenCode session, same container. No clone, no repeated setup.
+	active := a.getChat(chatID)
+	if active != nil && !strings.HasPrefix(strings.ToLower(text), "clone ") {
+		return a.continueChat(ctx, chatID, text, fmt.Sprintf("tg-%d-%d", chatID, u.Message.MessageID), a.currentMode(chatID))
 	}
 
-	session, err := a.db.CreateSession(ctx, "telegram", fmt.Sprintf("tg-%d", chatID))
-	if err != nil {
-		return err
+	c := a.parseCommand(chatID, text)
+	if c.askRepo {
+		return a.reply(ctx, chatID, "Which repo? Send 'clone owner/repo' (a GitHub URL works too) and I'll ask what to do next.")
 	}
+	if c.awaitingPrompt {
+		a.rememberRepo(chatID, c.repo)
+		return a.reply(ctx, chatID, "Got "+c.repo+". What should I do in it?")
+	}
+	fresh := active == nil
+	return a.startTask(ctx, chatID, c, fmt.Sprintf("tg-%d-%d", chatID, u.Message.MessageID), fresh)
+}
+
+// continueChat starts a task on an existing workspace, or falls back to normal
+// repo selection when no workspace is active (e.g. /plan followed by a prompt).
+func (a *application) continueChat(ctx context.Context, chatID int64, prompt, key, mode string) error {
+	if chat := a.getChat(chatID); chat != nil {
+		repo, _, _, _, _ := chat.detail()
+		return a.startTask(ctx, chatID, command{repo: repo, prompt: prompt}, key, false)
+	}
+	c := a.parseCommand(chatID, prompt)
+	if c.askRepo {
+		return a.reply(ctx, chatID, "Which repo should I use? Send 'clone owner/repo' first.")
+	}
+	return a.startTask(ctx, chatID, c, key, true)
+}
+
+func (a *application) handleCallback(ctx context.Context, q *telegram.CallbackQuery) error {
+	if err := a.tg.AnswerCallbackQuery(ctx, q.ID, ""); err != nil {
+		log.Printf("gateway: answer callback: %v", scrubForUser(err))
+	}
+	if q.Message == nil {
+		return &telegram.ReportedError{Err: errors.New("callback has no message")}
+	}
+	chatID := q.Message.Chat.ID
+	switch data := q.Data; {
+	case strings.HasPrefix(data, "mode:"):
+		mode := strings.TrimPrefix(data, "mode:")
+		if !validMode(mode) {
+			return &telegram.ReportedError{Err: fmt.Errorf("unknown mode %q", mode)}
+		}
+		a.rememberMode(chatID, mode)
+		if chat := a.getChat(chatID); chat != nil {
+			chat.mu.Lock()
+			chat.mode = mode
+			chat.mu.Unlock()
+		}
+		return a.replyKeyboard(ctx, chatID, mode+" mode on. Tell me what you want me to "+modeVerb(mode)+".", chatButtons(mode))
+	case data == "new":
+		a.closeChat(chatID)
+		a.forgetRepo(chatID)
+		a.rememberMode(chatID, modeBuild)
+		return a.replyKeyboard(ctx, chatID, "New topic. Send a request, or clone <repo> to open a repository.", chatButtons(modeBuild))
+	case data == "status":
+		return a.status(ctx, chatID)
+	case data == "help":
+		return a.help(ctx, chatID)
+	case data == "act:summary":
+		chat := a.getChat(chatID)
+		if chat == nil {
+			return a.reply(ctx, chatID, "No active workspace yet. Send a request or clone <repo> first.")
+		}
+		repo, _, _, _, _ := chat.detail()
+		return a.startTask(ctx, chatID, command{
+			repo: repo, prompt: "Summarize the current state and propose the next three steps. Ask me if anything is unclear.",
+		}, fmt.Sprintf("tg-%d-cb-%s", chatID, q.ID), false)
+	default:
+		return &telegram.ReportedError{Err: fmt.Errorf("unknown callback %q", data)}
+	}
+}
+
+func (a *application) help(ctx context.Context, chatID int64) error {
+	text := "Padi chat\n\n" +
+		"Just write naturally. I keep the repository and conversation open between messages, so you can ask follow-ups or ask me to clarify anything.\n\n" +
+		"Commands:\n" +
+		"• clone <repo> — open a GitHub repo (URLs work)\n" +
+		"• /build — implement changes (default)\n" +
+		"• /plan — investigate and propose a plan before editing\n" +
+		"• /research — read, search and report; no edits\n" +
+		"• /status — show the active workspace\n" +
+		"• /new — close this workspace and start fresh\n\n" +
+		"Buttons switch mode or start a summary. If I need detail, I will ask before acting."
+	return a.replyKeyboard(ctx, chatID, text, chatButtons(a.currentMode(chatID)))
+}
+
+func (a *application) status(ctx context.Context, chatID int64) error {
+	chat := a.getChat(chatID)
+	text := "No active workspace. Send a request, or clone <repo> to open a repository."
+	if chat != nil {
+		repo, mode, sessionID, last, busy := chat.detail()
+		state := "idle"
+		if busy {
+			state = "working"
+		}
+		text = fmt.Sprintf("Workspace: %s\nMode: %s\nState: %s\nSession: %s\nLast used: %s ago",
+			repo, mode, state, sessionID.String(), time.Since(last).Round(time.Second))
+	}
+	return a.replyKeyboard(ctx, chatID, text, chatButtons(a.currentMode(chatID)))
+}
+
+// startTask creates the audit task and either opens a fresh workspace or reuses
+// an existing one. The OpenCode session is preserved across follow-ups.
+func (a *application) startTask(ctx context.Context, chatID int64, c command, key string, fresh bool) error {
+	if c.repo == "" || c.prompt == "" {
+		return a.reply(ctx, chatID, "I need a repo and a request. Try 'clone owner/repo and add a README'.")
+	}
+	mode := a.currentMode(chatID)
+	chat := a.getChat(chatID)
+	if fresh && chat != nil {
+		a.closeChat(chatID)
+		chat = nil
+	}
+	if err := a.db.EnsureRepo(ctx, c.repo, "main"); err != nil {
+		return a.reportError(ctx, chatID, err)
+	}
+
+	var session store.Session
+	if chat != nil {
+		_, _, sessionID, _, _ := chat.detail()
+		found, err := a.db.GetSession(ctx, sessionID)
+		if err != nil {
+			return a.reportError(ctx, chatID, err)
+		}
+		session = found
+	} else {
+		created, err := a.db.CreateSession(ctx, "telegram", fmt.Sprintf("tg-%d", chatID))
+		if err != nil {
+			return a.reportError(ctx, chatID, err)
+		}
+		session = created
+	}
+
 	task, err := a.db.CreateTask(ctx, store.NewTask{
-		SessionID:      session.ID,
-		Repo:           repo,
-		Prompt:         prompt,
-		IdempotencyKey: fmt.Sprintf("tg-%d-%d", chatID, u.Message.MessageID),
+		SessionID: session.ID, Repo: c.repo, Prompt: c.prompt, IdempotencyKey: key,
 	})
 	if err != nil {
-		return err
+		return a.reportError(ctx, chatID, err)
 	}
-	a.event(ctx, session.ID, &task.ID, "status", map[string]string{"state": "QUEUED"})
+	if task.State == store.StateDone || task.State == store.StateFailed {
+		return a.reply(ctx, chatID, "I already handled that message.")
+	}
+	a.event(ctx, session.ID, &task.ID, "status", map[string]string{"state": "QUEUED", "mode": mode})
 	if err := a.db.Transition(ctx, task.ID, store.StateQueued, store.StatePreparing, ""); err != nil {
-		return err
+		return a.reportError(ctx, chatID, err)
 	}
 
 	taskCtx, taskCancel := context.WithTimeout(ctx, 20*time.Minute)
 	defer taskCancel()
 
-	workDir, branch, err := a.git.CloneForTask(taskCtx, repo, task.ID.String())
-	if err != nil {
-		a.fail(taskCtx, session, task, chatID, fmt.Errorf("clone: %w", err))
-		return nil
-	}
-	a.event(taskCtx, session.ID, &task.ID, "status", map[string]string{"state": "PREPARING", "branch": branch})
-
-	handle, err := a.runner.Start(taskCtx, task.ID.String(), workDir)
-	if err != nil {
-		a.fail(taskCtx, session, task, chatID, fmt.Errorf("start container: %w", err))
-		return nil
-	}
-	defer func() {
-		stopCtx, stopCancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer stopCancel()
-		if err := a.runner.Stop(stopCtx, handle.ID); err != nil {
-			log.Printf("gateway: stop container %s: %v", handle.ID, err)
+	if chat == nil {
+		workDir, branch, err := a.git.CloneForTask(taskCtx, c.repo, task.ID.String())
+		if err != nil {
+			a.fail(taskCtx, session, task, chatID, fmt.Errorf("clone: %w", err))
+			return nil
 		}
-	}()
+		a.event(taskCtx, session.ID, &task.ID, "status", map[string]string{"state": "PREPARING", "branch": branch})
+		handle, err := a.runner.Start(taskCtx, task.ID.String(), workDir)
+		if err != nil {
+			a.fail(taskCtx, session, task, chatID, fmt.Errorf("start container: %w", err))
+			return nil
+		}
+		oc := &opencode.Client{BaseURL: handle.Address, Password: handle.Password}
+		if err := runner.WaitHealthy(taskCtx, oc.Healthy, 60*time.Second); err != nil {
+			a.runner.Stop(context.Background(), handle.ID)
+			a.fail(taskCtx, session, task, chatID, fmt.Errorf("open code health: %w", err))
+			return nil
+		}
+		ocSession, err := oc.CreateSession(taskCtx)
+		if err != nil {
+			a.runner.Stop(context.Background(), handle.ID)
+			a.fail(taskCtx, session, task, chatID, fmt.Errorf("create agent session: %w", err))
+			return nil
+		}
+		chat = &chatSession{
+			repo: c.repo, mode: mode, session: session, handle: handle,
+			oc: oc, ocSession: ocSession, lastUsed: time.Now(), busy: true,
+		}
+		a.putChat(chatID, chat)
+		a.reply(taskCtx, chatID, "Working in "+c.repo+"...")
+	} else if !chat.begin() {
+		return a.reply(ctx, chatID, "I'm still working on the previous message. I'll pick this up next.")
+	}
+	defer chat.end()
 
 	if err := a.db.Transition(taskCtx, task.ID, store.StatePreparing, store.StateExecuting, ""); err != nil {
-		return err
+		return a.reportError(ctx, chatID, err)
 	}
-	summary, err := a.runTask(taskCtx, session, task, chatID, handle, prompt)
+	summary, err := a.runTask(taskCtx, chat, session, task, chatID, c.prompt, mode)
 	if err != nil {
 		a.fail(taskCtx, session, task, chatID, err)
 		return nil
 	}
 	if err := a.db.Transition(taskCtx, task.ID, store.StateExecuting, store.StateDone, ""); err != nil {
-		return err
+		return a.reportError(ctx, chatID, err)
 	}
 	a.event(taskCtx, session.ID, &task.ID, "done", map[string]string{"summary": summary})
 	return nil
 }
 
-func (a *application) runTask(ctx context.Context, session store.Session, task store.Task, chatID int64, handle runner.Handle, prompt string) (string, error) {
-	oc := &opencode.Client{BaseURL: handle.Address, Password: handle.Password}
-	if err := runner.WaitHealthy(ctx, oc.Healthy, 60*time.Second); err != nil {
-		return "", err
-	}
-	rawEvents, err := oc.Events(ctx)
-	if err != nil {
-		return "", err
-	}
-	ocSession, err := oc.CreateSession(ctx)
+func (a *application) runTask(ctx context.Context, chat *chatSession, session store.Session, task store.Task, chatID int64, prompt, mode string) (string, error) {
+	feedCtx, feedCancel := context.WithCancel(ctx)
+	defer feedCancel()
+	rawEvents, err := chat.oc.Events(feedCtx)
 	if err != nil {
 		return "", err
 	}
 	normalized := make(chan opencode.Event, 128)
-	feedCtx, feedCancel := context.WithCancel(ctx)
 	go func() {
 		defer close(normalized)
-		defer feedCancel()
 		for raw := range rawEvents {
 			ev, ok := opencode.Translate(raw)
 			if !ok {
 				continue
 			}
-			if ev.SessionID != "" && ev.SessionID != ocSession {
+			if ev.SessionID != "" && ev.SessionID != chat.ocSession {
 				continue
 			}
 			a.event(feedCtx, session.ID, &task.ID, ev.Type, map[string]string{
@@ -264,34 +672,143 @@ func (a *application) runTask(ctx context.Context, session store.Session, task s
 			}
 		}
 	}()
-	defer feedCancel()
 
-	if err := oc.Prompt(ctx, ocSession, prompt, a.cfg.OpenCode.Model); err != nil {
+	if err := chat.oc.PromptWithAgent(ctx, chat.ocSession, modePrompt(mode, prompt), a.cfg.OpenCode.Model, modeAgent(mode)); err != nil {
 		return "", err
 	}
-	summary, err := a.renderer.Relay(ctx, chatID, session.ID, &task.ID, normalized)
+	summary, err := a.renderer.RelayWithKeyboard(ctx, chatID, session.ID, &task.ID, normalized, chatButtons(mode))
 	if err != nil {
 		return "", err
 	}
 	return summary, nil
 }
 
+// reply sends escaped plain text. telegram.Client uses parse_mode=HTML, so
+// raw angle brackets from user-supplied repo names would be rejected.
+func (a *application) reply(ctx context.Context, chatID int64, text string) error {
+	_, err := a.tg.SendMessage(ctx, chatID, html.EscapeString(text))
+	return err
+}
+
+func (a *application) replyKeyboard(ctx context.Context, chatID int64, text string, rows [][]telegram.InlineButton) error {
+	_, err := a.tg.SendMessageKeyboard(ctx, chatID, html.EscapeString(text), rows)
+	return err
+}
+
+// reportError tells the owner what happened and marks the update as handled so
+// the poller does not replay it. Details stay in the server log.
+func (a *application) reportError(ctx context.Context, chatID int64, err error) error {
+	log.Printf("gateway: update failed: %v", scrubForUser(err))
+	message := "I couldn't start that task. Check the repo name and try again, or send /help."
+	if _, sendErr := a.tg.SendMessage(ctx, chatID, html.EscapeString(message)); sendErr != nil {
+		return fmt.Errorf("telegram: send error reply: %w", sendErr)
+	}
+	return &telegram.ReportedError{Err: err}
+}
+
 func (a *application) fail(ctx context.Context, session store.Session, task store.Task, chatID int64, cause error) {
-	log.Printf("gateway: task %s failed: %v", task.ID, cause)
-	a.event(ctx, session.ID, &task.ID, "error", map[string]string{"message": cause.Error()})
+	reason := scrubForUser(cause)
+	log.Printf("gateway: task %s failed: %s", task.ID, reason)
+	a.event(ctx, session.ID, &task.ID, "error", map[string]string{"message": reason})
 	current, err := a.db.GetTask(ctx, task.ID)
 	if err != nil {
 		log.Printf("gateway: load task %s: %v", task.ID, err)
 	} else if current.State == store.StateQueued || current.State == store.StatePreparing || current.State == store.StateExecuting {
-		if err := a.db.Transition(ctx, task.ID, current.State, store.StateFailed, cause.Error()); err != nil {
+		if err := a.db.Transition(ctx, task.ID, current.State, store.StateFailed, reason); err != nil {
 			log.Printf("gateway: fail task %s: %v", task.ID, err)
 		}
 	}
-	msg := "Task failed: " + cause.Error()
+	msg := "Task failed: " + reason
 	if len(msg) > 500 {
 		msg = msg[:500]
 	}
-	if _, err := a.tg.SendMessage(ctx, chatID, msg); err != nil {
+	if err := a.replyKeyboard(ctx, chatID, msg, chatButtons(a.currentMode(chatID))); err != nil {
 		log.Printf("gateway: send failure: %v", err)
+	}
+}
+
+func scrubForUser(err error) string {
+	if err == nil {
+		return ""
+	}
+	return userFacingSecret.ReplaceAllString(err.Error(), "[REDACTED]")
+}
+
+func validMode(mode string) bool {
+	switch mode {
+	case modeBuild, modePlan, modeResearch:
+		return true
+	default:
+		return false
+	}
+}
+
+func modeAgent(mode string) string {
+	if mode == modePlan || mode == modeResearch {
+		return "plan" // built-in primary agent; edits are denied in config
+	}
+	return "build"
+}
+
+// modePrompt prefixes the owner's text so the shared plan agent can behave as
+// a researcher without relying on an unsupported custom agent definition.
+func modePrompt(mode, prompt string) string {
+	switch mode {
+	case modePlan:
+		return "PLAN MODE: Investigate first. Ask a clarifying question if scope is unclear. Return a concise plan with files, steps, tests and risks. Do not edit files.\n\n" + prompt
+	case modeResearch:
+		return "RESEARCH MODE: Read and search only. Use web tools where useful and cite sources. Ask a clarifying question if scope is broad. Do not edit files, push, or open pull requests.\n\n" + prompt
+	default:
+		return prompt
+	}
+}
+
+func modeVerb(mode string) string {
+	switch mode {
+	case modePlan:
+		return "plan before editing"
+	case modeResearch:
+		return "research and report"
+	default:
+		return "build"
+	}
+}
+
+func modeFromCommand(text string) string {
+	fields := strings.Fields(text)
+	if len(fields) == 0 || !strings.HasPrefix(fields[0], "/") {
+		return ""
+	}
+	switch strings.ToLower(strings.TrimPrefix(fields[0], "/")) {
+	case "build":
+		return modeBuild
+	case "plan":
+		return modePlan
+	case "research":
+		return modeResearch
+	default:
+		return ""
+	}
+}
+
+func modePromptRest(text string) string {
+	if i := strings.IndexByte(text, ' '); i >= 0 {
+		return strings.TrimSpace(text[i+1:])
+	}
+	return ""
+}
+
+func chatButtons(mode string) [][]telegram.InlineButton {
+	return [][]telegram.InlineButton{
+		{
+			{Text: "Build", CallbackData: "mode:build"},
+			{Text: "Plan", CallbackData: "mode:plan"},
+			{Text: "Research", CallbackData: "mode:research"},
+		},
+		{
+			{Text: "Summary", CallbackData: "act:summary"},
+			{Text: "Status", CallbackData: "status"},
+			{Text: "New topic", CallbackData: "new"},
+		},
 	}
 }
