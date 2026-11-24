@@ -30,7 +30,7 @@ Authoritative summary lives in `README.md` §17 and `BUILD_SPEC.md` §8[cite: 2,
 | V12 | OpenCode headless `lsp`, `snapshot`, custom headers (`X-Task-Id`), MCP / custom tools | M1, M3a | Resolved | 2026-11-23 | Real `opencode v2.4.0` plus official `https://opencode.ai/config.json`. Schema keys: `lsp` (bool or per-server overrides), `snapshot` (**deprecated**) and `snapshots` (bool, authoritative), `provider` (deprecated) and `providers.<id>.headers` (string map), `mcp.servers.<name>` with `type: remote` + `url` (+ optional `headers`) or `type: local` + `command` array. There is **no config key for custom tools**; extension is via `plugins` / `plugin` (deprecated) or MCP servers, and built-in tools are gated by `tools` (deprecated) / `permissions`. Live probe: a temp project `opencode.json` with `lsp:false`, `snapshot:false`, `providers.probe.headers.x-probe:yes` and `mcp.servers.probe-remote` was accepted by `opencode serve`; authenticated `GET /api/config` returned `lsp:false`, `snapshots:false`, `providers:["probe"]`, `mcp:["servers"]`. M1 sets `lsp:false` and `snapshots:false` in `opencode.base.json`; per-provider headers are available for M2's router and `X-Task-Id`; MCP/tools work is deferred to M3a/M12 as specified. Live-loop evidence: the fake provider received `x-task-id=<task-id>` and `x-session-id=<session-id>` headers, and `settings.baseURL` pointed at the local fake provider. Provider override probe (same binary): `providers.<id>.models.<modelID>` with `modelID` is accepted (`id` also works); a custom provider needs `name`, `env`, `package: "@opencode/ai/providers/openai-compatible"`, `settings.baseURL` and `models`. `opencode models` then lists `nvidia/nvidia/nemotron-3.5-bolt-e4b` and the declared `groq/...` models, and `opencode serve` starts with both declared and no keys present. NVIDIA's API docs confirm the upstream ID `nvidia/nemotron-3.5-bolt-e4b`; models.dev does not yet ship it, hence the explicit override. |
 | V13 | Search provider configuration (`none` vs `searxng`) | M3a | Resolved (`none`) | 2026-11-24 | No searxng config, service, URL or credential exists in `config/`, `deploy/`, `scripts/` or host (`grep -rn searxng` returned only this VERIFY row). Choose `provider: none`; research search returns `search_unavailable` and tells the agent to fetch known documentation URLs. Revisit when M12 has an acceptable free-tier provider. |
 | V14 | Object Storage upload from arm64 (S3-compatible API / CLI without Python), boot backups, external monitors | M0 | Design resolved; live drill pending (VM not ready) | 2026-11-23 | Use **rclone's native `oracleobjectstorage` backend** (single static Go binary, arm64 build, no Python/OCI CLI) with `provider = instance_principal_auth`: certificates come from instance metadata, so **no credentials are stored on the VM** (Hard Rule 2). Config needs `namespace`, `region`, and (only for bucket listing) `compartment`; a dynamic group containing the instance plus an Object Storage policy are the only tenancy-side requirements. The S3-compatible alternative works but requires long-lived Customer Secret Keys on the VM, so it is rejected. Boot-volume backups: Oracle supports policy-based automatic backups; Always Free includes 5 free volume backups. External monitors: Healthchecks.io Hobbyist is USD 0/month with 20 checks (dead-man's switch via `HEALTHCHECK_PING_URL`); UptimeRobot has a free tier for HTTPS uptime. Live upload/alert drill awaits the ARM64 VM. See `update.md` §11 for the ordered VM command checklist. |
-| V15 | `git bundle` round trip, `--no-hardlinks` offline clone, bundle size cap on large repos | M3a, M3b | Resolved (small fixture) | 2026-11-24 | Pre-code probe: `git bundle create` then `git clone --no-hardlinks` produced byte-identical files, bundle 447 bytes. M3a real drill: container-side `padi-export-bundle`, host copy-out, `gitops.Quarantine`, `CheckoutForVerify` and a fresh verify container returned `verdict: pass` with `verify_exit=0`; bundle was 466 bytes. The bundle size cap is unit-tested (`ErrExportFailed` over 1 MB); large-repo timing/cap still needs M3b evidence. |
+| V15 | `git bundle` round trip, `--no-hardlinks` offline clone, bundle size cap on large repos | M3a, M3b | Resolved | 2026-11-24 | Pre-code probe: 447-byte bundle round trip. M3a real drill: container-side `padi-export-bundle`, host copy-out, `gitops.Quarantine`, `CheckoutForVerify` and a fresh verify container returned `verdict: pass` with `verify_exit=0` (466-byte bundle). M3b large-repo drill: 100,663,319-byte fixture (96 MiB incompressible blobs), bundle 100,694,505 bytes in 10,496 ms, `git clone --no-hardlinks` in 2,910 ms, tree SHA-256 identical; cap `size-1` rejected and cap `size+1MiB` accepted. `ExportBundle`/`Quarantine` enforce the same cap through `BundleMaxMB`; the 1 MB over-cap case is unit-tested. |
 | V16 | Chromium/Playwright on arm64 within 2 GB cap + remote MCP browser server | M11 | Pending | — | — |
 | V17 | `/dev/kvm` presence on VM (`ls /dev/kvm`) | M16 | Pending | — | — |
 | V18 | OpenCode skills discovery paths, config key, per-skill permissions, `question` event surfacing | M12 | Pending | — | — |
@@ -135,7 +135,7 @@ identical
 cap_ok 447 1
 ```
 
-Limits: this host is amd64 with a root Docker socket, so V10's arm64/rootless/gVisor portion and the large-repository half of V15 remain open for the VM/M3b.
+Limits: this host is amd64 with a root Docker socket, so V10's arm64/rootless/gVisor portion remains open for the VM. V15's large-repository half was resolved on this host before M3b code; the ARM VM does not change the result.
 
 ## M3a implementation acceptance (2026-11-24)
 
@@ -207,6 +207,25 @@ Decisions from defects found in the real drill:
 - Explicit `PATH` and `HOME` are injected because the container API replaces the image environment.
 - The fixed export script writes its bundle to `/workspace/.padi-task.bundle` because Docker cannot copy out of a runtime tmpfs; it deletes that file before every export so it is never committed.
 - Image rebuilt after these changes: `sandbox-agent-session:latest` = `sha256:24ff03b73b5e4b336adea2afac2355569eb369df80092953378877a9d3bf5a84`.
+
+## V15 large-repository resolution (2026-11-24, before M3b code)
+
+```text
+$ git init -q -b main source
+$ for n in 1 2 3; do dd if=/dev/urandom of=blob-$n.bin bs=1M count=32; done
+$ git bundle create /tmp/opencode/m3b-v15/repo.bundle --all
+$ git clone --no-hardlinks /tmp/opencode/m3b-v15/repo.bundle /tmp/opencode/m3b-v15/offline-clone
+
+fixture_files=4 fixture_bytes=100663319
+bundle_bytes=100694505 bundle_ms=10496 clone_ms=2910
+tree_match=yes
+src_sha=f0ed936eb296a309a332f72f1a5aea2ab9a490674f06d443e33088452aef59f3
+clone_sha=f0ed936eb296a309a332f72f1a5aea2ab9a490674f06d443e33088452aef59f3
+cap_under=100694504 result=rejected
+cap_over=101743081 result=accepted
+```
+
+Conclusion: a ~96 MiB repo round-trips with byte-identical tree contents; the cap boundary is enforced by the same size check used in `ExportBundle` and `Quarantine`. V15 is fully resolved; no VM dependency remains.
 
 ## M0 VM-only deferral — owner Option B (2026-11-23)
 
