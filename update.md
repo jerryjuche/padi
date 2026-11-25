@@ -1134,3 +1134,63 @@ New regression tests: `TestButtonsMatchTaskState`, `TestActionButtonsAreSingleUs
 - Router path was probed end to end with `agent-chat` (`nvidia/nemotron-3.5-bolt-e4b`, `OK`, HTTP 200), and the router was reachable from a container on `agent-session-net` (HTTP 200). A short online notice was sent to the owner chat (message 249).
 
 Send a normal chat message or tap a current button in Telegram.
+
+---
+
+## 21. Conversational-first Telegram chat (2026-11-25)
+
+### Owner guidance applied
+
+- Default repo: none. `git.default_repo` stays in the config for compatibility but never implies a repository.
+- General chat: answered directly through the router with per-chat memory; no clone, container, or repo selection.
+- Clarifying questions: one concrete question when work genuinely needs a workspace, and a plan with `PROPOSAL:` + Execute/Revise before every file change.
+
+### Cause and fix
+
+- `parseCommand` used to return `askRepo` for any plain message when no workspace and no default repo existed. That made every turn clone-focused, including "How's this project working?".
+- `handleUpdate` now treats every non-`clone` message as a conversation turn. The router receives the existing chat history plus workspace metadata and returns either a normal answer, `WORKSPACE_TASK: ...`, or `NEEDS_REPO: ...`. Marker lines are gateway-only and never reach Telegram.
+- `NEEDS_REPO` always includes the concrete `clone owner/repo and <task>` option, even if the model's question omits it.
+- Every plain build turn runs with the read-only `plan` agent and must end with one `PROPOSAL:` line. Only an Execute tap switches to the `build` agent; the approved prompt explicitly says not to ask twice. Quick read-only actions also use the plan agent.
+- Task summaries are appended back to direct-chat memory, so a follow-up after a workspace run does not sound like the earlier request was ignored.
+- Session image prompts now enforce the same plan-before-edit contract.
+
+### Evidence
+
+```
+$ gofmt -l cmd internal          # no output
+$ GOPROXY=off go build ./...     # no output
+$ GOPROXY=off go vet ./...       # no output
+$ GOPROXY=off go test -race -count=1 ./...
+ok  github.com/jerryjuche/padi/cmd/gateway  1.471s
+ok  github.com/jerryjuche/padi/internal/gateway/telegram  1.934s
+(all other packages ok)
+
+$ scripts/m3b-smoke.sh
+m3b-smoke: task-scoped one-time buttons, callback dedupe and trust regressions passed
+m3b-smoke: PASS M3b smoke (no live PR, no secrets used)
+
+$ set -a; . ./.env.local; set +a; sh scripts/dbaccess_test.sh
+dbaccess_test: anon key cannot read any agent table (16 checked)
+
+$ docker build -f deploy/session/Dockerfile -t sandbox-agent-session:latest .
+image=sha256:fa92ec7333124a78766feb9e5b245b27ebcc1f879e76d93c7fbd3ca23695cbc8
+prompt-check: plan-before-edit PROPOSAL contract present in AGENTS.target.md and opencode.base.json
+```
+
+New regression tests: `TestRouterChatClientSendsHistoryAndToken`, `TestClassifyDirectReplyMarkers`, `TestDirectChatAnswersWithoutRepo`, `TestDirectChatAsksRepoOnlyForWorkspaceWork`, `TestTaskAgentEnforcesPlanBeforeEdits`. `scripts/m3b-smoke.sh` runs the three owner-facing ones. `TestParseRepo` and `TestParseCommandConversation` now assert that a plain message never selects a default repo.
+
+### Live restart (2026-11-25)
+
+- Router: PID `164189`, log `/tmp/opencode/padi-router.log`; `/healthz` returned `{"ok":true}`, `/v1/models` listed `agent-chat`, and a direct `agent-chat` probe returned `LIVE_DIRECT_OK` from `nvidia/nemotron-3.5-bolt-e4b`.
+- Gateway: PID `163660`, log `/tmp/opencode/padi-gateway.log`; ready with `model=padi/agent-chat, network=agent-session-net` and the new binary.
+- Owner notice sent to Telegram message `265`.
+
+### Open items unchanged
+
+- No live PR: still needs a genuine owner decision and target repository installation.
+- V10 arm64/rootless/gVisor and the M0 VM-only drills remain deferred to the owner-provisioned ARM VM.
+- The M2 checkbox stays unticked until the M1 NVIDIA throwaway key is revoked.
+
+### Next
+
+Send a normal chat message in Telegram, then a code-change request. General chat should answer directly; code work should produce one plan with Execute/Revise before any edit.

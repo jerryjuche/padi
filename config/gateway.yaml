@@ -44,7 +44,7 @@ git:
   workspaces_dir: "/srv/agent/workspaces"
   quarantine_dir: "/srv/agent/quarantine"
   verify_dir: "/srv/agent/verify"
-  default_repo: ""               # optional local source for the M1 spike
+  default_repo: ""               # compatibility only; chat never implies a repo
 
 store:
   dsn_env: "DATABASE_URL"

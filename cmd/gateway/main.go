@@ -38,7 +38,8 @@ const (
 
 	// chatStyle is prepended to every agent prompt so replies read like a
 	// conversational collaborator, not a tool transcript or a generic menu.
-	chatStyle = "Answer the current request directly in 2-4 short sentences: the result, what you verified, then one concrete next step tied to this request. Do not open with a capability disclaimer or repeat a canned status line. Never re-ask a settled question or restate an earlier answer; use what you already learned in this conversation. Ask a question only when a file-changing choice is genuinely blocked, and offer concrete options when you do. If a next step needs approval, end with exactly one line `PROPOSAL: <goal; files; steps; risk>`; the owner will get an Execute button carrying that exact plan. Never mention tool parameter names such as oldString, newString or replaceAll. Publishing and pull requests happen only after verification and owner approval; finish the local work first. Keep replies under 600 characters.\n\n"
+	// Build turns are read-only plan turns until the owner taps Execute.
+	chatStyle = "Answer the current request directly in 2-4 short sentences: the result, what you verified, then one concrete next step tied to this request. Do not open with a capability disclaimer or repeat a canned status line. Never re-ask a settled question or restate an earlier answer; use what you already learned in this conversation. Before any file change, investigate and end with exactly one whole line `PROPOSAL: <goal; files; steps; risk>`; do not edit files in that turn. The owner receives an Execute button carrying that exact plan. When the prompt says the owner already approved a PROPOSAL, make only that approved change, run the narrowest relevant checks, and do not ask for approval again. Ask one clarifying question with concrete options only when a file-changing choice is genuinely blocked. Never mention tool parameter names such as oldString, newString or replaceAll. Publishing and pull requests happen only after verification and owner approval; finish the local work first. Keep replies under 600 characters.\n\n"
 )
 
 var userFacingSecret = regexp.MustCompile(`(?i)(authorization:\s*bearer\s+)\S+|(?i)(authorization:\s*basic\s+)[A-Za-z0-9+/=]+|\b(?:ghs|gho|ghu|ghr|github_pat)_[A-Za-z0-9_]+\b|\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b`)
@@ -174,6 +175,10 @@ func run() error {
 		checkpoints:      make(map[uuid.UUID]int),
 		publishing:       make(map[uuid.UUID]bool),
 		waits:            make(map[uuid.UUID]chan bool),
+		direct:           make(map[int64]*directChatState),
+		chatClient: &routerChatClient{
+			BaseURL: routerBaseURL, Token: routerToken, Model: cfg.OpenCode.Model,
+		},
 	}
 	go approvalManager.ExpireLoop(ctx)
 	poller := &telegram.Poller{
@@ -370,6 +375,15 @@ type application struct {
 	modes   map[int64]string
 	chats   map[int64]*chatSession
 
+	// direct holds router-only conversation memory for chats without a
+	// workspace task. Workspace tasks keep their own OpenCode session.
+	directMu sync.Mutex
+	direct   map[int64]*directChatState
+
+	// chatClient calls the same router the session containers use, so normal
+	// conversation needs no clone, container or provider keys in the gateway.
+	chatClient *routerChatClient
+
 	// actions de-duplicates legacy button tokens and approval callbacks. A
 	// token is consumed once; replayed updates cannot start a second run.
 	actions map[string]time.Time
@@ -474,19 +488,20 @@ func (a *application) event(ctx context.Context, sessionID uuid.UUID, taskID *uu
 	return exceeded
 }
 
-// command is the parsed form of one owner message.
+// command is the parsed form of one owner message. readOnly tasks use the
+// plan agent (no edits); approved tasks carry an accepted PROPOSAL and may
+// switch to the build agent immediately.
 type command struct {
 	repo           string
 	prompt         string
 	askRepo        bool
 	awaitingPrompt bool
+	readOnly       bool
+	approved       bool
 }
 
-// parseCommand supports a short conversation:
-//
-//	clone owner/repo and <prompt>  -> start immediately
-//	clone owner/repo               -> remember repo, ask what to do next
-//	<prompt>                       -> use the remembered or default repo
+// parseCommand handles repository selection only. Normal conversation is
+// answered by the router without a container; a default repo is never implied.
 func (a *application) parseCommand(chatID int64, text string) command {
 	fields := strings.Fields(text)
 	if len(fields) >= 2 && strings.EqualFold(fields[0], "clone") {
@@ -508,10 +523,7 @@ func (a *application) parseCommand(chatID int64, text string) command {
 	if repo := a.forgetRepo(chatID); repo != "" {
 		return command{repo: repo, prompt: text}
 	}
-	if a.cfg.Git.DefaultRepo != "" {
-		return command{repo: a.cfg.Git.DefaultRepo, prompt: text}
-	}
-	return command{askRepo: true}
+	return command{prompt: text}
 }
 
 // normalizeRepo turns the forms people actually type into an owner/repo key.
@@ -683,6 +695,7 @@ func (a *application) handleUpdate(ctx context.Context, u telegram.Update) error
 		return nil
 	}
 
+	key := fmt.Sprintf("tg-%d-%d", chatID, u.Message.MessageID)
 	switch {
 	case strings.HasPrefix(text, "/start"), strings.HasPrefix(text, "/help"):
 		return a.help(ctx, chatID)
@@ -693,6 +706,7 @@ func (a *application) handleUpdate(ctx context.Context, u telegram.Update) error
 	case strings.HasPrefix(text, "/new"):
 		a.closeChat(chatID)
 		a.forgetRepo(chatID)
+		a.clearDirect(chatID)
 		a.rememberMode(chatID, modeBuild)
 		return a.replyKeyboard(ctx, chatID, "New topic. Tell me what you'd like to work on, or send clone <repo> to open a repository.", a.buttons(chatID, "empty", ""))
 	case modeFromCommand(text) != "":
@@ -707,40 +721,87 @@ func (a *application) handleUpdate(ctx context.Context, u telegram.Update) error
 		if rest == "" {
 			return a.replyKeyboard(ctx, chatID, mode+" mode on. Tell me what you want me to "+modeVerb(mode)+".", a.buttonsForChat(chatID))
 		}
-		return a.continueChat(ctx, chatID, rest, fmt.Sprintf("tg-%d-%d", chatID, u.Message.MessageID), mode)
+		return a.handleConversation(ctx, chatID, rest, key, mode)
 	}
 
-	// A plain message in an active workspace is a follow-up: same repo, same
-	// OpenCode session, same container. No clone, no repeated setup.
-	active := a.getChat(chatID)
-	if active != nil && !strings.HasPrefix(strings.ToLower(text), "clone ") {
-		return a.continueChat(ctx, chatID, text, fmt.Sprintf("tg-%d-%d", chatID, u.Message.MessageID), a.currentMode(chatID))
+	// Explicit clone opens or replaces a workspace. Everything else is a
+	// conversation turn first; the model decides if it needs that workspace.
+	if strings.HasPrefix(strings.ToLower(text), "clone ") {
+		c := a.parseCommand(chatID, text)
+		if c.askRepo {
+			return a.reply(ctx, chatID, "That doesn't look like a repository. Send a GitHub URL (owner/repo works too), or just tell me what you'd like to chat about.")
+		}
+		if c.awaitingPrompt {
+			a.rememberRepo(chatID, c.repo)
+			return a.reply(ctx, chatID, "Got "+c.repo+". What should I do in it?")
+		}
+		fresh := a.getChat(chatID) == nil
+		return a.startTask(ctx, chatID, c, key, fresh)
 	}
-
-	c := a.parseCommand(chatID, text)
-	if c.askRepo {
-		return a.reply(ctx, chatID, "Which repo? Send 'clone owner/repo' (a GitHub URL works too) and I'll ask what to do next.")
-	}
-	if c.awaitingPrompt {
-		a.rememberRepo(chatID, c.repo)
-		return a.reply(ctx, chatID, "Got "+c.repo+". What should I do in it?")
-	}
-	fresh := active == nil
-	return a.startTask(ctx, chatID, c, fmt.Sprintf("tg-%d-%d", chatID, u.Message.MessageID), fresh)
+	return a.handleConversation(ctx, chatID, text, key, "")
 }
 
-// continueChat starts a task on an existing workspace, or falls back to normal
-// repo selection when no workspace is active (e.g. /plan followed by a prompt).
-func (a *application) continueChat(ctx context.Context, chatID int64, prompt, key, mode string) error {
-	if chat := a.getChat(chatID); chat != nil {
+// handleConversation answers a normal message through the router. The router
+// may hand the request back with a workspace marker; a repository is requested
+// only for work that genuinely needs one.
+func (a *application) handleConversation(ctx context.Context, chatID int64, text, key, modeHint string) error {
+	reply, err := a.directCompletion(ctx, chatID, text, modeHint)
+	if err != nil {
+		log.Printf("gateway: direct chat: %v", scrubForUser(err))
+		return a.replyKeyboard(ctx, chatID, "I couldn't reach the chat model. Try again, or send /help.", a.buttons(chatID, "empty", ""))
+	}
+	kind, message := classifyDirectReply(reply, text)
+	state := a.getDirect(chatID)
+
+	switch kind {
+	case directWorkspace:
+		chat := a.getChat(chatID)
+		state.add("user", text)
+		if chat == nil {
+			question := defaultRepoQuestion(message)
+			if modeHint != "" && modeHint != modeBuild {
+				question += " I'll use " + modeHint + " mode."
+			}
+			state.add("assistant", question)
+			return a.replyKeyboard(ctx, chatID, question, a.buttons(chatID, "empty", ""))
+		}
 		repo, _, _, _, _ := chat.detail()
-		return a.startTask(ctx, chatID, command{repo: repo, prompt: prompt}, key, false)
+		return a.startTask(ctx, chatID, command{repo: repo, prompt: message}, key, false)
+	case directNeedsRepo:
+		question := ensureRepoQuestion(message, text)
+		if modeHint != "" && modeHint != modeBuild {
+			question += " I'll use " + modeHint + " mode."
+		}
+		state.add("user", text)
+		state.add("assistant", question)
+		return a.replyKeyboard(ctx, chatID, question, a.buttons(chatID, "empty", ""))
+	default:
+		state.add("user", text)
+		state.add("assistant", message)
+		return a.replyKeyboard(ctx, chatID, message, a.buttons(chatID, "empty", ""))
 	}
-	c := a.parseCommand(chatID, prompt)
-	if c.askRepo {
-		return a.reply(ctx, chatID, "Which repo should I use? Send 'clone owner/repo' first.")
+}
+
+func (a *application) directCompletion(ctx context.Context, chatID int64, text, modeHint string) (string, error) {
+	if a.chatClient == nil {
+		return "I'm here. Tell me what you'd like to work on.", nil
 	}
-	return a.startTask(ctx, chatID, c, key, true)
+	history := a.getDirect(chatID).snapshot()
+	return a.chatClient.Complete(ctx, a.buildDirectSystem(chatID, modeHint), history, text)
+}
+
+// buildDirectSystem injects only workspace metadata. The model never receives
+// repo credentials and cannot claim it read files in this direct-chat path.
+func (a *application) buildDirectSystem(chatID int64, modeHint string) string {
+	workspace := "No repository is open."
+	if chat := a.getChat(chatID); chat != nil {
+		repo, mode, _, _, _ := chat.detail()
+		workspace = "Active workspace: " + repo + " in " + mode + " mode. You may refer to it, but you have not read its files in this chat."
+	}
+	if modeHint != "" {
+		workspace += " The owner selected " + modeHint + " mode for the next workspace task."
+	}
+	return directSystemPrompt + "\n" + workspace
 }
 
 func (a *application) handleCallback(ctx context.Context, q *telegram.CallbackQuery) error {
@@ -771,6 +832,7 @@ func (a *application) handleCallback(ctx context.Context, q *telegram.CallbackQu
 	case data == "new":
 		a.closeChat(chatID)
 		a.forgetRepo(chatID)
+		a.clearDirect(chatID)
 		a.rememberMode(chatID, modeBuild)
 		return a.replyToCallback(ctx, q, "New topic. Tell me what you'd like to work on, or send clone <repo> to open a repository.", a.buttons(chatID, "empty", ""))
 	case data == "status":
@@ -797,7 +859,7 @@ func (a *application) handleCallback(ctx context.Context, q *telegram.CallbackQu
 		}
 		chat.setProposal(nil)
 		repo, _, _, _, _ := chat.detail()
-		return a.startTask(ctx, chatID, command{repo: repo, prompt: p.Prompt}, "exec:"+taskID, false)
+		return a.startTask(ctx, chatID, command{repo: repo, prompt: p.Prompt, approved: true}, "exec:"+taskID, false)
 	case strings.HasPrefix(data, "undo:"):
 		return a.undoCallback(ctx, chatID, data)
 	case strings.HasPrefix(data, "x:"):
@@ -857,7 +919,7 @@ func (a *application) handleTap(ctx context.Context, chatID int64, q *telegram.C
 		p, _ := chat.proposalFor(tap.TaskID)
 		chat.setProposal(nil)
 		repo, _, _, _, _ := chat.detail()
-		return a.startTask(ctx, chatID, command{repo: repo, prompt: p.Prompt}, "tap:"+token, false)
+		return a.startTask(ctx, chatID, command{repo: repo, prompt: p.Prompt, approved: true}, "tap:"+token, false)
 	case "undo":
 		return a.undo(ctx, chatID, "")
 	default:
@@ -886,7 +948,8 @@ func (a *application) runAction(ctx context.Context, chatID int64, chat *chatSes
 		return &telegram.ReportedError{Err: fmt.Errorf("unknown action %q", action)}
 	}
 	repo, _, _, _, _ := chat.detail()
-	return a.startTask(ctx, chatID, command{repo: repo, prompt: prompt}, key, false)
+	readOnly := action == "checks" || action == "explain" || action == "diff" || action == "summary"
+	return a.startTask(ctx, chatID, command{repo: repo, prompt: prompt, readOnly: readOnly}, key, false)
 }
 
 // runLegacyAction keeps keyboards issued by an older binary harmless. Those
@@ -904,10 +967,10 @@ func (a *application) runLegacyAction(ctx context.Context, chatID int64, taskID,
 
 func (a *application) helpText() string {
 	return "Padi chat\n\n" +
-		"Just write naturally. I keep the repository and conversation open between messages, so you can ask follow-ups or ask me to clarify anything.\n\n" +
+		"Just write naturally. General chat needs no repository. When a request really needs a workspace, I'll ask you to open one; before any file change I'll propose a plan and wait for your Execute tap.\n\n" +
 		"Commands:\n" +
 		"• clone <repo> — open a GitHub repo (URLs work)\n" +
-		"• /build — implement changes (default)\n" +
+		"• /build — implement an approved plan (default mode)\n" +
 		"• /plan — investigate and propose a plan before editing\n" +
 		"• /research — read, search and report; no edits\n" +
 		"• /status — show the active workspace\n" +
@@ -922,7 +985,7 @@ func (a *application) help(ctx context.Context, chatID int64) error {
 
 func (a *application) statusText(chatID int64) string {
 	chat := a.getChat(chatID)
-	text := "No active workspace. Send a request, or clone <repo> to open a repository."
+	text := "No active workspace. Chat normally, or send clone <repo> to open a repository."
 	if chat != nil {
 		repo, mode, sessionID, last, busy := chat.detail()
 		state := "idle"
@@ -960,6 +1023,12 @@ func (a *application) startTask(ctx context.Context, chatID int64, c command, ke
 		return a.reply(ctx, chatID, "I need a repo and a request. Try 'clone owner/repo and add a README'.")
 	}
 	mode := a.currentMode(chatID)
+	agentName := taskAgent(mode, c)
+	agentPrompt := taskPrompt(mode, c)
+	eventMode := mode
+	if mode == modeBuild && !c.approved {
+		eventMode = modePlan // the first build turn is a read-only plan
+	}
 	chat := a.getChat(chatID)
 	if fresh && chat != nil {
 		a.closeChat(chatID)
@@ -1015,7 +1084,7 @@ func (a *application) startTask(ctx context.Context, chatID int64, c command, ke
 	if chat != nil {
 		priorContext = chat.taskContext()
 	}
-	a.event(ctx, session.ID, &task.ID, "status", map[string]string{"state": "QUEUED", "mode": mode})
+	a.event(ctx, session.ID, &task.ID, "status", map[string]string{"state": "QUEUED", "mode": eventMode})
 	if err := a.db.Transition(ctx, task.ID, store.StateQueued, store.StatePreparing, ""); err != nil {
 		return a.reportError(ctx, chatID, err)
 	}
@@ -1085,7 +1154,7 @@ func (a *application) startTask(ctx context.Context, chatID int64, c command, ke
 		return a.reportError(ctx, chatID, err)
 	}
 	stopCheckpoints := a.checkpointLoop(taskCtx, task.ID, session.ID, chat.handle.ID)
-	summary, err := a.runTask(taskCtx, chat, session, task, chatID, c.prompt, mode, priorContext)
+	summary, err := a.runTask(taskCtx, chat, session, task, chatID, agentName, agentPrompt, priorContext)
 	stopCheckpoints()
 	if err != nil {
 		if errors.Is(err, errBudgetExceeded) || errors.Is(err, errOffLimits) {
@@ -1102,6 +1171,9 @@ func (a *application) startTask(ctx context.Context, chatID int64, c command, ke
 	if _, err := a.checkpoint(taskCtx, task.ID, session.ID, chat.handle.ID); err != nil {
 		log.Printf("gateway: final checkpoint task %s: %s", task.ID, scrubForUser(err))
 	}
+	// Keep the router-only conversation aware of workspace results so a
+	// follow-up does not sound like the earlier request was never answered.
+	a.getDirect(chatID).add("assistant", summary)
 
 	// Publish only build-mode work that actually changed files. Chat replies,
 	// research and plans finish locally; they never create approval cards.
@@ -1154,7 +1226,7 @@ func (a *application) beginExecution(ctx context.Context, taskID uuid.UUID) erro
 	}
 }
 
-func (a *application) runTask(ctx context.Context, chat *chatSession, session store.Session, task store.Task, chatID int64, prompt, mode, priorContext string) (string, error) {
+func (a *application) runTask(ctx context.Context, chat *chatSession, session store.Session, task store.Task, chatID int64, agentName, agentPrompt, priorContext string) (string, error) {
 	feedCtx, feedCancel := context.WithCancel(ctx)
 	defer feedCancel()
 	rawEvents, err := chat.oc.Events(feedCtx)
@@ -1203,18 +1275,17 @@ func (a *application) runTask(ctx context.Context, chat *chatSession, session st
 		}
 	}()
 
-	agentPrompt := modePrompt(mode, prompt)
 	if priorContext != "" {
 		agentPrompt = priorContext + "\n\n" + agentPrompt
 	}
-	if err := chat.oc.PromptWithAgent(ctx, chat.ocSession, agentPrompt, a.cfg.OpenCode.Model, modeAgent(mode)); err != nil {
+	if err := chat.oc.PromptWithAgent(ctx, chat.ocSession, agentPrompt, a.cfg.OpenCode.Model, agentName); err != nil {
 		return "", err
 	}
 	summary, err := a.renderer.RelayWithKeyboardFunc(ctx, chatID, session.ID, &task.ID, normalized, func(final string) [][]telegram.InlineButton {
 		kind := "done"
 		if parseProposal(final, task.ID.String()) != nil {
 			kind = "decision"
-		} else if mode == modePlan || mode == modeResearch {
+		} else if agentName == "plan" {
 			kind = "workspace"
 		}
 		return a.buttons(chatID, kind, task.ID.String())
@@ -1307,12 +1378,39 @@ func modeAgent(mode string) string {
 func modePrompt(mode, prompt string) string {
 	switch mode {
 	case modePlan:
-		return "PLAN MODE: Investigate first. Return a short plan with files, steps, tests and risks. Do not edit files.\n\n" + chatStyle + prompt
+		return "PLAN MODE: Investigate first. Do not edit files. End with exactly one whole line beginning `PROPOSAL: <goal; files; steps; risk>`. If a file-changing choice is blocked, ask one concrete question instead.\n\n" + chatStyle + prompt
 	case modeResearch:
-		return "RESEARCH MODE: Read and search only. Cite sources. Do not edit files, push, or open pull requests.\n\n" + chatStyle + prompt
+		return "RESEARCH MODE: Read and search only. Cite sources. Do not edit files, push, or open pull requests. Do not emit a PROPOSAL unless the owner asked for one.\n\n" + chatStyle + prompt
 	default:
 		return chatStyle + prompt
 	}
+}
+
+// taskAgent keeps every file-changing turn read-only until the owner approves
+// a PROPOSAL. Quick read-only actions use the plan agent for the same reason.
+func taskAgent(mode string, c command) string {
+	if mode != modeBuild {
+		return modeAgent(mode)
+	}
+	if c.approved {
+		return modeAgent(modeBuild)
+	}
+	return modeAgent(modePlan) // plan agent has edit/write tools denied
+}
+
+// taskPrompt chooses the contract for this turn: plan first, read-only
+// answer, or an already-approved implementation.
+func taskPrompt(mode string, c command) string {
+	if mode != modeBuild {
+		return modePrompt(mode, c.prompt)
+	}
+	if c.approved {
+		return chatStyle + c.prompt
+	}
+	if c.readOnly {
+		return "READ-ONLY MODE: Use the existing workspace context. Do not edit files. Do not emit a PROPOSAL unless the owner asked for a plan.\n\n" + chatStyle + c.prompt
+	}
+	return modePrompt(modePlan, c.prompt)
 }
 
 func modeVerb(mode string) string {
@@ -1364,8 +1462,8 @@ func parseProposal(summary, taskID string) *proposalRecord {
 		}
 		return &proposalRecord{
 			TaskID: taskID,
-			Prompt: "Execute this approved plan in this workspace: " + body +
-				". Make the changes, run the narrowest relevant checks, and report in two sentences. Do not push.",
+			Prompt: "The owner approved this exact plan. Do not ask for approval again. Execute this approved plan in this workspace: " + body +
+				". Make only these changes, run the narrowest relevant checks, and report in two sentences. Do not push.",
 		}
 	}
 	return nil

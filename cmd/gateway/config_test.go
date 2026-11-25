@@ -105,7 +105,8 @@ func TestParseRepo(t *testing.T) {
 		text, repo, prompt string
 	}{
 		{"clone /tmp/source and add a line", "/tmp/source", "add a line"},
-		{"add a line to README", "/srv/local/default", "add a line to README"},
+		// default_repo is retained for compatibility but never implies a repo.
+		{"add a line to README", "", "add a line to README"},
 	}
 	for _, tc := range cases {
 		got := a.parseCommand(7, tc.text)

@@ -2,7 +2,7 @@
 
 Authoritative summary lives in `README.md` §17 and `BUILD_SPEC.md` §8[cite: 2, 4]. Every `VERIFY` item must be tested against the real environment and recorded here with date and command/output evidence before building on it[cite: 2].
 
-## Architectural Decisions (D1–D38)
+## Architectural Decisions (D1–D39)
 
 | # | Decision | Status | Reference |
 |---|---|---|---|
@@ -11,6 +11,7 @@ Authoritative summary lives in `README.md` §17 and `BUILD_SPEC.md` §8[cite: 2,
 | D20–D24 | Rootless Docker (benchmark `runsc` vs `runc` in M3a), independent clone (not worktree), bundle export + quarantine repo, default-deny `egress-proxy`, fresh verify container + test-tampering guard | Adopted | `README.md` §9, §11.1A, §12[cite: 4] |
 | D25–D29 | Supabase authoritative + nightly Object Storage dumps, memory-floor `keepalive` primary anti-reclaim lever, task contract + confirmed incident log, Phase 8 interactive browser opt-in | Adopted | `README.md` §7.7, §7.8, §11.8, §11.9[cite: 4] |
 | D30–D38 | Pinned/hashed read-only skills, Go+Postgres `memory.Store` with provenance/trust (Hard Rule 10), SearxNG on `agent-net`, low-priority routines, request-changes loop, reverse-proxy credential injection, offline `osv-scanner` + `gitleaks`, 300 MB DB size alert | Adopted | `README.md` §7.10–§7.13, §9.4, §12[cite: 4] |
+| D39 | Conversational-first Telegram broker: normal messages use the router directly with per-chat memory and no container/repo; a repo is requested only when the model marks real workspace work; every build turn is read-only plan + `PROPOSAL` until the owner taps Execute; `default_repo` is compatibility-only | Adopted | `cmd/gateway/directchat.go`, `cmd/gateway/main.go`, `deploy/session/AGENTS.target.md`, `update.md` §21 |
 
 ## Open Verifications (`VERIFY` V1–V23)
 

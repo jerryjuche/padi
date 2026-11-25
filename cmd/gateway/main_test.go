@@ -100,6 +100,13 @@ func TestParseCommandConversation(t *testing.T) {
 	if !c.askRepo {
 		t.Fatalf("invalid repo should ask again: %+v", c)
 	}
+
+	// A plain message with no pending repo is a conversation turn, not a
+	// repo selection failure. No implicit default repo is ever applied.
+	c = a.parseCommand(99, "How's this project working?")
+	if c.askRepo || c.repo != "" || c.prompt != "How's this project working?" {
+		t.Fatalf("plain chat = %+v", c)
+	}
 }
 
 func TestModesAndButtons(t *testing.T) {

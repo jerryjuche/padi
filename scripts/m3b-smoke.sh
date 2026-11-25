@@ -75,7 +75,7 @@ say 'contract, guard, risk, approval and expiry gates passed'
 # 6. Gateway button/callback contract: task-scoped actions, ap: namespace and
 # the audit regression guards for dual approvals, budgets and stale verdicts.
 GOPROXY=off go test -count=1 ./cmd/gateway \
-  -run 'TestButtonsMatchTaskState|TestActionButtonsAreSingleUse|TestStaleAndUnapprovedCallbacks|TestMarkActionRejectsDuplicateTap|TestContractOverridesAndHardViolation|TestTrackUsageSignalsBudgetAbort|TestReadVerifyVerdictRejectsNonZeroExit|TestMaybePublishKeepsResumeUntilBothGates' >/dev/null
+  -run 'TestButtonsMatchTaskState|TestActionButtonsAreSingleUse|TestStaleAndUnapprovedCallbacks|TestMarkActionRejectsDuplicateTap|TestDirectChatAnswersWithoutRepo|TestDirectChatAsksRepoOnlyForWorkspaceWork|TestTaskAgentEnforcesPlanBeforeEdits|TestContractOverridesAndHardViolation|TestTrackUsageSignalsBudgetAbort|TestReadVerifyVerdictRejectsNonZeroExit|TestMaybePublishKeepsResumeUntilBothGates' >/dev/null
 GOPROXY=off go test -count=1 ./internal/gateway/telegram \
   -run 'TestRendererRelayKeyboardFollowsFinalReply' >/dev/null
 say 'task-scoped one-time buttons, callback dedupe and trust regressions passed'
