@@ -1076,3 +1076,55 @@ live gateway count: 1
 ### Next
 
 Owner decision on a real push/PR target if a live PR is wanted now; otherwise proceed to M4 only after the owner's go-ahead.
+
+---
+
+## 20. Telegram reply and button lifecycle cleanup (2026-11-25)
+
+### Read-back
+
+- Replayed live `getUpdates`: one pending owner message (`Hi`, chat `7610510426`, update `374300513`); no queued callbacks.
+- Read the live `agent.events` rows behind the bot's last replies. The recent summaries repeated the stale sentence "I can make and verify local changes here, but I can't push or open a PR in M1" across unrelated tasks.
+- Cause found in the session image prompt: `deploy/session/AGENTS.target.md` and `opencode.base.json` still instructed the agent to emit that canned M1 disclaimer. The gateway's runtime `chatStyle` also allowed capability preambles.
+
+### Done
+
+- Removed the M1 disclaimer from the session image prompt and replaced it with a direct-answer contract: result, verification, one concrete next step; no canned status line; no re-asking settled questions. Updated the runtime `chatStyle` the same way and rebuilt `sandbox-agent-session:latest`.
+- Rebuilt Telegram keyboards from task state: `running`/approval waits show Status + New topic, a plan shows Execute + Revise, a completed task shows Run checks + Explain this + Show diff + Undo last, a failed task shows Continue locally + Run checks + Undo last, and an idle workspace shows Summarize + Run checks. The final keyboard is now built from the finished reply, so a `PROPOSAL:` receives Execute/Revise on that same card instead of a second stacked card.
+- Every actionable button now carries a fresh `x:<random>` token held in an in-memory tap table. The first callback consumes the token, edits the tapped card to a spent state (no keyboard), and starts the exact action bound to it. A replay edits the card to "already used" with current buttons; it cannot start a second task. Legacy `a:`, `exec:`, `undo:` and `act:` tokens remain accepted but are single-use too.
+- Approval cards keep the strict `ap:` gate; publish still requires both decisions.
+
+### Evidence
+
+```
+$ gofmt -l cmd internal          # no output
+$ GOPROXY=off go build ./...     # no output
+$ GOPROXY=off go vet ./...       # no output
+$ GOPROXY=off go test -race -count=1 ./...
+ok  github.com/jerryjuche/padi/cmd/gateway  1.486s
+ok  github.com/jerryjuche/padi/internal/gateway/telegram  2.132s
+(all other packages ok)
+
+$ scripts/m3b-smoke.sh
+m3b-smoke: task-scoped one-time buttons, callback dedupe and trust regressions passed
+m3b-smoke: PASS M3b smoke (no live PR, no secrets used)
+
+$ sh scripts/dbaccess_test.sh
+dbaccess_test: anon key cannot read any agent table (16 checked)
+
+$ docker build -f deploy/session/Dockerfile -t sandbox-agent-session:latest .
+image=sha256:269a5675e59b2d263f4a4a874b5ccf25d674be93c1faaa4175d60f96afe36f08
+prompt-clean
+```
+
+New regression tests: `TestButtonsMatchTaskState`, `TestActionButtonsAreSingleUse`, `TestRendererRelayKeyboardFollowsFinalReply`. `scripts/m3b-smoke.sh` runs all three.
+
+### Open items unchanged
+
+- No live PR: still needs a genuine owner decision and target repository installation.
+- V10 arm64/rootless/gVisor and the M0 VM-only drills remain deferred to the owner-provisioned ARM VM.
+- The M2 checkbox stays unticked until the M1 NVIDIA throwaway key is revoked in the NVIDIA console.
+
+### Next
+
+Gateway and router are restarted locally for owner testing; send a normal chat message or tap a current button in Telegram.

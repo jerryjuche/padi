@@ -288,6 +288,48 @@ func TestRendererRelayTreatsNotModifiedAsNoOp(t *testing.T) {
 	}
 }
 
+func TestRendererRelayKeyboardFollowsFinalReply(t *testing.T) {
+	var mu sync.Mutex
+	var seenSummary string
+	var finalMarkup string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		if strings.HasSuffix(r.URL.Path, "/sendMessage") {
+			fmt.Fprint(w, `{"ok":true,"result":{"message_id":99}}`)
+			return
+		}
+		mu.Lock()
+		if markup := r.Form.Get("reply_markup"); markup != "" {
+			finalMarkup = markup
+		}
+		mu.Unlock()
+		fmt.Fprint(w, `{"ok":true,"result":true}`)
+	}))
+	defer srv.Close()
+	events := make(chan opencode.Event, 2)
+	events <- opencode.Event{Type: "token", Text: "Plan ready"}
+	events <- opencode.Event{Type: "done"}
+	close(events)
+	r := &Renderer{
+		Client: &Client{BaseURL: srv.URL, Token: "t", HTTP: srv.Client()},
+	}
+	_, err := r.RelayWithKeyboardFunc(context.Background(), 7, uuid.New(), nil, events, func(summary string) [][]InlineButton {
+		seenSummary = summary
+		return [][]InlineButton{{{Text: "Execute", CallbackData: "x:one"}}}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if seenSummary != "Plan ready" {
+		t.Fatalf("keyboard built from %q, want final summary", seenSummary)
+	}
+	if !strings.Contains(finalMarkup, `"callback_data":"x:one"`) {
+		t.Fatalf("final markup=%q", finalMarkup)
+	}
+}
+
 func TestRendererRelayFailsOnTerminalError(t *testing.T) {
 	var mu sync.Mutex
 	var calls []string

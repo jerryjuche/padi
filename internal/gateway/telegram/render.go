@@ -115,9 +115,18 @@ func (r *Renderer) Relay(ctx context.Context, chatID int64, sessionID uuid.UUID,
 	return r.RelayWithKeyboard(ctx, chatID, sessionID, taskID, events, nil)
 }
 
-// RelayWithKeyboard is Relay with an inline keyboard attached to the final
+// KeyboardFunc builds the final keyboard from the cleaned reply. The gateway
+// uses it so buttons match the finished task, not the state at task start.
+type KeyboardFunc func(summary string) [][]InlineButton
+
+// RelayWithKeyboard is Relay with a fixed inline keyboard attached to the final
 // message, so follow-up actions are one tap away.
 func (r *Renderer) RelayWithKeyboard(ctx context.Context, chatID int64, sessionID uuid.UUID, taskID *uuid.UUID, events <-chan opencode.Event, rows [][]InlineButton) (string, error) {
+	return r.RelayWithKeyboardFunc(ctx, chatID, sessionID, taskID, events, func(string) [][]InlineButton { return rows })
+}
+
+// RelayWithKeyboardFunc builds the final keyboard only when the reply is ready.
+func (r *Renderer) RelayWithKeyboardFunc(ctx context.Context, chatID int64, sessionID uuid.UUID, taskID *uuid.UUID, events <-chan opencode.Event, keyboard KeyboardFunc) (string, error) {
 	statusID, err := r.Client.SendMessage(ctx, chatID, html.EscapeString("Working..."))
 	if err != nil {
 		return "", err
@@ -185,6 +194,10 @@ finish:
 		summary = "Done."
 	}
 	parts := Split(summary, r.maxChars())
+	var rows [][]InlineButton
+	if keyboard != nil {
+		rows = keyboard(summary)
+	}
 	if err := edit(html.EscapeString(parts[0]), rows); err != nil {
 		return "", err
 	}

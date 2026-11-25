@@ -1685,6 +1685,8 @@ Task contract and budget enforcement, checkpoints and `/undo`, `agent-verify` in
 **Accept:** a real PR opens only after verification and approval; a deliberately failing change is blocked; a deleted test is flagged high risk; an off-limits edit is stopped; the risk block renders; no secret exists in the container.
 **Implementation status (2026-11-24):** the trust gates, contract, checkpoints, `/undo`, risk card, approval buttons and quarantine push/PR adapters are built and hermetically verified; the live PR is intentionally left for a genuine owner decision. Evidence is in `update.md` §19.
 
+**Telegram UX (2026-11-25):** inline buttons are built from the current task state and carry single-use tokens. Tapping one spends it, edits that card to a no-button status, and starts the bound action; replayed taps cannot start a second task. The session prompt no longer emits the retired M1 disclaimer. Evidence is in `update.md` §20.
+
 ### Phase 4: Router hardening, queue and capacity (M4)
 Circuit breakers, cooldown handling, queue with one-task-at-a-time admission, memory admission with the keepalive credit, load test for a second slot, agent-eval benchmark that chooses real model IDs.
 **Accept:** queued tasks run strictly one at a time; with `max_sessions: 2` the load test either passes 10 runs or the setting stays at 1 with the evidence recorded; real model IDs replace placeholders.

@@ -115,45 +115,44 @@ func TestModesAndButtons(t *testing.T) {
 	if !strings.Contains(modePrompt(modeBuild, "check auth"), chatStyle) {
 		t.Fatal("build prompt is missing the chat style contract")
 	}
-	rows := contextButtons("empty", "")
-	if len(rows) != 1 || len(rows[0]) != 2 || rows[0][0].CallbackData != "help" || rows[0][1].CallbackData != "status" {
+	rows := buttonLayout("empty", "")
+	if len(rows) != 1 || len(rows[0]) != 2 || rows[0][0].Static != "help" || rows[0][1].Static != "status" {
 		t.Fatalf("empty buttons=%v", rows)
 	}
 }
 
-func TestButtonsAreTaskScoped(t *testing.T) {
+func TestButtonsMatchTaskState(t *testing.T) {
 	const id = "task-42"
 	cases := []struct {
 		kind string
 		want []string
 	}{
-		{"running", []string{"status", "new"}},
-		{"decision", []string{"exec:task-42", "a:task-42:revise", "new"}},
-		{"done", []string{"a:task-42:checks", "a:task-42:explain", "a:task-42:diff", "undo:task-42:latest", "new"}},
-		{"failed", []string{"a:task-42:continue", "a:task-42:checks", "undo:task-42:latest", "new"}},
-		{"workspace", []string{"a:task-42:summary", "a:task-42:checks", "new"}},
+		{"running", []string{"s:status", "s:new"}},
+		{"decision", []string{"a:execute", "a:revise", "s:new"}},
+		{"done", []string{"a:checks", "a:explain", "a:diff", "a:undo", "s:new"}},
+		{"failed", []string{"a:continue", "a:checks", "a:undo", "s:new"}},
+		{"workspace", []string{"a:summary", "a:checks", "s:new"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.kind, func(t *testing.T) {
-			rows := contextButtons(tc.kind, id)
+			rows := buttonLayout(tc.kind, id)
 			var got []string
 			for _, row := range rows {
 				for _, b := range row {
-					got = append(got, b.CallbackData)
+					if b.Action != "" {
+						got = append(got, "a:"+b.Action)
+					} else {
+						got = append(got, "s:"+b.Static)
+					}
 				}
 			}
 			if strings.Join(got, ",") != strings.Join(tc.want, ",") {
 				t.Fatalf("buttons=%q want %q", got, tc.want)
 			}
-			for _, token := range got {
-				if strings.HasPrefix(token, "act:") {
-					t.Errorf("legacy unscoped token %q", token)
-				}
-			}
 		})
 	}
-	if rows := contextButtons("done", "other-task"); strings.Contains(keyboardTokens(rows), id) {
-		t.Fatalf("stale task id leaked into buttons: %v", rows)
+	if rows := buttonLayout("done", "other-task"); strings.Contains(fmt.Sprint(rows), id) {
+		t.Fatalf("stale task id leaked into button layout: %v", rows)
 	}
 }
 
@@ -166,6 +165,64 @@ func keyboardTokens(rows [][]telegram.InlineButton) string {
 		}
 	}
 	return b.String()
+}
+
+func TestActionButtonsAreSingleUse(t *testing.T) {
+	var mu sync.Mutex
+	var sends, edits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		mu.Lock()
+		if strings.HasSuffix(r.URL.Path, "/sendMessage") {
+			sends++
+		} else if strings.HasSuffix(r.URL.Path, "/editMessageText") {
+			edits++
+		}
+		mu.Unlock()
+		if strings.HasSuffix(r.URL.Path, "/sendMessage") {
+			fmt.Fprint(w, `{"ok":true,"result":{"message_id":99}}`)
+			return
+		}
+		fmt.Fprint(w, `{"ok":true,"result":true}`)
+	}))
+	defer srv.Close()
+
+	chat := &chatSession{state: "done", lastUsed: time.Now(), lastTask: taskRecord{ID: "task-42", Prompt: "fix parser"}}
+	a := &application{cfg: defaults(), tg: &telegram.Client{
+		BaseURL: srv.URL, Token: "test", HTTP: srv.Client(),
+	}, chats: map[int64]*chatSession{42: chat}}
+	rows := a.buttons(42, "done", "task-42")
+	token := ""
+	for candidate, tap := range a.taps {
+		if tap.Action == "undo" {
+			token = candidate
+		}
+	}
+	if token == "" || !strings.HasPrefix(token, "x:") || strings.Contains(keyboardTokens(rows), "task-42") {
+		t.Fatalf("dynamic token missing or leaked task id: token=%q rows=%v", token, rows)
+	}
+	q := &telegram.CallbackQuery{
+		ID: "cb-1", From: telegram.User{ID: 42}, Data: token,
+		Message: &telegram.Message{MessageID: 77, Chat: telegram.Chat{ID: 42, Type: "private"}},
+	}
+	if err := a.handleCallback(context.Background(), q); err != nil {
+		t.Fatalf("first tap: %v", err)
+	}
+	if _, ok := a.taps[token]; ok {
+		t.Fatal("token must be consumed on first tap")
+	}
+	q.ID = "cb-2"
+	if err := a.handleCallback(context.Background(), q); err != nil {
+		t.Fatalf("replayed tap: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if sends != 1 {
+		t.Fatalf("replayed button started %d runs, want 1", sends)
+	}
+	if edits < 2 {
+		t.Fatalf("tapped card was not spent: %d edits", edits)
+	}
 }
 
 func TestParseProposal(t *testing.T) {

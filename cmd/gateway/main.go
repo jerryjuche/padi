@@ -3,6 +3,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"html"
@@ -12,6 +14,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -35,7 +38,7 @@ const (
 
 	// chatStyle is prepended to every agent prompt so replies read like a
 	// conversational collaborator, not a tool transcript or a generic menu.
-	chatStyle = "Reply in 2-4 short sentences: the answer, what you verified, then one concrete next step tied to this request. Never re-ask a settled question; use what you already learned in this conversation. Ask a question only when a file-changing choice is genuinely blocked, and offer concrete options when you do. If a next step needs approval, end with exactly one line `PROPOSAL: <goal; files; steps; risk>`; the owner will get an Execute button carrying that exact plan. Never mention tool parameter names such as oldString, newString or replaceAll. Publishing and pull requests happen only after verification and owner approval; finish the local work first. Keep replies under 600 characters.\n\n"
+	chatStyle = "Answer the current request directly in 2-4 short sentences: the result, what you verified, then one concrete next step tied to this request. Do not open with a capability disclaimer or repeat a canned status line. Never re-ask a settled question or restate an earlier answer; use what you already learned in this conversation. Ask a question only when a file-changing choice is genuinely blocked, and offer concrete options when you do. If a next step needs approval, end with exactly one line `PROPOSAL: <goal; files; steps; risk>`; the owner will get an Execute button carrying that exact plan. Never mention tool parameter names such as oldString, newString or replaceAll. Publishing and pull requests happen only after verification and owner approval; finish the local work first. Keep replies under 600 characters.\n\n"
 )
 
 var userFacingSecret = regexp.MustCompile(`(?i)(authorization:\s*bearer\s+)\S+|(?i)(authorization:\s*basic\s+)[A-Za-z0-9+/=]+|\b(?:ghs|gho|ghu|ghr|github_pat)_[A-Za-z0-9_]+\b|\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b`)
@@ -258,6 +261,12 @@ func (c *chatSession) setState(state string) {
 	c.mu.Unlock()
 }
 
+func (c *chatSession) stateSnapshot() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.state
+}
+
 func (c *chatSession) setLastTask(t taskRecord) {
 	c.mu.Lock()
 	c.lastTask = t
@@ -361,9 +370,14 @@ type application struct {
 	modes   map[int64]string
 	chats   map[int64]*chatSession
 
-	// actions de-duplicates button taps. A second tap on the same task-scoped
-	// action returns the already running task instead of creating a duplicate.
+	// actions de-duplicates legacy button tokens and approval callbacks. A
+	// token is consumed once; replayed updates cannot start a second run.
 	actions map[string]time.Time
+
+	// taps backs one-time inline buttons. Every actionable keyboard issues a
+	// fresh short token that is deleted on the first callback, so an old card
+	// can never trigger the same action twice.
+	taps map[string]buttonTap
 
 	// M3b per-task state used to resume after owner decisions and to avoid
 	// publishing from a duplicate callback.
@@ -376,26 +390,80 @@ type application struct {
 	waits       map[uuid.UUID]chan bool
 }
 
-// markAction records a tap and returns false when the same action was already
-// started within the dedupe window. Old entries are pruned lazily.
+// markAction consumes a legacy action or approval token. Tokens are never
+// reusable: a replayed callback must not start a second run or decision.
 func (a *application) markAction(key string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.actions == nil {
 		a.actions = make(map[string]time.Time)
 	}
-	if len(a.actions) > 256 {
+	if len(a.actions) > 512 {
 		for k, t := range a.actions {
-			if time.Since(t) > time.Minute {
+			if time.Since(t) > 24*time.Hour {
 				delete(a.actions, k)
 			}
 		}
 	}
-	if last, ok := a.actions[key]; ok && time.Since(last) < 30*time.Second {
+	if _, ok := a.actions[key]; ok {
 		return false
 	}
 	a.actions[key] = time.Now()
 	return true
+}
+
+type buttonTap struct {
+	ChatID  int64
+	TaskID  string
+	Action  string
+	Label   string
+	Kind    string
+	Created time.Time
+}
+
+var fallbackTapSeq uint64
+
+func newTapToken() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		return "x:" + hex.EncodeToString(b[:])
+	}
+	return fmt.Sprintf("x:%016x", atomic.AddUint64(&fallbackTapSeq, 1))
+}
+
+// issueTap creates a fresh one-time token for an actionable button.
+func (a *application) issueTap(tap buttonTap) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.taps == nil {
+		a.taps = make(map[string]buttonTap)
+	}
+	if len(a.taps) > 512 {
+		for token, old := range a.taps {
+			if time.Since(old.Created) > chatIdleTTL {
+				delete(a.taps, token)
+			}
+		}
+	}
+	token := newTapToken()
+	tap.Created = time.Now()
+	a.taps[token] = tap
+	return token
+}
+
+// consumeTap removes a token before the action runs. Even a failed action is
+// spent; an owner must ask for a fresh keyboard to retry it.
+func (a *application) consumeTap(chatID int64, token string) (buttonTap, bool) {
+	a.mu.Lock()
+	tap, ok := a.taps[token]
+	if ok {
+		delete(a.taps, token)
+	}
+	a.mu.Unlock()
+	if !ok || tap.ChatID != chatID {
+		return buttonTap{}, false
+	}
+	return tap, true
 }
 
 func (a *application) event(ctx context.Context, sessionID uuid.UUID, taskID *uuid.UUID, typ string, data any) bool {
@@ -626,7 +694,7 @@ func (a *application) handleUpdate(ctx context.Context, u telegram.Update) error
 		a.closeChat(chatID)
 		a.forgetRepo(chatID)
 		a.rememberMode(chatID, modeBuild)
-		return a.replyKeyboard(ctx, chatID, "New topic. Tell me what you'd like to work on, or send clone <repo> to open a repository.", contextButtons("empty", ""))
+		return a.replyKeyboard(ctx, chatID, "New topic. Tell me what you'd like to work on, or send clone <repo> to open a repository.", a.buttons(chatID, "empty", ""))
 	case modeFromCommand(text) != "":
 		mode := modeFromCommand(text)
 		a.rememberMode(chatID, mode)
@@ -676,7 +744,11 @@ func (a *application) continueChat(ctx context.Context, chatID int64, prompt, ke
 }
 
 func (a *application) handleCallback(ctx context.Context, q *telegram.CallbackQuery) error {
-	if err := a.tg.AnswerCallbackQuery(ctx, q.ID, ""); err != nil {
+	ack := ""
+	if strings.HasPrefix(q.Data, "x:") {
+		ack = "Started"
+	}
+	if err := a.tg.AnswerCallbackQuery(ctx, q.ID, ack); err != nil {
 		log.Printf("gateway: answer callback: %v", scrubForUser(err))
 	}
 	if q.Message == nil {
@@ -700,7 +772,7 @@ func (a *application) handleCallback(ctx context.Context, q *telegram.CallbackQu
 		a.closeChat(chatID)
 		a.forgetRepo(chatID)
 		a.rememberMode(chatID, modeBuild)
-		return a.replyToCallback(ctx, q, "New topic. Tell me what you'd like to work on, or send clone <repo> to open a repository.", contextButtons("empty", ""))
+		return a.replyToCallback(ctx, q, "New topic. Tell me what you'd like to work on, or send clone <repo> to open a repository.", a.buttons(chatID, "empty", ""))
 	case data == "status":
 		return a.replyToCallback(ctx, q, a.statusText(chatID), a.buttonsForChat(chatID))
 	case data == "help":
@@ -718,19 +790,24 @@ func (a *application) handleCallback(ctx context.Context, q *telegram.CallbackQu
 			return a.reply(ctx, chatID, "That plan is no longer active. Ask for a fresh plan and I'll prepare it.")
 		}
 		if !a.markAction(data) {
-			return a.reply(ctx, chatID, "That plan is already being executed.")
+			return a.replyToCallback(ctx, q, "That plan was already executed.", a.buttonsForChat(chatID))
+		}
+		if err := a.replyToCallback(ctx, q, "Executing the approved plan...", nil); err != nil {
+			log.Printf("gateway: spend plan card: %v", scrubForUser(err))
 		}
 		chat.setProposal(nil)
 		repo, _, _, _, _ := chat.detail()
 		return a.startTask(ctx, chatID, command{repo: repo, prompt: p.Prompt}, "exec:"+taskID, false)
 	case strings.HasPrefix(data, "undo:"):
 		return a.undoCallback(ctx, chatID, data)
+	case strings.HasPrefix(data, "x:"):
+		return a.handleTap(ctx, chatID, q, data)
 	case strings.HasPrefix(data, "a:"):
 		parts := strings.Split(data, ":")
 		if len(parts) != 3 {
 			return &telegram.ReportedError{Err: fmt.Errorf("malformed action %q", data)}
 		}
-		return a.runAction(ctx, chatID, parts[1], parts[2], data)
+		return a.runLegacyAction(ctx, chatID, parts[1], parts[2], data)
 	case strings.HasPrefix(data, "act:"):
 		// Keyboards sent before the task-scoped protocol stay harmless: map
 		// them to the current task instead of starting a generic new task.
@@ -741,7 +818,7 @@ func (a *application) handleCallback(ctx context.Context, q *telegram.CallbackQu
 		action := strings.TrimPrefix(data, "act:")
 		switch action {
 		case "explain", "checks", "continue", "summary":
-			return a.runAction(ctx, chatID, chat.lastTaskID(), action, data)
+			return a.runLegacyAction(ctx, chatID, chat.lastTaskID(), action, data)
 		default:
 			return &telegram.ReportedError{Err: fmt.Errorf("unknown action %q", data)}
 		}
@@ -750,13 +827,46 @@ func (a *application) handleCallback(ctx context.Context, q *telegram.CallbackQu
 	}
 }
 
-// runAction resolves a task-scoped quick action and starts it with the exact
-// prior task as context. A second tap within the dedupe window is a no-op.
-func (a *application) runAction(ctx context.Context, chatID int64, taskID, action, token string) error {
+// handleTap resolves a one-time keyboard token, spends it, and starts the
+// action bound to it. The tapped card is edited to a spent state first, so the
+// same buttons cannot be clicked twice and stale cards stop offering actions.
+func (a *application) handleTap(ctx context.Context, chatID int64, q *telegram.CallbackQuery, token string) error {
+	tap, ok := a.consumeTap(chatID, token)
+	if !ok {
+		return a.replyToCallback(ctx, q, "That button was already used. Current actions are below.", a.buttonsForChat(chatID))
+	}
 	chat := a.getChat(chatID)
 	if chat == nil {
-		return a.reply(ctx, chatID, "No active workspace yet. Send a request or clone <repo> first.")
+		return a.replyToCallback(ctx, q, "No active workspace yet. Send a request or clone <repo> first.", a.buttons(chatID, "empty", ""))
 	}
+	if chat.lastTaskID() != tap.TaskID {
+		return a.replyToCallback(ctx, q, "That button belongs to an older task. Current actions are below.", a.buttonsForChat(chatID))
+	}
+	verb := tap.Label
+	if verb == "" {
+		verb = "For this task..."
+	}
+	if err := a.replyToCallback(ctx, q, verb+"...", nil); err != nil {
+		log.Printf("gateway: spend button card: %v", scrubForUser(err))
+	}
+	switch tap.Action {
+	case "execute":
+		if _, ok := chat.proposalFor(tap.TaskID); !ok {
+			return a.reply(ctx, chatID, "That plan is no longer active. Ask for a fresh plan and I'll prepare it.")
+		}
+		p, _ := chat.proposalFor(tap.TaskID)
+		chat.setProposal(nil)
+		repo, _, _, _, _ := chat.detail()
+		return a.startTask(ctx, chatID, command{repo: repo, prompt: p.Prompt}, "tap:"+token, false)
+	case "undo":
+		return a.undo(ctx, chatID, "")
+	default:
+		return a.runAction(ctx, chatID, chat, tap.TaskID, tap.Action, "tap:"+token)
+	}
+}
+
+// runAction starts a quick action with the exact prior task as context.
+func (a *application) runAction(ctx context.Context, chatID int64, chat *chatSession, taskID, action, key string) error {
 	t, ok := chat.taskFor(taskID)
 	if !ok {
 		return a.reply(ctx, chatID, "That button belongs to an older task. The current actions are below.")
@@ -775,11 +885,21 @@ func (a *application) runAction(ctx context.Context, chatID int64, taskID, actio
 	if !ok {
 		return &telegram.ReportedError{Err: fmt.Errorf("unknown action %q", action)}
 	}
-	if !a.markAction(token) {
-		return a.reply(ctx, chatID, "That action is already running.")
-	}
 	repo, _, _, _, _ := chat.detail()
-	return a.startTask(ctx, chatID, command{repo: repo, prompt: prompt}, "cb:"+taskID+":"+action, false)
+	return a.startTask(ctx, chatID, command{repo: repo, prompt: prompt}, key, false)
+}
+
+// runLegacyAction keeps keyboards issued by an older binary harmless. Those
+// tokens are single-use too, but they cannot be edited to a spent card here.
+func (a *application) runLegacyAction(ctx context.Context, chatID int64, taskID, action, token string) error {
+	chat := a.getChat(chatID)
+	if chat == nil {
+		return a.reply(ctx, chatID, "No active workspace yet. Send a request or clone <repo> first.")
+	}
+	if !a.markAction(token) {
+		return a.reply(ctx, chatID, "That action was already used. Ask for fresh buttons.")
+	}
+	return a.runAction(ctx, chatID, chat, taskID, action, "cb:"+taskID+":"+action)
 }
 
 func (a *application) helpText() string {
@@ -1002,11 +1122,10 @@ func (a *application) startTask(ctx context.Context, chatID int64, c command, ke
 	}
 	chat.setState("done")
 	chat.setLastTask(taskRecord{ID: task.ID.String(), Prompt: c.prompt, Outcome: "completed", Evidence: summary})
+	// The final task card already carries the correct Execute/Revise buttons
+	// when the reply contains a PROPOSAL; do not stack a second keyboard.
 	if proposal := parseProposal(summary, task.ID.String()); proposal != nil {
 		chat.setProposal(proposal)
-		if err := a.replyKeyboard(taskCtx, chatID, "Plan ready. Execute approves it; Revise changes it.", a.buttonsForChat(chatID)); err != nil {
-			log.Printf("gateway: send plan actions: %v", scrubForUser(err))
-		}
 	} else {
 		chat.setProposal(nil)
 	}
@@ -1091,7 +1210,15 @@ func (a *application) runTask(ctx context.Context, chat *chatSession, session st
 	if err := chat.oc.PromptWithAgent(ctx, chat.ocSession, agentPrompt, a.cfg.OpenCode.Model, modeAgent(mode)); err != nil {
 		return "", err
 	}
-	summary, err := a.renderer.RelayWithKeyboard(ctx, chatID, session.ID, &task.ID, normalized, contextButtons("done", task.ID.String()))
+	summary, err := a.renderer.RelayWithKeyboardFunc(ctx, chatID, session.ID, &task.ID, normalized, func(final string) [][]telegram.InlineButton {
+		kind := "done"
+		if parseProposal(final, task.ID.String()) != nil {
+			kind = "decision"
+		} else if mode == modePlan || mode == modeResearch {
+			kind = "workspace"
+		}
+		return a.buttons(chatID, kind, task.ID.String())
+	})
 	select {
 	case cause := <-abortHit:
 		return "", cause
@@ -1265,49 +1392,92 @@ func actionPrompt(action string, t taskRecord) (string, bool) {
 	}
 }
 
-// contextButtons offers actions legal in the current state. Every actionable
-// token is bound to a task ID; a stale keyboard cannot start a new task.
-func contextButtons(kind, taskID string) [][]telegram.InlineButton {
+// buttonSpec is one button before its token is bound. Static buttons are
+// informational; action buttons receive a fresh, single-use token.
+type buttonSpec struct {
+	Text   string
+	Static string
+	Action string
+}
+
+// buttonLayout returns only actions legal in the current task state. A stale
+// keyboard therefore cannot offer a step that belongs to another stage.
+func buttonLayout(kind, taskID string) [][]buttonSpec {
 	if taskID == "" {
-		return [][]telegram.InlineButton{{
-			{Text: "How to start", CallbackData: "help"},
-			{Text: "Status", CallbackData: "status"},
+		return [][]buttonSpec{{
+			{Text: "How to start", Static: "help"},
+			{Text: "Status", Static: "status"},
 		}}
 	}
-	act := func(label, action string) telegram.InlineButton {
-		return telegram.InlineButton{Text: label, CallbackData: "a:" + taskID + ":" + action}
+	act := func(label, action string) buttonSpec {
+		return buttonSpec{Text: label, Action: action}
+	}
+	static := func(label, data string) buttonSpec {
+		return buttonSpec{Text: label, Static: data}
 	}
 	switch kind {
-	case "running", "awaiting_approval":
-		return [][]telegram.InlineButton{{{Text: "Status", CallbackData: "status"}, {Text: "New topic", CallbackData: "new"}}}
+	case "running", "awaiting_approval", "awaiting_plan_approval":
+		return [][]buttonSpec{{static("Status", "status"), static("New topic", "new")}}
 	case "decision":
-		return [][]telegram.InlineButton{{{Text: "Execute", CallbackData: "exec:" + taskID}, act("Revise", "revise"), {Text: "New topic", CallbackData: "new"}}}
+		return [][]buttonSpec{{act("Execute", "execute"), act("Revise", "revise"), static("New topic", "new")}}
 	case "done":
-		return [][]telegram.InlineButton{
+		return [][]buttonSpec{
 			{act("Run checks", "checks"), act("Explain this", "explain"), act("Show diff", "diff")},
-			{{Text: "Undo last", CallbackData: "undo:" + taskID + ":latest"}, {Text: "New topic", CallbackData: "new"}},
+			{act("Undo last", "undo"), static("New topic", "new")},
 		}
 	case "failed":
-		return [][]telegram.InlineButton{
-			{act("Continue locally", "continue"), act("Run checks", "checks"), {Text: "Undo last", CallbackData: "undo:" + taskID + ":latest"}},
-			{{Text: "New topic", CallbackData: "new"}},
+		return [][]buttonSpec{
+			{act("Continue locally", "continue"), act("Run checks", "checks"), act("Undo last", "undo")},
+			{static("New topic", "new")},
 		}
 	default:
-		return [][]telegram.InlineButton{{act("Summarize", "summary"), act("Run checks", "checks")}, {{Text: "New topic", CallbackData: "new"}}}
+		return [][]buttonSpec{
+			{act("Summarize", "summary"), act("Run checks", "checks")},
+			{static("New topic", "new")},
+		}
 	}
+}
+
+// buttons binds a state-specific layout to short-lived callback tokens.
+func (a *application) buttons(chatID int64, kind, taskID string) [][]telegram.InlineButton {
+	layout := buttonLayout(kind, taskID)
+	rows := make([][]telegram.InlineButton, 0, len(layout))
+	for _, row := range layout {
+		buttons := make([]telegram.InlineButton, 0, len(row))
+		for _, spec := range row {
+			button := telegram.InlineButton{Text: spec.Text, CallbackData: spec.Static}
+			if spec.Action != "" {
+				label := "Running " + spec.Text
+				switch spec.Action {
+				case "execute":
+					label = "Executing the approved plan"
+				case "undo":
+					label = "Rewinding the workspace"
+				}
+				button.CallbackData = a.issueTap(buttonTap{
+					ChatID: chatID, TaskID: taskID, Action: spec.Action, Label: label, Kind: kind,
+				})
+			}
+			buttons = append(buttons, button)
+		}
+		rows = append(rows, buttons)
+	}
+	return rows
 }
 
 func (a *application) buttonsForChat(chatID int64) [][]telegram.InlineButton {
 	chat := a.getChat(chatID)
 	if chat == nil {
-		return contextButtons("empty", "")
+		return a.buttons(chatID, "empty", "")
 	}
 	_, _, _, _, busy := chat.detail()
-	state := "workspace"
+	state := chat.stateSnapshot()
 	if busy {
 		state = "running"
 	} else if chat.hasProposal() {
 		state = "decision"
+	} else if state != "failed" && state != "awaiting_approval" && state != "awaiting_plan_approval" {
+		state = "workspace"
 	}
-	return contextButtons(state, chat.lastTaskID())
+	return a.buttons(chatID, state, chat.lastTaskID())
 }

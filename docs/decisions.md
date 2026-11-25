@@ -288,6 +288,14 @@ Independent static audit of the M0 file set found concrete defects; all P0/P1/P2
 
 Tracked low-severity follow-up: host-side credentials still appear in process argv and systemd `EnvironmentFile` escaping needs care. No session/verify container exists in M0, so Hard Rule 2 is unaffected.
 
+## One-time contextual Telegram buttons (2026-11-25)
+
+- Task-scoped keyboards are rendered from the task state, not a fixed menu. The final keyboard is built from the cleaned assistant reply, so a `PROPOSAL:` immediately yields Execute/Revise on the same card.
+- Every actionable button carries a fresh random `x:` token stored with its chat, task, action and state. The first callback consumes the token and edits the tapped card to a spent state; a replay shows current buttons instead of starting another run. Legacy task-scoped tokens are also single-use.
+- The session prompt no longer emits the retired "M1 cannot push or open a PR" disclaimer. Replies must answer the current request, state verification, and offer one concrete next step; publishing is an approval-gated gateway action, not a canned agent message.
+
+Evidence is in `update.md` §20.
+
 ## Sources
 
 - <https://opencode.ai/docs/api> — Authoritative V2 HTTP API index; `/openapi.json` linked there was queried locally via `opencode api get /openapi.json` for V1 endpoint/event/auth schemas.
