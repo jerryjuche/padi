@@ -1127,4 +1127,10 @@ New regression tests: `TestButtonsMatchTaskState`, `TestActionButtonsAreSingleUs
 
 ### Next
 
-Gateway and router are restarted locally for owner testing; send a normal chat message or tap a current button in Telegram.
+### Live restart (2026-11-25)
+
+- Router: `/tmp/opencode/padi-router`, log `/tmp/opencode/padi-router.log`; `/healthz` and `/v1/models` returned HTTP 200 with the `agent-chat` alias enabled.
+- Gateway: `/tmp/opencode/padi-gateway`, log `/tmp/opencode/padi-gateway.log`; ready with `model=padi/agent-chat, network=agent-session-net` and the Telegram cursor advanced past the pending owner update.
+- Router path was probed end to end with `agent-chat` (`nvidia/nemotron-3.5-bolt-e4b`, `OK`, HTTP 200), and the router was reachable from a container on `agent-session-net` (HTTP 200). A short online notice was sent to the owner chat (message 249).
+
+Send a normal chat message or tap a current button in Telegram.
