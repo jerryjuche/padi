@@ -1182,7 +1182,7 @@ New regression tests: `TestRouterChatClientSendsHistoryAndToken`, `TestClassifyD
 ### Live restart (2026-11-25)
 
 - Router: PID `164189`, log `/tmp/opencode/padi-router.log`; `/healthz` returned `{"ok":true}`, `/v1/models` listed `agent-chat`, and a direct `agent-chat` probe returned `LIVE_DIRECT_OK` from `nvidia/nemotron-3.5-bolt-e4b`.
-- Gateway: PID `163660`, log `/tmp/opencode/padi-gateway.log`; ready with `model=padi/agent-chat, network=agent-session-net` and the new binary.
+- Gateway: PID `163660`, log `/tmp/opencode/padi-gateway.log`; ready with `model=padi/agent-chat, network=agent-session-net`. This binary was later found to predate commit `7909f26`; see §22 for the corrective restart.
 - Owner notice sent to Telegram message `265`.
 
 ### Open items unchanged
@@ -1194,3 +1194,65 @@ New regression tests: `TestRouterChatClientSendsHistoryAndToken`, `TestClassifyD
 ### Next
 
 Send a normal chat message in Telegram, then a code-change request. General chat should answer directly; code work should produce one plan with Execute/Revise before any edit.
+
+---
+
+## 22. Conversational build deployed and verified (2026-11-25)
+
+### Cause
+
+The owner still saw the clone-only reply because the live gateway binary was stale. PID `163660` started at `16:52:37`; commit `7909f26` landed at `16:54:37`, and the old binary hash (`cf946dd2…`) differed from a fresh `HEAD` build. The source fix in §21 was pushed but never reached the running process.
+
+### Fix
+
+1. Rebuilt `/tmp/opencode/padi-gateway` from `HEAD` with `GOPROXY=off go build`.
+2. Stopped PID `163660`, started `/tmp/opencode/start-padi.sh`, and confirmed PID `176848` reached `gateway: ready (model=padi/agent-chat, network=agent-session-net)` at `17:07:11`.
+3. Sent a short Telegram notice (message `290`) asking for a fresh normal-chat message.
+
+Live binary: `sha256:75db5c089ed3f752c12cc65608ca90d079bedb48b0a8b4ceb99f7fcead991fa8`.
+
+### Live model probes
+
+Direct probes through `padi/agent-chat` confirmed the routing prompt before the restart:
+
+- `hello there` -> a normal greeting; no repo question.
+- `how does this bot work?` -> a normal explanation; no repo question.
+- `fix the login bug` -> `NEEDS_REPO: Can I get the repo link to fix the login bug?`; the gateway appends the concrete `clone owner/repo and <task>` option when the model omits it.
+- `you keep asking which repo; stop repeating that` -> acknowledges the correction; no repo question.
+
+### Evidence
+
+```
+$ gofmt -l cmd internal          # no output
+$ GOPROXY=off go vet ./...       # no output
+$ GOPROXY=off go test -race -count=1 ./...
+ok  github.com/jerryjuche/padi/cmd/gateway  1.375s
+(all other packages ok)
+
+$ scripts/m3b-smoke.sh
+m3b-smoke: PASS M3b smoke (no live PR, no secrets used)
+
+$ set -a; . ./.env.local; set +a; sh scripts/dbaccess_test.sh
+dbaccess_test: anon key cannot read any agent table (16 checked)
+
+$ pgrep -af '/tmp/opencode/padi-(gateway|router)'
+164189 /tmp/opencode/padi-router
+176848 /tmp/opencode/padi-gateway
+```
+
+### Owner-visible behaviour
+
+- General chat is answered directly with per-chat history; no clone prompt.
+- A repo is requested only for work that needs files or commands, with one concrete `clone owner/repo and <task>` next step.
+- Code work runs through one read-only plan turn with `PROPOSAL:` plus Execute/Revise buttons; only Execute switches to the editing agent.
+- Task buttons are task-scoped, single-use, and edit the tapped card instead of stacking keyboards.
+
+### Open items unchanged
+
+- No live PR: still needs a genuine owner decision and target repository installation.
+- V10 arm64/rootless/gVisor and the M0 VM-only drills remain deferred to the owner-provisioned ARM VM.
+- The M2 checkbox stays unticked until the M1 NVIDIA throwaway key is revoked.
+
+### Next
+
+Send one normal chat message in Telegram, then one code-change request, and quote the first line of each reply.
