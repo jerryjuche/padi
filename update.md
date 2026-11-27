@@ -1738,3 +1738,59 @@ Final gates rerun before commit: `gofmt -l cmd internal` (no output), `GOPROXY=o
 ### Next
 
 Git push is owner-authorized and limited to `agent/m0-audit-fixes-b53482d`; no PR is opened. Owner: complete the genuine in-app Telegram E2E gate, key/row cleanup and VM drills; coding agent: start M5 only after owner go-ahead.
+
+---
+
+## 31. Proxy DNS failure in host-bridge sessions (2026-11-27)
+
+### Cause
+
+After the router alias fix, live task `c5769032-1413-4615-880a-fa2fe16634a1` still failed:
+
+```text
+gateway: task c5769032-1413-4615-880a-fa2fe16634a1 failed:
+model_transport_failed: Can't reach 172.20.0.1. Check the network connection.
+(getaddrinfo EAI_AGAIN egress-proxy)
+```
+
+The host had no `egress-proxy` listener, but the portable config still injected `HTTP_PROXY=http://egress-proxy:3128` into session containers. The model client did not honor `NO_PROXY` for this call, so it tried to resolve `egress-proxy` before reaching the router. The 6-retry guard worked: the task ended `FAILED` after 3 events instead of hanging, and no orphan container remained.
+
+### Fix
+
+- Added `PADI_PROXY_URL` as an explicit host-runtime override for `container.proxy`. An empty value clears the Compose proxy on hosts with no `egress-proxy` container; an unset value leaves Compose behavior unchanged.
+- The host launcher now sets `PADI_PROXY_URL=""` alongside `PADI_ROUTER_HOST_IP=172.20.0.1`.
+- Runner omits all proxy variables when `ProxyURL` is empty; regression test `TestStartWithoutProxyOmitsProxyEnv` covers it. `TestRuntimeOverrides` covers both overrides, including the explicit empty proxy.
+- Updated `README.md`, `BUILD_SPEC.md`, `CONTRACT.md`, `docs/runbooks.md`, `deploy/docker-compose.yml` and `config/gateway.yaml` so Compose keeps its real `egress-proxy` while the host bridge clears it. No egress was opened and `agent-session-net` stays `internal=true`.
+
+### Evidence
+
+```bash
+$ psql ... -c "select state, fail_reason from agent.tasks where id='c5769032-...'"
+FAILED | model_transport_failed: ... getaddrinfo EAI_AGAIN egress-proxy
+
+$ tr '\0' '\n' < /proc/$(cat /tmp/opencode/padi-gateway.pid)/environ | grep '^PADI_PROXY_URL='
+PADI_PROXY_URL=$
+
+$ docker run --network agent-session-net --add-host router:172.20.0.1 ... \
+    sandbox-agent-session:latest
+proxy env: none
+router health: HTTP 200
+models: HTTP 200
+agent-think
+
+$ gofmt -l cmd internal       # no output
+$ GOPROXY=off go vet ./...    # no output
+$ GOPROXY=off go test -race -count=1 ./...    # all packages ok
+$ scripts/m3b-smoke.sh | tail -1
+m3b-smoke: PASS M3b smoke (no live PR, no secrets used)
+$ scripts/dbaccess_test.sh | tail -1
+dbaccess_test: anon key cannot read any agent table (16 checked)
+$ docker network inspect agent-session-net --format 'internal={{.Internal}} containers={{len .Containers}}'
+internal=true containers=0
+$ tail -1 /tmp/opencode/padi-gateway.log
+2026/11/27 14:08:34 gateway: ready (chat=padi/agent-chat, build=padi/agent-build, plan=padi/agent-plan, network=agent-session-net)
+```
+
+### Next
+
+Owner: send a fresh `clone jerryjuche/koder and read the readme`, tap **Approve contract**, and watch `/options` for `Thinking → Agent planning → Agent executing` with `♥ alive` and no proxy error. No PR.

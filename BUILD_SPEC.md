@@ -404,7 +404,7 @@ Classification: 429 means `RateLimited` (parse `Retry-After`: seconds or HTTP da
 
 ### 3.3 Gateway (`cmd/gateway`, `internal/gateway/*`)
 
-**`cmd/gateway/main.go`** wiring order: load config, open DB pool, `store.Migrate`, build `hub`, `runner`, `queue`, `approvals`, `gitops`, `risk`, `contract`, `keys` (M7), `onboard` and `preview` (M8), `incidents` (M10), start Telegram poller, start HTTP server, start watchdog loop, start GC loop, start heartbeat loop (hourly database ping), start egress-denial poller (polls the egress admin endpoint every 5 s while a task runs and raises `new_domain` approvals), start budget meter loop (every 30 s per running task), start nightly-staleness watcher (alerts if `state/nightly.json` is older than 36 h). Graceful shutdown on SIGTERM: stop accepting work, let running tasks keep their containers (they are reconciled on next start), flush events. Implemented locally: the launcher may set `PADI_ROUTER_HOST_IP`; when present the gateway overrides `cfg.Container.RouterHostIP` with it, and a 15-second activity loop probes each running OpenCode session (details in `opencode/client.go` below).
+**`cmd/gateway/main.go`** wiring order: load config, open DB pool, `store.Migrate`, build `hub`, `runner`, `queue`, `approvals`, `gitops`, `risk`, `contract`, `keys` (M7), `onboard` and `preview` (M8), `incidents` (M10), start Telegram poller, start HTTP server, start watchdog loop, start GC loop, start heartbeat loop (hourly database ping), start egress-denial poller (polls the egress admin endpoint every 5 s while a task runs and raises `new_domain` approvals), start budget meter loop (every 30 s per running task), start nightly-staleness watcher (alerts if `state/nightly.json` is older than 36 h). Graceful shutdown on SIGTERM: stop accepting work, let running tasks keep their containers (they are reconciled on next start), flush events. Implemented locally: the launcher may set `PADI_ROUTER_HOST_IP`; when present the gateway overrides `cfg.Container.RouterHostIP` with it. `PADI_PROXY_URL` is an explicit override for `container.proxy`; an empty value clears the Compose proxy on host-bridge runtimes with no `egress-proxy` container. A 15-second activity loop probes each running OpenCode session (details in `opencode/client.go` below).
 
 **`store/`**
 ```go
@@ -814,6 +814,8 @@ container:
   # Leave empty in Compose, where "router" is a real container on the
   # internal network and Docker DNS resolves it.
   router_host_ip: ""
+  # Compose has a real egress-proxy; host-bridge runtimes without one set
+  # PADI_PROXY_URL="" to clear this value.
   proxy: "http://egress-proxy:3128"
   bundle_max_mb: 200
 opencode:                        # M4: all model calls go to the router

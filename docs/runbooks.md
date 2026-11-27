@@ -65,7 +65,7 @@ Use when a task stays `EXECUTING` with no visible progress. Evidence: `update.md
 1. Send `/options` (or tap **Options** on `/status`). The rolling trace shows phases `QUEUED → CONTRACT → CLONE → SANDBOX → EXECUTE → VERIFY → PUBLISH → DONE`; for active work expect `Thinking → Agent planning → Agent executing`. A finished/failed task rebuilds the last 18 events from `agent.events`, so the trace survives container closure.
 2. Look for `♥ alive` from the 15 s activity probe, the retry count, and the last transport error. No model output plus retries is a transport failure, not a slow model.
 3. Check the failure reason: after 6 retries the gateway fails the task instead of waiting. In `update.md` §29, stale `EXECUTING` tasks were marked `FAILED` with reason `model unreachable: router DNS alias missing`; remove any orphan container before retrying with a fresh contract.
-4. Verify the host-bridge alias: `PADI_ROUTER_HOST_IP=172.20.0.1` in the gateway environment and Docker `ExtraHosts` `router:172.20.0.1` on the session container. Check the network is still internal:
+4. Verify the host-bridge aliases: `PADI_ROUTER_HOST_IP=172.20.0.1` in the gateway environment and Docker `ExtraHosts` `router:172.20.0.1` on the session container. If this host has no `egress-proxy` listener, `PADI_PROXY_URL` must be empty; a leftover `HTTP_PROXY=http://egress-proxy:3128` makes the model client fail DNS before it reaches the router. Check the network is still internal:
    ```bash
    docker network inspect agent-session-net --format 'internal={{.Internal}} gateway={{range .IPAM.Config}}{{.Gateway}}{{end}}'
    docker inspect <container> --format '{{json .HostConfig.ExtraHosts}}'

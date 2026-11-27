@@ -53,6 +53,19 @@ func main() {
 	}
 }
 
+// applyRuntimeOverrides keeps the portable YAML free of host-specific network
+// details. An empty PADI_PROXY_URL explicitly clears the Compose proxy setting
+// on hosts without an egress-proxy container; an empty router host IP leaves
+// Docker DNS in charge.
+func applyRuntimeOverrides(c *Config) {
+	if ip := strings.TrimSpace(os.Getenv("PADI_ROUTER_HOST_IP")); ip != "" {
+		c.Container.RouterHostIP = ip
+	}
+	if proxy, ok := os.LookupEnv("PADI_PROXY_URL"); ok {
+		c.Container.Proxy = strings.TrimSpace(proxy)
+	}
+}
+
 func run() error {
 	configPath := os.Getenv("GATEWAY_CONFIG")
 	if configPath == "" {
@@ -62,11 +75,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	// Host-bridge runtime only. Compose has a real router container and must
-	// leave this unset so Docker DNS resolves "router" normally.
-	if ip := strings.TrimSpace(os.Getenv("PADI_ROUTER_HOST_IP")); ip != "" {
-		cfg.Container.RouterHostIP = ip
-	}
+	applyRuntimeOverrides(&cfg)
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 

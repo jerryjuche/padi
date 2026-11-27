@@ -68,6 +68,30 @@ func TestValidateRejectsConcurrency(t *testing.T) {
 	}
 }
 
+func TestRuntimeOverrides(t *testing.T) {
+	c, err := loadConfig(filepath.Join("..", "..", "config", "gateway.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Container.Proxy == "" {
+		t.Fatal("portable config should define a proxy for Compose")
+	}
+	t.Setenv("PADI_ROUTER_HOST_IP", "172.20.0.1")
+	t.Setenv("PADI_PROXY_URL", "")
+	applyRuntimeOverrides(&c)
+	if c.Container.RouterHostIP != "172.20.0.1" {
+		t.Fatalf("router host=%q", c.Container.RouterHostIP)
+	}
+	if c.Container.Proxy != "" {
+		t.Fatalf("proxy should be cleared, got %q", c.Container.Proxy)
+	}
+	t.Setenv("PADI_PROXY_URL", "http://egress-proxy:3128")
+	applyRuntimeOverrides(&c)
+	if c.Container.Proxy != "http://egress-proxy:3128" {
+		t.Fatalf("proxy override=%q", c.Container.Proxy)
+	}
+}
+
 func TestOpenCodeAliasMapping(t *testing.T) {
 	c, err := loadConfig(filepath.Join("..", "..", "config", "gateway.yaml"))
 	if err != nil {

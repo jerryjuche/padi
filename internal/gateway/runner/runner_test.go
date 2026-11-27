@@ -130,6 +130,34 @@ func TestStartWaitStop(t *testing.T) {
 	}
 }
 
+func TestStartWithoutProxyOmitsProxyEnv(t *testing.T) {
+	docker, last := fakeDocker(t)
+	r := New(docker, Config{
+		Image: "session:latest", Network: "agent-session-net", Runtime: "runc", MemoryMB: 2560,
+		CPUs: 1, Pids: 512, Model: "padi/agent-chat", RouterToken: "router-only-token",
+		RouterBaseURL: "http://router:8090/v1", RouterHostIP: "172.20.0.1", BundleMaxMB: 200,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	h, err := r.Start(ctx, "task-0002", "/srv/agent/workspaces/task-0002/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	create := (*last)["create"].(map[string]any)
+	env := fmt.Sprint(create["Env"])
+	for _, forbidden := range []string{"HTTP_PROXY=", "HTTPS_PROXY=", "http_proxy=", "https_proxy=", "egress-proxy"} {
+		if strings.Contains(env, forbidden) {
+			t.Fatalf("proxy env leaked with no proxy configured: %v", create["Env"])
+		}
+	}
+	if !strings.Contains(env, "ROUTER_TOKEN=router-only-token") {
+		t.Fatalf("router token missing: %v", create["Env"])
+	}
+	if err := r.Stop(ctx, h.ID); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestReconcile(t *testing.T) {
 	docker, last := fakeDocker(t)
 	r := New(docker, Config{})

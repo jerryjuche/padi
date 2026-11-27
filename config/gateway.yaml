@@ -29,6 +29,8 @@ container:
   # Host-bridge runtime only: set PADI_ROUTER_HOST_IP to pin "router" to the
   # bridge gateway when the router runs on the host. Leave unset in Compose,
   # where "router" is a real container on agent-session-net and Docker DNS works.
+  # Compose has a real egress-proxy container. Host-bridge runtimes without one
+  # must set PADI_PROXY_URL="" so session containers do not inherit this proxy.
   proxy: "http://egress-proxy:3128"
   bundle_max_mb: 200
 

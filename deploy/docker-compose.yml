@@ -7,7 +7,9 @@
 # so session containers resolve `router` through Docker DNS. The host-bridge
 # runtime instead sets PADI_ROUTER_HOST_IP=172.20.0.1 and passes ExtraHosts
 # `router:172.20.0.1` into session containers. That alias opens no egress;
-# `agent-session-net` remains `internal: true`.
+# `agent-session-net` remains `internal: true`. Compose also provides the real
+# egress-proxy container, so container.proxy stays set here; host-bridge
+# runtimes without that listener clear it with PADI_PROXY_URL="".
 services:
   router:
     build:
