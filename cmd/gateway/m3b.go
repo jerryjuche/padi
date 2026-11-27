@@ -29,6 +29,7 @@ var (
 	errBudgetExceeded  = errors.New("budget_exceeded")
 	errOffLimits       = errors.New("off_limits")
 	errApprovalPending = errors.New("approval_pending")
+	errModelTransport  = errors.New("model_transport_failed")
 )
 
 // resumeTask is the durable-enough context needed to finish a publish after an

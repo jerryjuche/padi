@@ -38,6 +38,7 @@ type Config struct {
 		CPUs            float64 `yaml:"cpus"`
 		Pids            int     `yaml:"pids"`
 		Network         string  `yaml:"network"`
+		RouterHostIP    string  `yaml:"router_host_ip"`
 		Proxy           string  `yaml:"proxy"`
 		BundleMaxMB     int     `yaml:"bundle_max_mb"`
 	} `yaml:"container"`
@@ -51,6 +52,7 @@ type Config struct {
 			Research string `yaml:"research"`
 			Chat     string `yaml:"chat"`
 			Small    string `yaml:"small"`
+			Think    string `yaml:"think"`
 			Eval     string `yaml:"eval"`
 		} `yaml:"aliases"`
 		LSP       bool `yaml:"lsp"`
@@ -117,8 +119,10 @@ func (c Config) TaskModel(agent string) string {
 	switch agent {
 	case "build":
 		return c.OpenCodeAlias("build")
-	case "plan":
+	case "plan", "research":
 		return c.OpenCodeAlias("plan")
+	case "think":
+		return c.OpenCodeAlias("think")
 	default:
 		return c.OpenCodeAlias("plan")
 	}
@@ -136,7 +140,7 @@ func (c Config) openCodeAliasMap() map[string]string {
 	return map[string]string{
 		"build": o.Aliases.Build, "plan": o.Aliases.Plan,
 		"research": o.Aliases.Research, "chat": o.Aliases.Chat,
-		"small": o.Aliases.Small, "eval": o.Aliases.Eval,
+		"small": o.Aliases.Small, "think": o.Aliases.Think, "eval": o.Aliases.Eval,
 	}
 }
 
@@ -158,6 +162,7 @@ func defaults() Config {
 	c.Container.CPUs = 1
 	c.Container.Pids = 512
 	c.Container.Network = "agent-session-net"
+	c.Container.RouterHostIP = "172.20.0.1"
 	c.Container.BundleMaxMB = 200
 	c.OpenCode.Model = "padi/agent-build"
 	c.OpenCode.RouterBaseURL = "http://router:8090/v1"
@@ -167,6 +172,7 @@ func defaults() Config {
 	c.OpenCode.Aliases.Research = "padi/agent-plan"
 	c.OpenCode.Aliases.Chat = "padi/agent-chat"
 	c.OpenCode.Aliases.Small = "padi/agent-small"
+	c.OpenCode.Aliases.Think = "padi/agent-think"
 	c.OpenCode.Aliases.Eval = "padi/agent-eval"
 	c.OpenCode.LSP = false
 	c.OpenCode.Snapshots = false

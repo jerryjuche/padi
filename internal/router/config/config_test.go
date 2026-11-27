@@ -101,7 +101,7 @@ func TestFullAliasesWithOnlyNvidiaKey(t *testing.T) {
 	}
 	for _, alias := range []string{
 		"agent-build", "agent-plan", "agent-chat", "agent-small",
-		"agent-vision", "agent-embed", "agent-eval",
+		"agent-think", "agent-vision", "agent-embed", "agent-eval",
 	} {
 		if _, ok := cfg.Routes[alias]; !ok {
 			t.Fatalf("alias %s missing", alias)
@@ -121,7 +121,7 @@ func TestFullAliasesWithOnlyNvidiaKey(t *testing.T) {
 	}
 	enabled := cfg.EnabledAliases()
 	sort.Strings(enabled)
-	want := []string{"agent-build", "agent-chat", "agent-plan", "agent-small", "agent-vision"}
+	want := []string{"agent-build", "agent-chat", "agent-plan", "agent-small", "agent-think", "agent-vision"}
 	if strings.Join(enabled, ",") != strings.Join(want, ",") {
 		t.Fatalf("enabled=%v want %v", enabled, want)
 	}

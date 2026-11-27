@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -25,6 +26,7 @@ type Config struct {
 	Model           string
 	RouterToken     string // only credential passed to the session container
 	RouterBaseURL   string // OpenAI-compatible router endpoint, always /v1
+	RouterHostIP    string // host bridge IP mapped to the "router" hostname
 	ProxyURL        string // egress-proxy build port
 	BundleMaxMB     int
 	TaskIDHeader    string // optional per-provider header value source
@@ -148,6 +150,17 @@ func (r *Runner) hardenedSpec(spec ContainerSpec) ContainerSpec {
 	// already trusts this exact path. No extra capability or root access.
 	if gid := os.Getgid(); gid > 0 {
 		spec.GroupAdd = []string{strconv.Itoa(gid)}
+	}
+	// The router runs on the host bridge, not as a container on
+	// agent-session-net. Docker's embedded DNS has no "router" record, so the
+	// session would retry forever without this alias. No egress is opened:
+	// the network remains internal and only this one hostname is pinned.
+	if ip := strings.TrimSpace(r.Cfg.RouterHostIP); ip != "" {
+		host := "router"
+		if u, err := url.Parse(r.Cfg.RouterBaseURL); err == nil && u.Hostname() != "" {
+			host = u.Hostname()
+		}
+		spec.ExtraHosts = []string{host + ":" + ip}
 	}
 	spec.User = "agent"
 	return spec

@@ -73,12 +73,16 @@ func TestOpenCodeAliasMapping(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if c.Container.RouterHostIP != "172.20.0.1" {
+		t.Fatalf("router_host_ip=%q", c.Container.RouterHostIP)
+	}
 	for _, tc := range []struct {
 		name, got, want string
 	}{
 		{"build agent", c.TaskModel("build"), "padi/agent-build"},
 		{"plan agent", c.TaskModel("plan"), "padi/agent-plan"},
 		{"research agent", c.TaskModel("research"), "padi/agent-plan"},
+		{"thinking agent", c.TaskModel("think"), "padi/agent-think"},
 		{"direct chat", c.DirectModel(), "padi/agent-chat"},
 		{"lightweight", c.LightModel(), "padi/agent-small"},
 		{"eval", c.OpenCodeAlias("eval"), "padi/agent-eval"},

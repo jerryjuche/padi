@@ -98,6 +98,62 @@ func (c *Client) CreateSession(ctx context.Context) (string, error) {
 	return out.Data.ID, nil
 }
 
+// SessionActivity is a bounded view of what an OpenCode session is doing.
+// OpenCode keeps provider transport failures in assistant messages as retry
+// metadata; without reading them the gateway cannot tell a silent retry loop
+// from a healthy long-running turn.
+type SessionActivity struct {
+	Retry     int
+	LastError string
+	Tokens    int
+}
+
+// Activity reads the session message list and returns the latest retry state.
+// It never exposes message content to callers, only counters and the transport
+// error needed for the live card.
+func (c *Client) Activity(ctx context.Context, sessionID string) (SessionActivity, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/api/session/"+url.PathEscape(sessionID)+"/message", nil)
+	if err != nil {
+		return SessionActivity{}, err
+	}
+	defer resp.Body.Close()
+	var envelope struct {
+		Data []struct {
+			Type  string `json:"type"`
+			Retry *struct {
+				Attempt int `json:"attempt"`
+				Error   *struct {
+					Message string `json:"message"`
+				} `json:"error"`
+			} `json:"retry"`
+			Tokens *struct {
+				Input     int `json:"input"`
+				Output    int `json:"output"`
+				Reasoning int `json:"reasoning"`
+			} `json:"tokens"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&envelope); err != nil {
+		return SessionActivity{}, fmt.Errorf("opencode: decode session activity: %w", err)
+	}
+	var out SessionActivity
+	for _, msg := range envelope.Data {
+		if msg.Tokens != nil {
+			out.Tokens += msg.Tokens.Input + msg.Tokens.Output + msg.Tokens.Reasoning
+		}
+		if msg.Type != "assistant" || msg.Retry == nil {
+			continue
+		}
+		if msg.Retry.Attempt > out.Retry {
+			out.Retry = msg.Retry.Attempt
+		}
+		if msg.Retry.Error != nil && msg.Retry.Error.Message != "" && msg.Retry.Attempt >= out.Retry {
+			out.LastError = msg.Retry.Error.Message
+		}
+	}
+	return out, nil
+}
+
 // SetModel is per-session in v2; there is no per-message model field.
 func (c *Client) SetModel(ctx context.Context, sessionID, model string) error {
 	if model == "" {

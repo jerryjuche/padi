@@ -165,62 +165,9 @@ func (r *Renderer) RelayWithLive(ctx context.Context, chatID int64, sessionID uu
 	var answer strings.Builder
 	var status string
 	var lastEdit time.Time
-	for ev := range events {
-		switch ev.Type {
-		case "token":
-			answer.WriteString(ev.Text)
-			if live != nil {
-				live.AddTokens(len([]rune(ev.Text)))
-			}
-		case "done":
-			goto finish
-		case "error":
-			if ev.Terminal {
-				message := Render(ev)
-				if live != nil {
-					live.SetPhase("done", "Failed")
-					live.Add("error", message, "")
-				}
-				if editErr := edit(html.EscapeString(message), nil); editErr != nil {
-					return "", editErr
-				}
-				return "", fmt.Errorf("%s", message)
-			}
-			if live != nil {
-				live.Add("error", ev.Message, "")
-			}
-			status = Render(ev)
-		case "tool_call":
-			if live != nil {
-				live.Add("tool", ev.Tool, "called")
-			}
-			if line := Render(ev); line != "" {
-				status = line
-			}
-		case "tool_result":
-			if live != nil {
-				live.Add("tool", ev.Tool, "finished")
-			}
-			if line := Render(ev); line != "" {
-				status = line
-			}
-		case "file_change":
-			if live != nil {
-				live.Add("file", ev.Text, "changed")
-			}
-			if line := Render(ev); line != "" {
-				status = line
-			}
-		default:
-			if live != nil && ev.Type == "status" && ev.Message != "" {
-				live.Add("status", ev.Message, "")
-			}
-			if line := Render(ev); line != "" {
-				status = line
-			}
-		}
+	renderNow := func() error {
 		if time.Since(lastEdit) < r.interval() {
-			continue
+			return nil
 		}
 		var text string
 		if live != nil {
@@ -235,9 +182,87 @@ func (r *Renderer) RelayWithLive(ctx context.Context, chatID int64, sessionID uu
 			text = html.EscapeString(truncate(text, r.maxChars()))
 		}
 		if err := edit(text, nil); err != nil {
-			return "", err
+			return err
 		}
 		lastEdit = time.Now()
+		return nil
+	}
+
+	// A live card must refresh even when the model is silent: the pulse probe
+	// updates the trace outside the event stream.
+	var ticks <-chan time.Time
+	if live != nil {
+		ticker := time.NewTicker(r.interval())
+		defer ticker.Stop()
+		ticks = ticker.C
+	}
+	for {
+		select {
+		case ev, ok := <-events:
+			if !ok {
+				goto finish
+			}
+			switch ev.Type {
+			case "token":
+				answer.WriteString(ev.Text)
+				if live != nil {
+					live.AddTokens(len([]rune(ev.Text)))
+				}
+			case "done":
+				goto finish
+			case "error":
+				if ev.Terminal {
+					message := Render(ev)
+					if live != nil {
+						live.SetPhase("done", "Failed")
+						live.Add("error", message, "")
+					}
+					if editErr := edit(html.EscapeString(message), nil); editErr != nil {
+						return "", editErr
+					}
+					return "", fmt.Errorf("%s", message)
+				}
+				if live != nil {
+					live.Add("error", ev.Message, "")
+				}
+				status = Render(ev)
+			case "tool_call":
+				if live != nil {
+					live.Add("tool", ev.Tool, "called")
+				}
+				if line := Render(ev); line != "" {
+					status = line
+				}
+			case "tool_result":
+				if live != nil {
+					live.Add("tool", ev.Tool, "finished")
+				}
+				if line := Render(ev); line != "" {
+					status = line
+				}
+			case "file_change":
+				if live != nil {
+					live.Add("file", ev.Text, "changed")
+				}
+				if line := Render(ev); line != "" {
+					status = line
+				}
+			default:
+				if live != nil && ev.Type == "status" && ev.Message != "" {
+					live.Add("status", ev.Message, "")
+				}
+				if line := Render(ev); line != "" {
+					status = line
+				}
+			}
+			if err := renderNow(); err != nil {
+				return "", err
+			}
+		case <-ticks:
+			if err := renderNow(); err != nil {
+				return "", err
+			}
+		}
 	}
 
 finish:

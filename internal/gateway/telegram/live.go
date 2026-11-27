@@ -30,6 +30,9 @@ type LiveTrace struct {
 	PhaseIndex int
 	Events     []LiveEvent
 	Tokens     int
+	PulseAt    timepkg.Time
+	Retry      int
+	PulseError string
 }
 
 // livePhases is the owner-facing phase track. The index is authoritative for
@@ -108,6 +111,19 @@ func (l *LiveTrace) AddTokens(n int) {
 	l.mu.Unlock()
 }
 
+// SetPulse records a heartbeat from the session probe. It does not add an
+// event, so a long silent turn cannot flood the trace with duplicate lines.
+func (l *LiveTrace) SetPulse(retry int, errText string) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	l.PulseAt = timepkg.Now()
+	l.Retry = retry
+	l.PulseError = liveClip(errText, 120)
+	l.mu.Unlock()
+}
+
 func (l *LiveTrace) trim() {
 	if len(l.Events) > liveMaxEvents {
 		l.Events = append([]LiveEvent(nil), l.Events[len(l.Events)-liveMaxEvents:]...)
@@ -125,6 +141,9 @@ type LiveSnapshot struct {
 	PhaseIndex int
 	Events     []LiveEvent
 	Tokens     int
+	PulseAt    timepkg.Time
+	Retry      int
+	PulseError string
 	Total      int
 }
 
@@ -138,7 +157,8 @@ func (l *LiveTrace) Snapshot() LiveSnapshot {
 	return LiveSnapshot{
 		TaskID: l.TaskID, Repo: l.Repo, Mode: l.Mode, Started: l.Started,
 		Phase: l.Phase, PhaseLabel: l.PhaseLabel, PhaseIndex: l.PhaseIndex,
-		Events: events, Tokens: l.Tokens, Total: len(events),
+		Events: events, Tokens: l.Tokens, PulseAt: l.PulseAt,
+		Retry: l.Retry, PulseError: l.PulseError, Total: len(events),
 	}
 }
 
@@ -212,7 +232,18 @@ func RenderLiveCard(s LiveSnapshot, draft string, tail int) string {
 		}
 		track.WriteString(mark + " " + p.Name)
 	}
-	b.WriteString("<code>" + esc(track.String()) + "</code>\n\n")
+	b.WriteString("<code>" + esc(track.String()) + "</code>\n")
+	if !s.PulseAt.IsZero() {
+		pulse := "♥ alive"
+		if s.Retry > 0 {
+			pulse += fmt.Sprintf(" · retry %d", s.Retry)
+		}
+		if s.PulseError != "" {
+			pulse += " · " + s.PulseError
+		}
+		b.WriteString("<code>" + esc(liveClip(pulse, 132)) + "</code>\n")
+	}
+	b.WriteString("\n")
 
 	b.WriteString("<b>Events</b> <i>" + fmt.Sprintf("%d total", s.Total) + "</i>\n")
 	start := len(s.Events) - tail

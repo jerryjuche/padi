@@ -105,6 +105,16 @@ routes:
       model: "<placeholder>"
       priority: 2
 
+  agent-think:
+    # Read-only reasoning role. Same NVIDIA provider, separate alias so the
+    # thinking pass can be swapped independently without touching build/plan.
+    - provider: nvidia
+      model: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+      priority: 1
+    - provider: groq
+      model: "<placeholder>"
+      priority: 2
+
   agent-vision:
     - provider: nvidia
       model: "nvidia/nemotron-3.5-super-vl-120b-a12b"

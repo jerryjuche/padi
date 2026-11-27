@@ -26,6 +26,9 @@ container:
   cpus: 1.0
   pids: 512
   network: "agent-session-net"
+  # The router listens on the host bridge; containers cannot resolve "router"
+  # through Docker DNS. This alias is added with ExtraHosts, not egress access.
+  router_host_ip: "172.20.0.1"
   proxy: "http://egress-proxy:3128"
   bundle_max_mb: 200
 
@@ -39,6 +42,7 @@ opencode:
     research: "padi/agent-plan"
     chat: "padi/agent-chat"
     small: "padi/agent-small"
+    think: "padi/agent-think"
     eval: "padi/agent-eval"
   # Reachable from the gateway; PADI_ROUTER_BASE_URL overrides for local runs.
   router_base_url: "http://router:8090/v1"

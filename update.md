@@ -1651,3 +1651,58 @@ Draft: answer &lt;b&gt;text&lt;/b&gt;
 ### Next
 
 Owner: send a fresh `clone jerryjuche/koder and read the readme`, tap **Approve contract**, use `/status` for the card and `/options` during the run for the full underground trace. No push.
+
+---
+
+## 29. Silent model retries and role handoffs (2026-11-27)
+
+### Cause
+
+Two live tasks (`8db55f9a`, `855ac651`) stayed in `EXECUTING` with only `QUEUED` and `PREPARING` events. Their OpenCode sessions had **0 tokens** and an assistant retry at attempt 31:
+
+```text
+provider.transport: Can't reach 172.20.0.1. (getaddrinfo EAI_AGAIN egress-proxy)
+```
+
+`agent-session-net` was recreated without a `router` container, but the session model base URL is `http://router:8090/v1`. Docker's embedded DNS had no `router` record, so no model call ever succeeded. OpenCode kept retrying internally and emitted no SSE events, so the live card stayed at `Agent planning`.
+
+There was also only one effective workspace model: all aliases used NVIDIA, and there was no explicit handoff between roles.
+
+### Fix
+
+- Added `container.router_host_ip` and mapped `router -> 172.20.0.1` into every container with Docker `ExtraHosts`. The network stays `internal=true`; no egress was opened.
+- Added an OpenCode activity probe every 15s. The live card now shows `♥ alive`, retry count and the last transport error even when the model is silent. After 6 retries the gateway fails the task instead of waiting indefinitely.
+- Added a `think` role using NVIDIA `agent-think` (small reasoning model). Unapproved work now runs `think → plan` in one OpenCode session; each role receives an explicit `HANDOFF` note. The owner's **Execute** tap still gates `plan → execute`, and the executor receives the approved PROPOSAL as a named handoff.
+- Added `agent-think` to router config and the session image; rebuilt `sandbox-agent-session:latest` with 8 model aliases and the custom read-only think agent.
+- Marked the two stale `EXECUTING` tasks `FAILED` with reason `model unreachable: router DNS alias missing`; removed the orphan container.
+
+### Evidence
+
+```bash
+$ docker run --add-host router:172.20.0.1 ... sandbox-agent-session:latest
+dns: 172.20.0.1      router
+health: HTTP 200
+models: HTTP 200
+agent-think
+
+$ docker run --rm --entrypoint sh sandbox-agent-session:latest \
+    -c 'grep -c modelID /opt/agent/opencode.base.json; grep -c "\"think\"" ...'
+8
+1
+
+$ gofmt -l cmd internal       # no output
+$ GOPROXY=off go vet ./...    # no output
+$ GOPROXY=off go test -race -count=1 ./...     # all packages ok
+$ scripts/m3b-smoke.sh | tail -1
+m3b-smoke: PASS M3b smoke (no live PR, no secrets used)
+$ scripts/dbaccess_test.sh | tail -1
+dbaccess_test: anon key cannot read any agent table (16 checked)
+$ tail -1 /tmp/opencode/padi-gateway.log
+2026/11/27 13:06:00 gateway: ready (chat=padi/agent-chat, build=padi/agent-build, plan=padi/agent-plan, network=agent-session-net)
+$ tail -1 /tmp/opencode/padi-router.log
+router ready (listen=:8090, aliases=[agent-build agent-plan agent-chat agent-small agent-vision agent-think], usage=true)
+```
+
+### Next
+
+Owner: send a fresh `clone jerryjuche/koder and read the readme`, tap **Approve contract**, then watch `/options` for `Thinking → Agent planning → Agent executing`. No push.

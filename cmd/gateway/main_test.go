@@ -58,6 +58,28 @@ func TestHintMessagesAreValidTelegramHTML(t *testing.T) {
 	}
 }
 
+func TestTaskStagesRoleHandoff(t *testing.T) {
+	plan := taskStages(modeBuild, command{repo: "o/r", prompt: "read the readme"})
+	if len(plan) != 2 || plan[0].Name != "think" || plan[0].Agent != "think" || plan[1].Name != "plan" || plan[1].Agent != "plan" {
+		t.Fatalf("plan stages=%+v", plan)
+	}
+	if !strings.Contains(plan[0].Prompt, "HANDOFF:") {
+		t.Fatalf("think prompt missing handoff: %q", plan[0].Prompt)
+	}
+	if got := stageHandoff("think", " use  the  context "); !strings.Contains(got, "HANDOFF from think role") || !strings.Contains(got, "use the context") {
+		t.Fatalf("handoff=%q", got)
+	}
+
+	exec := taskStages(modeBuild, command{repo: "o/r", prompt: "p", approved: true})
+	if len(exec) != 1 || exec[0].Name != "execute" || exec[0].Agent != "build" {
+		t.Fatalf("execute stages=%+v", exec)
+	}
+	proposal := parseProposal("Done.\nPROPOSAL: add docs; README.md; write two lines; low risk", "t1")
+	if proposal == nil || !strings.Contains(proposal.Prompt, "HANDOFF from planning role") {
+		t.Fatalf("proposal=%+v", proposal)
+	}
+}
+
 func TestOptionsCardKeepsTraceAfterChatClose(t *testing.T) {
 	trace := telegram.NewLiveTrace("task-1234", "owner/repo", "build")
 	trace.SetPhase("execute", "Agent executing")

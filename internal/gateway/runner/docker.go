@@ -114,6 +114,7 @@ type ContainerSpec struct {
 	CapDrop        []string
 	SecurityOpt    []string
 	GroupAdd       []string
+	ExtraHosts     []string
 	User           string
 	Entrypoint     []string
 	Cmd            []string
@@ -150,6 +151,9 @@ func (s ContainerSpec) body() map[string]any {
 	}
 	if len(s.GroupAdd) > 0 {
 		host["GroupAdd"] = s.GroupAdd
+	}
+	if len(s.ExtraHosts) > 0 {
+		host["ExtraHosts"] = s.ExtraHosts
 	}
 	body := map[string]any{
 		"Image":        s.Image,

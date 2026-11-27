@@ -32,10 +32,12 @@ import (
 )
 
 const (
-	modeBuild    = "build"
-	modePlan     = "plan"
-	modeResearch = "research"
-	chatIdleTTL  = 30 * time.Minute
+	modeBuild     = "build"
+	modePlan      = "plan"
+	modeResearch  = "research"
+	chatIdleTTL   = 30 * time.Minute
+	pulseEvery    = 15 * time.Second
+	maxModelRetry = 6
 
 	// chatStyle is prepended to every agent prompt so replies read like a
 	// conversational collaborator, not a tool transcript or a generic menu.
@@ -126,6 +128,7 @@ func run() error {
 		Model:           cfg.OpenCode.Model,
 		RouterToken:     routerToken,
 		RouterBaseURL:   routerBaseURL,
+		RouterHostIP:    cfg.Container.RouterHostIP,
 		ProxyURL:        cfg.Container.Proxy,
 		BundleMaxMB:     cfg.Container.BundleMaxMB,
 	})
@@ -1475,8 +1478,7 @@ func (a *application) startTask(ctx context.Context, chatID int64, c command, ke
 		return a.reply(ctx, chatID, "I need a repo and a request. Try 'clone owner/repo and add a README'.")
 	}
 	mode := a.currentMode(chatID)
-	agentName := taskAgent(mode, c)
-	agentPrompt := taskPrompt(mode, c)
+	stages := taskStages(mode, c)
 	eventMode := mode
 	if mode == modeBuild && !c.approved {
 		eventMode = modePlan // the first build turn is a read-only plan
@@ -1625,12 +1627,8 @@ func (a *application) startTask(ctx context.Context, chatID int64, c command, ke
 		return a.reportError(ctx, chatID, err)
 	}
 	stopCheckpoints := a.checkpointLoop(taskCtx, task.ID, session.ID, chat.handle.ID)
-	if agentName == "plan" {
-		live.SetPhase("execute", "Agent planning")
-	} else {
-		live.SetPhase("execute", "Agent executing")
-	}
-	summary, err := a.runTask(taskCtx, chat, session, task, chatID, agentName, agentPrompt, priorContext)
+	live.SetPhase("execute", stages[0].Label)
+	summary, err := a.runTask(taskCtx, chat, session, task, chatID, stages, priorContext)
 	stopCheckpoints()
 	if err != nil {
 		if errors.Is(err, errBudgetExceeded) || errors.Is(err, errOffLimits) {
@@ -1711,7 +1709,10 @@ func (a *application) beginExecution(ctx context.Context, taskID uuid.UUID) erro
 	return nil
 }
 
-func (a *application) runTask(ctx context.Context, chat *chatSession, session store.Session, task store.Task, chatID int64, agentName, agentPrompt, priorContext string) (string, error) {
+func (a *application) runTask(ctx context.Context, chat *chatSession, session store.Session, task store.Task, chatID int64, stages []taskStage, priorContext string) (string, error) {
+	if len(stages) == 0 {
+		return "", errors.New("gateway: no task stages")
+	}
 	feedCtx, feedCancel := context.WithCancel(ctx)
 	defer feedCancel()
 	rawEvents, err := chat.oc.Events(feedCtx)
@@ -1720,15 +1721,23 @@ func (a *application) runTask(ctx context.Context, chat *chatSession, session st
 	}
 	normalized := make(chan opencode.Event, 128)
 	abortHit := make(chan error, 1)
+	stageDone := make(chan string, 1)
+	var stageIndex atomic.Int32
+	signalAbort := func(cause error) {
+		select {
+		case abortHit <- cause:
+		default:
+		}
+		feedCancel()
+	}
+
+	// One persistent SSE feed serves every role. Intermediate turns are turned
+	// into status lines for the live card instead of final answers, and their
+	// text becomes the next role's explicit handoff.
 	go func() {
 		defer close(normalized)
-		signalAbort := func(cause error) {
-			select {
-			case abortHit <- cause:
-			default:
-			}
-			feedCancel()
-		}
+		stageText := ""
+		live := chat.currentLive()
 		for raw := range rawEvents {
 			ev, ok := opencode.Translate(raw)
 			if !ok {
@@ -1749,6 +1758,29 @@ func (a *application) runTask(ctx context.Context, chat *chatSession, session st
 					return
 				}
 			}
+			idx := int(stageIndex.Load())
+			intermediate := idx < len(stages)-1
+			if intermediate && ev.Type == "token" {
+				stageText += ev.Text
+				ev = opencode.Event{Type: "status", SessionID: chat.ocSession, Message: ev.Text}
+			}
+			if ev.Terminal && intermediate {
+				if live != nil {
+					live.Add("status", stages[idx].Name+" complete", "")
+				}
+				select {
+				case normalized <- opencode.Event{Type: "status", SessionID: chat.ocSession, Message: stages[idx].Name + " complete"}:
+				case <-feedCtx.Done():
+					return
+				}
+				select {
+				case stageDone <- stageText:
+				case <-feedCtx.Done():
+					return
+				}
+				stageText = ""
+				continue
+			}
 			select {
 			case normalized <- ev:
 			case <-feedCtx.Done():
@@ -1760,17 +1792,78 @@ func (a *application) runTask(ctx context.Context, chat *chatSession, session st
 		}
 	}()
 
-	if priorContext != "" {
-		agentPrompt = priorContext + "\n\n" + agentPrompt
-	}
-	if err := chat.oc.PromptWithAgent(ctx, chat.ocSession, agentPrompt, a.cfg.TaskModel(agentName), agentName); err != nil {
-		return "", err
-	}
+	// Heartbeat with the real OpenCode retry state. Without this a silent
+	// provider failure looks identical to a healthy long-running turn.
+	go func() {
+		ticker := time.NewTicker(pulseEvery)
+		defer ticker.Stop()
+		live := chat.currentLive()
+		for {
+			select {
+			case <-ticker.C:
+				activity, probeErr := chat.oc.Activity(feedCtx, chat.ocSession)
+				if probeErr != nil {
+					if live != nil {
+						live.SetPulse(0, scrubForUser(probeErr))
+					}
+					continue
+				}
+				if live != nil {
+					live.SetPulse(activity.Retry, activity.LastError)
+				}
+				if activity.Retry >= maxModelRetry {
+					detail := activity.LastError
+					if detail == "" {
+						detail = "model did not respond"
+					}
+					signalAbort(fmt.Errorf("%w: %s", errModelTransport, detail))
+					return
+				}
+			case <-feedCtx.Done():
+				return
+			}
+		}
+	}()
+
+	// Role director: switch agent/model in the same session, pass the previous
+	// role's handoff text, then wait for its idle event before the next role.
+	go func() {
+		handoff := ""
+		for i, stage := range stages {
+			stageIndex.Store(int32(i))
+			prompt := stage.Prompt
+			if priorContext != "" && i == 0 {
+				prompt = priorContext + "\n\n" + prompt
+			}
+			if handoff != "" {
+				prompt = stageHandoff(stages[i-1].Name, handoff) + "\n\n" + prompt
+				handoff = ""
+			}
+			if promptErr := chat.oc.PromptWithAgent(ctx, chat.ocSession, prompt,
+				a.cfg.TaskModel(stage.Agent), stage.Agent); promptErr != nil {
+				signalAbort(fmt.Errorf("%s stage: %w", stage.Name, promptErr))
+				return
+			}
+			if i == len(stages)-1 {
+				return
+			}
+			select {
+			case handoff = <-stageDone:
+			case <-feedCtx.Done():
+				return
+			}
+			if live := chat.currentLive(); live != nil {
+				live.SetPhase("execute", stages[i+1].Label)
+			}
+		}
+	}()
+
+	finalAgent := stages[len(stages)-1].Agent
 	summary, err := a.renderer.RelayWithLive(ctx, chatID, session.ID, &task.ID, normalized, func(final string) [][]telegram.InlineButton {
 		kind := "done"
 		if parseProposal(final, task.ID.String()) != nil {
 			kind = "decision"
-		} else if agentName == "plan" {
+		} else if finalAgent == "plan" || finalAgent == "think" {
 			kind = "workspace"
 		}
 		return a.buttons(chatID, kind, task.ID.String())
@@ -1887,6 +1980,57 @@ func modePrompt(mode, prompt string) string {
 	}
 }
 
+// taskStage is one role handoff inside the same OpenCode session. The gateway
+// switches agent and model before each prompt; the session keeps the context.
+type taskStage struct {
+	Name   string
+	Agent  string
+	Prompt string
+	Label  string
+}
+
+// thinkPrompt asks the small reasoning model for a compact handoff. It is
+// read-only and cannot approve its own idea; the planner is next.
+func thinkPrompt(prompt string) string {
+	return "THINKING ROLE: investigate read-only and produce one whole line " +
+		"HANDOFF: <goal; findings; constraints; files; risk; next role>. " +
+		"Do not edit files and do not emit PROPOSAL. Keep the reply under 500 characters.\n\n" +
+		"Owner request: " + prompt
+}
+
+// taskStages builds the role sequence. Only the execute role may write files,
+// and it runs only after the owner accepted the planner's PROPOSAL.
+func taskStages(mode string, c command) []taskStage {
+	if c.approved {
+		return []taskStage{{
+			Name: "execute", Agent: modeAgent(modeBuild),
+			Prompt: taskPrompt(mode, c), Label: "Agent executing",
+		}}
+	}
+	agent := taskAgent(mode, c)
+	label := "Agent executing"
+	if agent == "plan" {
+		label = "Agent planning"
+	}
+	return []taskStage{
+		{Name: "think", Agent: "think", Prompt: thinkPrompt(c.prompt), Label: "Thinking"},
+		{Name: "plan", Agent: agent, Prompt: taskPrompt(mode, c), Label: label},
+	}
+}
+
+// stageHandoff turns one role's output into the next role's explicit context.
+// The text is clipped so a long turn cannot blow the next prompt's budget.
+func stageHandoff(from string, text string) string {
+	text = strings.Join(strings.Fields(text), " ")
+	if len(text) > 1400 {
+		text = text[:1399] + "…"
+	}
+	if text == "" {
+		text = "No additional handoff details; use the same workspace context."
+	}
+	return "HANDOFF from " + from + " role (read this before continuing): " + text
+}
+
 // taskAgent keeps every file-changing turn read-only until the owner approves
 // a PROPOSAL. Quick read-only actions use the plan agent for the same reason.
 func taskAgent(mode string, c command) string {
@@ -1963,7 +2107,8 @@ func parseProposal(summary, taskID string) *proposalRecord {
 		}
 		return &proposalRecord{
 			TaskID: taskID,
-			Prompt: "The owner approved this exact plan. Do not ask for approval again. Execute this approved plan in this workspace: " + body +
+			Prompt: "HANDOFF from planning role (the owner approved this exact PROPOSAL). " +
+				"Do not ask for approval again. Execute only this handoff in the current workspace: " + body +
 				". Make only these changes, run the narrowest relevant checks, and report in two sentences. Do not push.",
 		}
 	}

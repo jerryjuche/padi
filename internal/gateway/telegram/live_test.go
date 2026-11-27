@@ -45,6 +45,20 @@ func TestLiveTracePhasesAndEvents(t *testing.T) {
 	}
 }
 
+func TestLiveTracePulseShowsRetryError(t *testing.T) {
+	trace := NewLiveTrace("t", "owner/repo", "build")
+	trace.SetPulse(31, "getaddrinfo EAI_AGAIN egress-proxy")
+	card := RenderLiveCard(trace.Snapshot(), "", 1)
+	for _, want := range []string{"♥ alive", "retry 31", "EAI_AGAIN"} {
+		if !strings.Contains(card, want) {
+			t.Errorf("card missing %q: %s", want, card)
+		}
+	}
+	if got := len(trace.Snapshot().Events); got != 0 {
+		t.Fatalf("pulse added %d events", got)
+	}
+}
+
 func TestLiveTraceBoundsMemory(t *testing.T) {
 	trace := NewLiveTrace("t", "r", "plan")
 	for i := 0; i < liveMaxEvents+50; i++ {

@@ -75,6 +75,38 @@ func TestClientEndpoints(t *testing.T) {
 	}
 }
 
+func TestActivityReadsRetryWithoutMessageContent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/session/ses_test1/message" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		fmt.Fprint(w, `{"data":[
+			{"type":"user","content":[{"type":"text","text":"secret prompt"}]},
+			{"type":"assistant","agent":"plan","tokens":{"input":12,"output":3,"reasoning":4},"retry":{"attempt":31,"error":{"type":"provider.transport","message":"getaddrinfo EAI_AGAIN egress-proxy"}}},
+			{"type":"assistant","agent":"build","retry":{"attempt":2,"error":{"message":"older error"}}}
+		]}`)
+	}))
+	defer srv.Close()
+	c := &Client{BaseURL: srv.URL, Password: "throwaway", HTTP: srv.Client()}
+	activity, err := c.Activity(context.Background(), "ses_test1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activity.Retry != 31 {
+		t.Fatalf("retry=%d want 31", activity.Retry)
+	}
+	if activity.Tokens != 19 {
+		t.Fatalf("tokens=%d want 19", activity.Tokens)
+	}
+	if !strings.Contains(activity.LastError, "EAI_AGAIN") {
+		t.Fatalf("last error=%q", activity.LastError)
+	}
+	if strings.Contains(activity.LastError, "secret prompt") {
+		t.Fatal("message content leaked into activity")
+	}
+}
+
 func TestEventsSSE(t *testing.T) {
 	cases := []struct {
 		name  string

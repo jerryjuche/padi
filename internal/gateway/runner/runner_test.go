@@ -64,7 +64,7 @@ func TestStartWaitStop(t *testing.T) {
 		Image: "session:latest", Network: "agent-session-net", Runtime: "runc", MemoryMB: 2560,
 		CPUs: 1, Pids: 512, Model: "padi/agent-chat",
 		RouterToken: "router-only-token", RouterBaseURL: "http://router:8090/v1",
-		ProxyURL: "http://egress-proxy:3128", BundleMaxMB: 200,
+		RouterHostIP: "172.20.0.1", ProxyURL: "http://egress-proxy:3128", BundleMaxMB: 200,
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -91,6 +91,9 @@ func TestStartWaitStop(t *testing.T) {
 	}
 	if fmt.Sprint(host["GroupAdd"]) != fmt.Sprintf("[%d]", os.Getgid()) {
 		t.Fatalf("workspace group not passed: %+v", host)
+	}
+	if fmt.Sprint(host["ExtraHosts"]) != "[router:172.20.0.1]" {
+		t.Fatalf("router host alias not passed: %+v", host)
 	}
 	tmpfs := host["Tmpfs"].(map[string]any)
 	if !strings.Contains(fmt.Sprint(tmpfs["/tmp"]), "exec") {
