@@ -177,7 +177,7 @@ func run() error {
 		waits:            make(map[uuid.UUID]chan bool),
 		direct:           make(map[int64]*directChatState),
 		chatClient: &routerChatClient{
-			BaseURL: routerBaseURL, Token: routerToken, Model: cfg.OpenCode.Model,
+			BaseURL: routerBaseURL, Token: routerToken, Model: cfg.DirectModel(),
 		},
 	}
 	go approvalManager.ExpireLoop(ctx)
@@ -194,7 +194,8 @@ func run() error {
 			cancel()
 		}
 	}()
-	log.Printf("gateway: ready (model=%s, network=%s)", cfg.OpenCode.Model, cfg.Container.Network)
+	log.Printf("gateway: ready (chat=%s, build=%s, plan=%s, network=%s)",
+		cfg.DirectModel(), cfg.OpenCodeAlias("build"), cfg.OpenCodeAlias("plan"), cfg.Container.Network)
 	<-ctx.Done()
 	app.Close()
 	return nil
@@ -621,6 +622,30 @@ func (a *application) getChat(chatID int64) *chatSession {
 	return chat
 }
 
+// repoSwitched reports whether an active chat must be retired before a task
+// for repo starts. A normal follow-up has an empty repo and keeps its session.
+func repoSwitched(chat *chatSession, repo string) bool {
+	if chat == nil || repo == "" {
+		return false
+	}
+	current, _, _, _, _ := chat.detail()
+	return current != "" && !strings.EqualFold(current, repo)
+}
+
+// prepareWorkspace applies the max_sessions=1 cross-repo boundary. It returns
+// the chat to reuse, or nil after closing the old chat and stopping its
+// container; the caller must then open a fresh session and container.
+func (a *application) prepareWorkspace(chatID int64, chat *chatSession, repo string, fresh bool) *chatSession {
+	if chat == nil {
+		return nil
+	}
+	if fresh || repoSwitched(chat, repo) {
+		a.closeChat(chatID)
+		return nil
+	}
+	return chat
+}
+
 func (a *application) closeChat(chatID int64) {
 	a.mu.Lock()
 	chat := a.chats[chatID]
@@ -1030,10 +1055,11 @@ func (a *application) startTask(ctx context.Context, chatID int64, c command, ke
 		eventMode = modePlan // the first build turn is a read-only plan
 	}
 	chat := a.getChat(chatID)
-	if fresh && chat != nil {
-		a.closeChat(chatID)
-		chat = nil
-	}
+	// A cloned repo is a new workspace. Retire the previous chat and its
+	// container before any repo/session state is created, so a follow-up can
+	// never run inside a different repository's idle container and at most one
+	// session container stays active.
+	chat = a.prepareWorkspace(chatID, chat, c.repo, fresh)
 	if err := a.db.EnsureRepo(ctx, c.repo, "main"); err != nil {
 		return a.reportError(ctx, chatID, err)
 	}
@@ -1278,7 +1304,7 @@ func (a *application) runTask(ctx context.Context, chat *chatSession, session st
 	if priorContext != "" {
 		agentPrompt = priorContext + "\n\n" + agentPrompt
 	}
-	if err := chat.oc.PromptWithAgent(ctx, chat.ocSession, agentPrompt, a.cfg.OpenCode.Model, agentName); err != nil {
+	if err := chat.oc.PromptWithAgent(ctx, chat.ocSession, agentPrompt, a.cfg.TaskModel(agentName), agentName); err != nil {
 		return "", err
 	}
 	summary, err := a.renderer.RelayWithKeyboardFunc(ctx, chatID, session.ID, &task.ID, normalized, func(final string) [][]telegram.InlineButton {

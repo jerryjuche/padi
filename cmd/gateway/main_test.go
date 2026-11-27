@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jerryjuche/padi/internal/gateway/runner"
 	"github.com/jerryjuche/padi/internal/gateway/telegram"
 )
 
@@ -457,6 +458,60 @@ func TestScrubForUser(t *testing.T) {
 	got := scrubForUser(fmt.Errorf("git Authorization: Bearer ghs_SECRET123 failed"))
 	if strings.Contains(got, "ghs_SECRET123") || !strings.Contains(got, "[REDACTED]") {
 		t.Fatalf("scrub=%q", got)
+	}
+}
+
+func TestPrepareWorkspaceReplacesCrossRepoSession(t *testing.T) {
+	var mu sync.Mutex
+	var stopped []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/containers/") {
+			mu.Lock()
+			stopped = append(stopped, strings.TrimPrefix(r.URL.Path, "/containers/"))
+			mu.Unlock()
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	fake := &runner.Docker{BaseURL: srv.URL, HTTP: srv.Client()}
+
+	cases := []struct {
+		name      string
+		repo      string
+		fresh     bool
+		wantReuse bool
+		wantStops int
+	}{
+		{"same repo follow-up", "owner/repo", false, true, 0},
+		{"different repo", "owner/other", false, false, 1},
+		{"empty repo follow-up", "", false, true, 0},
+		{"explicit fresh", "owner/repo", true, false, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mu.Lock()
+			stopped = nil
+			mu.Unlock()
+			chat := &chatSession{repo: "owner/repo", handle: runner.Handle{ID: "old-container"}}
+			app := &application{
+				runner: runner.New(fake, runner.Config{}),
+				chats:  map[int64]*chatSession{42: chat},
+			}
+			got := app.prepareWorkspace(42, chat, tc.repo, tc.fresh)
+			if (got != nil) != tc.wantReuse {
+				t.Fatalf("reuse=%t want %t", got != nil, tc.wantReuse)
+			}
+			if _, ok := app.chats[42]; ok != tc.wantReuse {
+				t.Fatalf("chat retained=%t want %t", ok, tc.wantReuse)
+			}
+			mu.Lock()
+			gotStops := len(stopped)
+			stopped = nil
+			mu.Unlock()
+			if gotStops != tc.wantStops {
+				t.Fatalf("container stops=%d want %d", gotStops, tc.wantStops)
+			}
+		})
 	}
 }
 

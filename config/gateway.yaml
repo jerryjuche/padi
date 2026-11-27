@@ -30,9 +30,16 @@ container:
   bundle_max_mb: 200
 
 opencode:
-  # M2: OpenCode talks only to the router. The alias maps to an ordered target
+  # M4: OpenCode talks only to the router. Each alias maps to an ordered target
   # chain in config/router.yaml; no provider key enters the session container.
-  model: "padi/agent-chat"
+  model: "padi/agent-build"
+  aliases:
+    build: "padi/agent-build"
+    plan: "padi/agent-plan"
+    research: "padi/agent-plan"
+    chat: "padi/agent-chat"
+    small: "padi/agent-small"
+    eval: "padi/agent-eval"
   # Reachable from the gateway; PADI_ROUTER_BASE_URL overrides for local runs.
   router_base_url: "http://router:8090/v1"
   router_token_env: "ROUTER_TOKEN"

@@ -65,6 +65,21 @@ func TestEntrypointRendersConfigWithoutKey(t *testing.T) {
 	if !ok {
 		t.Fatalf("padi provider missing: %v", providers)
 	}
+	models := padi["models"].(map[string]any)
+	for _, alias := range []string{
+		"agent-build", "agent-plan", "agent-chat", "agent-small", "agent-vision", "agent-embed", "agent-eval",
+	} {
+		if _, ok := models[alias]; !ok {
+			t.Fatalf("model %s missing from rendered provider: %v", alias, models)
+		}
+	}
+	agents := cfg["agent"].(map[string]any)
+	if got := agents["build"].(map[string]any)["model"]; got != "padi/agent-build" {
+		t.Fatalf("build model=%v", got)
+	}
+	if got := agents["plan"].(map[string]any)["model"]; got != "padi/agent-plan" {
+		t.Fatalf("plan model=%v", got)
+	}
 	headers := padi["headers"].(map[string]any)
 	if headers["X-Task-Id"] != "task-42" {
 		t.Fatalf("headers=%+v", headers)

@@ -1,4 +1,4 @@
-// Package router implements the M2 chat-completions handler: capability
+// Package router implements the M2/M4 chat-completions handler: capability
 // filtering, RPM wait, concurrency, retries, cooldowns and fallback.
 package router
 
@@ -27,6 +27,7 @@ type Handler struct {
 	limiters map[string]*limiter.Sliding
 	sems     map[string]*limiter.Sem
 	clock    limiter.Clock
+	usage    Recorder
 
 	mu           sync.Mutex
 	breakers     map[string]*breaker.Breaker
@@ -36,10 +37,15 @@ type Handler struct {
 	dailyTokens  map[string]int
 }
 
-// NewHandler builds all per-provider state from config.
-func NewHandler(cfg *config.Config, clock limiter.Clock) *Handler {
+// NewHandler builds all per-provider state from config. A recorder may be
+// supplied for usage rows; tests and deployments without a DSN get a no-op.
+func NewHandler(cfg *config.Config, clock limiter.Clock, recorder ...Recorder) *Handler {
 	if clock == nil {
 		clock = limiter.RealClock{}
+	}
+	var rec Recorder = noopRecorder{}
+	if len(recorder) > 0 && recorder[0] != nil {
+		rec = recorder[0]
 	}
 	h := &Handler{
 		cfg:          cfg,
@@ -48,6 +54,7 @@ func NewHandler(cfg *config.Config, clock limiter.Clock) *Handler {
 		limiters:     make(map[string]*limiter.Sliding, len(cfg.Providers)),
 		sems:         make(map[string]*limiter.Sem, len(cfg.Providers)),
 		clock:        clock,
+		usage:        rec,
 		breakers:     make(map[string]*breaker.Breaker, len(cfg.Providers)),
 		cooldown:     make(map[string]time.Time),
 		cooldownStep: make(map[string]int),
@@ -125,6 +132,7 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 			alias = enabled[0]
 		}
 	}
+	normalized := route.NormalizeAlias(alias)
 	req := route.Request{
 		Alias:     alias,
 		Body:      raw,
@@ -139,6 +147,21 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 			req.Headers[key] = v
 		}
 	}
+
+	// Evaluation must judge a build from a different upstream. Excluding every
+	// enabled agent-build provider here keeps the rule independent of target
+	// order, retries and the per-provider breaker state.
+	excluded := []string(nil)
+	if isEvalAlias(alias) {
+		excluded = buildProviders(h.cfg)
+		req.ExcludeProviders = excluded
+		if independent, _, _ := evalAvailability(h.cfg, excluded); independent == 0 {
+			writeError(w, http.StatusServiceUnavailable, "eval_provider_isolation", evalErrorReasons(h.cfg, excluded))
+			return
+		}
+	}
+
+	w.Header().Set("X-Padi-Alias", normalized)
 	candidates, err := h.routes.Candidates(req)
 	if err != nil {
 		if strings.Contains(err.Error(), "unknown alias") {
@@ -151,11 +174,37 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 
 	reasons := map[string]string{}
 	var retryAfter time.Duration
-	for _, target := range candidates {
+	for depth, target := range candidates {
 		p := h.cfg.Providers[target.Provider]
+		// Safe routing metadata. The provider name is operational state, not a
+		// secret; agent-eval uses it to prove cross-provider isolation.
+		w.Header().Set("X-Padi-Provider", target.Provider)
 		now := h.clock.Now()
+		record := func(status int, res upstream.Result, elapsed time.Duration) {
+			if status <= 0 {
+				status = http.StatusBadGateway
+			}
+			tokensIn, tokensOut := res.TokensIn, res.TokensOut
+			h.usage.Record(UsageRow{
+				Time:          time.Now().UTC(),
+				SessionID:     req.Headers["X-Session-Id"],
+				TaskID:        req.Headers["X-Task-Id"],
+				Alias:         normalized,
+				Provider:      target.Provider,
+				Model:         target.Model,
+				Status:        status,
+				FallbackDepth: depth,
+				FirstByte:     res.FirstByte,
+				Total:         elapsed,
+				TokensIn:      tokensIn,
+				TokensOut:     tokensOut,
+				CostMicros:    costMicros(tokensIn, tokensOut, p),
+				QuotaTokens:   tokensIn + tokensOut,
+			})
+		}
 		if !h.breakerAllow(target.Provider, now) {
 			reasons[target.Provider] = "breaker_" + string(h.breakerState(target.Provider, now))
+			record(http.StatusServiceUnavailable, upstream.Result{}, 0)
 			continue
 		}
 		if until := h.cooldownUntil(target.Provider); now.Before(until) {
@@ -163,10 +212,12 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 			if left := until.Sub(now); left < retryAfter || retryAfter == 0 {
 				retryAfter = left
 			}
+			record(http.StatusTooManyRequests, upstream.Result{}, 0)
 			continue
 		}
 		if p.DailyTokenCap > 0 && h.dailyUsed(target.Provider) >= p.DailyTokenCap {
 			reasons[target.Provider] = "daily_cap"
+			record(http.StatusServiceUnavailable, upstream.Result{}, 0)
 			continue
 		}
 
@@ -178,6 +229,7 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		cancel()
 		if err != nil {
 			reasons[target.Provider] = "queue_timeout"
+			record(http.StatusServiceUnavailable, upstream.Result{}, 0)
 			continue
 		}
 		for attempt := 0; attempt < h.cfg.Retry.Attempts; attempt++ {
@@ -187,11 +239,14 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 				acqCancel()
 				if err != nil {
 					reasons[target.Provider] = "queue_timeout"
+					record(http.StatusServiceUnavailable, upstream.Result{}, 0)
 					break
 				}
 			}
+			attemptStart := time.Now()
 			res, _ := h.upstream.Do(r.Context(), target, p, req, w)
 			h.sems[target.Provider].Release()
+			record(res.Status, res, time.Since(attemptStart))
 
 			if res.MidStream {
 				h.setLastError(target.Provider, res.Outcome)

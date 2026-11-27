@@ -131,6 +131,11 @@ func TestInspectTreeTable(t *testing.T) {
 				t.Fatal(err)
 			}
 		}, true},
+		{"gitmodules manifest", func(t *testing.T, root string) {
+			if err := os.WriteFile(filepath.Join(root, ".gitmodules"), []byte("[submodule \"x\"]\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

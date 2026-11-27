@@ -68,6 +68,40 @@ func TestValidateRejectsConcurrency(t *testing.T) {
 	}
 }
 
+func TestOpenCodeAliasMapping(t *testing.T) {
+	c, err := loadConfig(filepath.Join("..", "..", "config", "gateway.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, got, want string
+	}{
+		{"build agent", c.TaskModel("build"), "padi/agent-build"},
+		{"plan agent", c.TaskModel("plan"), "padi/agent-plan"},
+		{"research agent", c.TaskModel("research"), "padi/agent-plan"},
+		{"direct chat", c.DirectModel(), "padi/agent-chat"},
+		{"lightweight", c.LightModel(), "padi/agent-small"},
+		{"eval", c.OpenCodeAlias("eval"), "padi/agent-eval"},
+	} {
+		if tc.got != tc.want {
+			t.Fatalf("%s=%q want %q", tc.name, tc.got, tc.want)
+		}
+	}
+
+	fallback := defaults()
+	fallback.OpenCode.Aliases.Chat = ""
+	fallback.OpenCode.Model = "padi/agent-chat"
+	if got := fallback.DirectModel(); got != "padi/agent-chat" {
+		t.Fatalf("chat fallback=%q", got)
+	}
+
+	invalid := defaults()
+	invalid.OpenCode.Aliases.Plan = "agent-plan"
+	if err := invalid.validate(); err == nil {
+		t.Fatal("expected alias validation error")
+	}
+}
+
 func TestSecretFromEnvAny(t *testing.T) {
 	cases := []struct {
 		name    string

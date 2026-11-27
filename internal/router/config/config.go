@@ -18,6 +18,8 @@ type Config struct {
 	Listen           string              `yaml:"listen"`
 	RouterTokenEnv   string              `yaml:"router_token_env"`
 	RouterToken      string              `yaml:"-"`
+	UsageDSNEnv      string              `yaml:"usage_dsn_env"`
+	UsageDSN         string              `yaml:"-"`
 	Providers        map[string]Provider `yaml:"providers"`
 	Routes           map[string][]Target `yaml:"routes"`
 	Retry            RetryCfg            `yaml:"retry"`
@@ -32,27 +34,32 @@ type Config struct {
 // Provider is one upstream provider. APIKey is resolved from the environment
 // at load time and is never serialised.
 type Provider struct {
-	Name           string `yaml:"name"`
-	BaseURL        string `yaml:"base_url"`
-	APIKeyEnv      string `yaml:"api_key_env"`
-	APIKey         string `yaml:"-"`
-	Package        string `yaml:"package"`
-	RPM            int    `yaml:"rpm"`
-	Concurrency    int    `yaml:"concurrency"`
-	SupportsStream bool   `yaml:"supports_stream"`
-	SupportsTools  bool   `yaml:"supports_tools"`
-	SupportsImages bool   `yaml:"supports_images"`
-	MaxContext     int    `yaml:"max_context"`
-	DailyTokenCap  int    `yaml:"daily_token_cap"`
-	Enabled        bool   `yaml:"-"`
+	Name               string `yaml:"name"`
+	BaseURL            string `yaml:"base_url"`
+	APIKeyEnv          string `yaml:"api_key_env"`
+	APIKey             string `yaml:"-"`
+	Package            string `yaml:"package"`
+	RPM                int    `yaml:"rpm"`
+	Concurrency        int    `yaml:"concurrency"`
+	SupportsStream     bool   `yaml:"supports_stream"`
+	SupportsTools      bool   `yaml:"supports_tools"`
+	SupportsImages     bool   `yaml:"supports_images"`
+	MaxContext         int    `yaml:"max_context"`
+	DailyTokenCap      int    `yaml:"daily_token_cap"`
+	CostPer1MInMicros  int64  `yaml:"cost_per_1m_in_micros"`
+	CostPer1MOutMicros int64  `yaml:"cost_per_1m_out_micros"`
+	Enabled            bool   `yaml:"-"`
 }
 
 // Target is one ordered candidate for an alias.
 type Target struct {
-	Provider string `yaml:"provider"`
-	Model    string `yaml:"model"`
-	Priority int    `yaml:"priority"`
-	Enabled  bool   `yaml:"-"`
+	Provider       string `yaml:"provider"`
+	Model          string `yaml:"model"`
+	Priority       int    `yaml:"priority"`
+	SupportsImages bool   `yaml:"supports_images"`
+	Embeddings     bool   `yaml:"embeddings"`
+	Dims           int    `yaml:"dims"`
+	Enabled        bool   `yaml:"-"`
 }
 
 // RetryCfg controls retries inside the same target before failover.
@@ -72,6 +79,7 @@ func defaults() *Config {
 	return &Config{
 		Listen:           ":8090",
 		RouterTokenEnv:   "ROUTER_TOKEN",
+		UsageDSNEnv:      "ROUTER_DATABASE_URL",
 		Retry:            RetryCfg{Attempts: 3, Backoff: 150 * time.Millisecond},
 		Breaker:          BreakerCfg{ConsecutiveFailures: 3, InitialCooldown: 10 * time.Second, MaxCooldown: 2 * time.Minute},
 		RLCooldown:       []time.Duration{time.Second, 2 * time.Second, 5 * time.Second, 15 * time.Second, time.Minute},
@@ -102,6 +110,13 @@ func Load(path string, lookup func(string) string) (*Config, error) {
 	c.RouterToken = lookup(c.RouterTokenEnv)
 	if c.RouterToken == "" {
 		c.Warnings = append(c.Warnings, c.RouterTokenEnv+" is empty; /v1 and /status will refuse requests")
+	}
+	if c.UsageDSNEnv == "" {
+		c.UsageDSNEnv = "ROUTER_DATABASE_URL"
+	}
+	c.UsageDSN = lookup(c.UsageDSNEnv)
+	if c.UsageDSN == "" {
+		c.Warnings = append(c.Warnings, c.UsageDSNEnv+" is empty; llm_usage recording disabled")
 	}
 	for name, p := range c.Providers {
 		if p.Name == "" {
@@ -212,4 +227,25 @@ func (c *Config) TargetFor(provider, model string) (Target, bool) {
 		}
 	}
 	return Target{}, false
+}
+
+// AliasEnabled reports whether an alias has at least one callable target.
+func (c *Config) AliasEnabled(alias string) bool {
+	for _, t := range c.Routes[alias] {
+		if t.Enabled && c.Providers[t.Provider].Enabled {
+			return true
+		}
+	}
+	return false
+}
+
+// EnabledTargetCount is the number of callable targets for an alias.
+func (c *Config) EnabledTargetCount(alias string) int {
+	n := 0
+	for _, t := range c.Routes[alias] {
+		if t.Enabled && c.Providers[t.Provider].Enabled {
+			n++
+		}
+	}
+	return n
 }

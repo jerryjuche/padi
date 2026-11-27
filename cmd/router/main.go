@@ -29,14 +29,26 @@ func main() {
 		log.Printf("router: warning: %s", warning)
 	}
 
+	var recorder router.Recorder
+	if cfg.UsageDSN != "" {
+		writer, err := router.NewPGUsageWriter(context.Background(), cfg.UsageDSN)
+		if err != nil {
+			// The error can contain a DSN; never log it.
+			log.Printf("router: warning: llm_usage recording disabled (database unavailable)")
+		} else {
+			recorder = writer
+			defer writer.Close()
+		}
+	}
+
 	srv := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           router.NewHandler(cfg, nil),
+		Handler:           router.NewHandler(cfg, nil, recorder),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.ListenAndServe() }()
-	log.Printf("router ready (listen=%s, aliases=%v)", cfg.Listen, cfg.EnabledAliases())
+	log.Printf("router ready (listen=%s, aliases=%v, usage=%t)", cfg.Listen, cfg.EnabledAliases(), recorder != nil)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)

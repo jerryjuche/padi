@@ -160,9 +160,11 @@ func InspectTree(root string) error {
 			parts := strings.Split(rel, string(os.PathSeparator))
 			for i, part := range parts {
 				lower := strings.ToLower(part)
-				// The clone's own top-level .git is expected; a nested .git or
-				// any .git_* file is metadata smuggled in by the bundle.
-				if (i > 0 && lower == ".git") || strings.HasPrefix(lower, ".git_") {
+				// The clone's own top-level .git is expected; a nested .git,
+				// .git_* file or .gitmodules is metadata smuggled in by the
+				// bundle. Submodules are never initialised, so reject their
+				// manifest as defence in depth.
+				if (i > 0 && lower == ".git") || strings.HasPrefix(lower, ".git_") || lower == ".gitmodules" {
 					return fmt.Errorf("%w: git metadata %q", ErrHostileBundle, rel)
 				}
 			}

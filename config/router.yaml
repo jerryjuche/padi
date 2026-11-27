@@ -1,8 +1,9 @@
-# M2 router config. No secret values belong here; only environment-variable names.
+# M4 router config. No secret values belong here; only environment-variable names.
 # Targets with <placeholder> model IDs are disabled at startup (BUILD_SPEC §3.2).
 
 listen: ":8090"
 router_token_env: "ROUTER_TOKEN"
+usage_dsn_env: "ROUTER_DATABASE_URL"
 
 providers:
   nvidia:
@@ -17,6 +18,8 @@ providers:
     supports_images: false
     max_context: 120000
     daily_token_cap: 0
+    cost_per_1m_in_micros: 0
+    cost_per_1m_out_micros: 0
 
   groq:
     name: "Groq"
@@ -30,6 +33,8 @@ providers:
     supports_images: false
     max_context: 128000
     daily_token_cap: 0
+    cost_per_1m_in_micros: 0
+    cost_per_1m_out_micros: 0
 
   openrouter:
     name: "OpenRouter"
@@ -43,10 +48,12 @@ providers:
     supports_images: false
     max_context: 128000
     daily_token_cap: 0
+    cost_per_1m_in_micros: 0
+    cost_per_1m_out_micros: 0
 
   deepseek:
     name: "DeepSeek"
-    base_url: "https://api.deepseek.com"
+    base_url: "https://api.deepseek.com/v1"
     api_key_env: "DEEPSEEK_API_KEY"
     package: "@opencode/ai/providers/openai-compatible"
     rpm: 60
@@ -56,8 +63,29 @@ providers:
     supports_images: false
     max_context: 64000
     daily_token_cap: 0
+    cost_per_1m_in_micros: 0
+    cost_per_1m_out_micros: 0
 
 routes:
+  agent-build:
+    - provider: nvidia
+      model: "nvidia/nemotron-3.5-bolt-e4b"
+      priority: 1
+    - provider: groq
+      model: "<placeholder>"
+      priority: 2
+    - provider: openrouter
+      model: "<placeholder>"
+      priority: 3
+
+  agent-plan:
+    - provider: nvidia
+      model: "nvidia/nemotron-3.5-bolt-e4b"
+      priority: 1
+    - provider: groq
+      model: "<placeholder>"
+      priority: 2
+
   agent-chat:
     - provider: nvidia
       model: "nvidia/nemotron-3.5-bolt-e4b"
@@ -69,18 +97,41 @@ routes:
       model: "<placeholder>"
       priority: 3
 
+  agent-small:
+    - provider: nvidia
+      model: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+      priority: 1
+    - provider: groq
+      model: "<placeholder>"
+      priority: 2
+
   agent-vision:
+    - provider: nvidia
+      model: "nvidia/nemotron-3.5-super-vl-120b-a12b"
+      priority: 1
+      supports_images: true
+
+  agent-embed:
+    # Verified live at 2048 dims, but the /v1/embeddings route is M13 and
+    # expects 384 dims. Keep disabled until that handler exists.
     - provider: nvidia
       model: "<placeholder>"
       priority: 1
+      embeddings: true
+      dims: 384
 
   agent-eval:
+    # Must never use the agent-build provider. With no independent key on this
+    # host these targets stay disabled; the handler returns an explicit error.
     - provider: groq
       model: "<placeholder>"
       priority: 1
     - provider: openrouter
       model: "<placeholder>"
       priority: 2
+    - provider: deepseek
+      model: "<placeholder>"
+      priority: 3
 
 retry:
   attempts: 3

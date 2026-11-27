@@ -22,10 +22,11 @@ func targetAndProvider(baseURL string) (config.Target, config.Provider) {
 
 func TestDoRewritesModelAndPassesToolsAndHeaders(t *testing.T) {
 	var saw map[string]any
-	var auth, task string
+	var auth, task, session string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth = r.Header.Get("Authorization")
 		task = r.Header.Get("X-Task-Id")
+		session = r.Header.Get("X-Session-Id")
 		_ = json.NewDecoder(r.Body).Decode(&saw)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(200)
@@ -36,7 +37,7 @@ func TestDoRewritesModelAndPassesToolsAndHeaders(t *testing.T) {
 	target, provider := targetAndProvider(srv.URL)
 	body := []byte(`{"model":"alias","stream":true,"tools":[{"type":"function"}],"messages":[]}`)
 	rec := httptest.NewRecorder()
-	res, err := New(time.Second, 5*time.Second).Do(context.Background(), target, provider, route.Request{Body: body, Stream: true, Headers: map[string]string{"X-Task-Id": "task-42"}}, rec)
+	res, err := New(time.Second, 5*time.Second).Do(context.Background(), target, provider, route.Request{Body: body, Stream: true, Headers: map[string]string{"X-Task-Id": "task-42", "X-Session-Id": "session-42"}}, rec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,8 +54,8 @@ func TestDoRewritesModelAndPassesToolsAndHeaders(t *testing.T) {
 	if !ok || opts["include_usage"] != true {
 		t.Fatalf("stream_options=%v", saw["stream_options"])
 	}
-	if auth != "Bearer provider-key" || task != "task-42" {
-		t.Fatalf("auth/task=%q/%q", auth, task)
+	if auth != "Bearer provider-key" || task != "task-42" || session != "session-42" {
+		t.Fatalf("auth/task/session=%q/%q/%q", auth, task, session)
 	}
 	if !strings.Contains(rec.Body.String(), "hello") {
 		t.Fatalf("body=%q", rec.Body.String())

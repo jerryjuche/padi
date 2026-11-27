@@ -1256,3 +1256,110 @@ $ pgrep -af '/tmp/opencode/padi-(gateway|router)'
 ### Next
 
 Send one normal chat message in Telegram, then one code-change request, and quote the first line of each reply.
+
+---
+
+## 23. M4 router resilience and trust hardening (2026-11-27)
+
+### Done
+
+- **Router M4:** all seven aliases are configured; live aliases are `agent-build`, `agent-plan`, `agent-chat`, `agent-small` and `agent-vision` on NVIDIA. `agent-embed` and `agent-eval` stay disabled until an independent model/key exists.
+- **Eval isolation:** `internal/router/eval.go` excludes every provider that can serve `agent-build`; `cmd/agent-eval` targets `agent-eval`, forwards `X-Task-Id`/`X-Session-Id`, and reports router state without echoing tokens.
+- **Usage persistence:** `internal/router/usage.go` records streaming and non-streaming token/cost rows to `agent.llm_usage` with task/session IDs; `cmd/router/main.go` constructs and closes the writer; `/status` reports `usage.enabled` and `usage.dropped` without secrets.
+- **Alias routing:** `config/router.yaml`, `internal/router/config`, `route`, `upstream`, `status` and `cmd/gateway/config.go` now map every session model/agent to the router aliases. Secrets remain environment-only.
+- **Finding 2 fix:** `cmd/gateway/main.go:prepareWorkspace` retires an existing chat and stops its container before a different `clone` repo creates a new session. `TestPrepareWorkspaceReplacesCrossRepoSession` covers same-repo follow-up, repo switch, empty repo and explicit fresh.
+- **Defence in depth:** `internal/gateway/gitops/quarantine.go:InspectTree` now rejects `.gitmodules` alongside symlinks, nested `.git`, `.git_*` files and executable hooks; `TestInspectTreeTable` has a new case.
+- **Live runtime:** router and gateway were rebuilt from the verified tree and restarted. The local launcher maps `PADI_MODEL_API_KEY` to `NVIDIA_API_KEY` only in the process environment; no config file or repository holds a provider key.
+
+### Evidence
+
+```
+$ gofmt -l cmd internal
+(no output)
+$ GOPROXY=off go vet ./...
+(no output)
+$ GOPROXY=off go test -race -count=1 ./...
+ok  github.com/jerryjuche/padi/cmd/agent-eval        1.260s
+ok  github.com/jerryjuche/padi/cmd/agent-verify      1.144s
+ok  github.com/jerryjuche/padi/cmd/egress-proxy      1.152s
+ok  github.com/jerryjuche/padi/cmd/gateway           1.312s
+?   github.com/jerryjuche/padi/cmd/keepalive         [no test files]
+?   github.com/jerryjuche/padi/cmd/router            [no test files]
+ok  github.com/jerryjuche/padi/internal/egress/allowlist   1.071s
+ok  github.com/jerryjuche/padi/internal/egress/config      1.101s
+ok  github.com/jerryjuche/padi/internal/egress/proxy       1.206s
+ok  github.com/jerryjuche/padi/internal/egress/research    1.699s
+ok  github.com/jerryjuche/padi/internal/egress/search      1.098s
+ok  github.com/jerryjuche/padi/internal/gateway/approvals  1.140s
+ok  github.com/jerryjuche/padi/internal/gateway/contract   1.259s
+ok  github.com/jerryjuche/padi/internal/gateway/gitops     7.274s
+ok  github.com/jerryjuche/padi/internal/gateway/opencode   1.194s
+ok  github.com/jerryjuche/padi/internal/gateway/pipeline   2.381s
+ok  github.com/jerryjuche/padi/internal/gateway/risk       3.786s
+ok  github.com/jerryjuche/padi/internal/gateway/runner     1.468s
+ok  github.com/jerryjuche/padi/internal/gateway/store      1.125s
+ok  github.com/jerryjuche/padi/internal/gateway/telegram   1.844s
+ok  github.com/jerryjuche/padi/internal/keepalive          5.947s
+ok  github.com/jerryjuche/padi/internal/router             1.683s
+ok  github.com/jerryjuche/padi/internal/router/breaker     1.195s
+ok  github.com/jerryjuche/padi/internal/router/config      1.211s
+ok  github.com/jerryjuche/padi/internal/router/limiter     1.092s
+ok  github.com/jerryjuche/padi/internal/router/route       1.080s
+ok  github.com/jerryjuche/padi/internal/router/upstream    1.477s
+ok  github.com/jerryjuche/padi/internal/verify/detect      1.098s
+ok  github.com/jerryjuche/padi/internal/verify/guard       1.075s
+ok  github.com/jerryjuche/padi/internal/verify/report      1.053s
+ok  github.com/jerryjuche/padi/internal/verify/runner      4.155s
+ok  github.com/jerryjuche/padi/internal/verify/secrets     1.173s
+ok  github.com/jerryjuche/padi/internal/verify/tampering   1.323s
+
+$ set -a; . ./.env.local; set +a; scripts/dbaccess_test.sh | tail -3
+PASS  egress_allow           HTTP 404 (no exposure)
+PASS  session_checkpoints    HTTP 404 (no exposure)
+dbaccess_test: anon key cannot read any agent table (16 checked)
+
+$ set -a; . ./.env.local; set +a; scripts/m3b-smoke.sh | tail -3
+m3b-smoke: contract, guard, risk, approval and expiry gates passed
+m3b-smoke: task-scoped one-time buttons, callback dedupe and trust regressions passed
+m3b-smoke: PASS M3b smoke (no live PR, no secrets used)
+
+$ set -a; . ./.env.local; set +a; scripts/router-hammer.sh
+     10 200
+router-hammer: ok (10 requests, all 2xx)
+
+$ pgrep -af '/tmp/opencode/padi-(gateway|router)'
+45250 /tmp/opencode/padi-router
+45251 /tmp/opencode/padi-gateway
+
+$ tail -2 /tmp/opencode/padi-router.log
+2026/11/27 10:55:54 router: warning: alias agent-eval has no enabled targets
+2026/11/27 10:55:56 router ready (listen=:8090, aliases=[agent-build agent-plan agent-chat agent-small agent-vision], usage=true)
+$ tail -1 /tmp/opencode/padi-gateway.log
+2026/11/27 10:55:57 gateway: ready (chat=padi/agent-chat, build=padi/agent-build, plan=padi/agent-plan, network=agent-session-net)
+
+Direct probe with valid UUID headers returned `USAGE_OK`; one `agent.llm_usage` row was written for that task ID, and `/status` reported `usage={'dropped': 0, 'enabled': True}`.
+
+$ /tmp/opencode/agent-eval --router http://127.0.0.1:8090/v1 --prompt 'Reply with exactly EVAL_PROBE' --task-id 55555555-5555-4555-8555-555555555555 --session-id 66666666-6666-4666-8666-666666666666
+agent-eval: router status 503: {"error":{"code":"eval_provider_isolation","message":"eval_provider_isolation","type":"router_error"},"providers":{"deepseek":"disabled","groq":"disabled","openrouter":"disabled"}}
+agent-eval exit: 1
+```
+
+The `agent-eval` failure is the intended acceptance result here: NVIDIA is the only enabled provider, so the router refuses to let it judge NVIDIA-generated work. No fallback provider exists yet, and the error names only provider states, never keys or model IDs.
+
+### Deviations
+
+- `sql/005_router_usage.sql` is used for M4. The owner-approved `docs/decisions.md` entry already reserves `sql/005_incidents.sql` for M10; both files are forward-only and idempotent, but the shared number is recorded rather than silently renamed.
+- `agent-embed` remains `<placeholder>`: the live probed model returned 2048 dimensions while the spec requires 384. It is disabled at startup.
+- `agent-eval` remains disabled until an independent provider key is available. The router returns explicit `eval_provider_isolation` / `single_provider` state instead of silently reusing NVIDIA.
+
+### Open items
+
+- **Live PR gate still blocked:** no owner `Approve Push` or `Approve PR` taps exist and no draft PR has been opened. `clone jerryjuche/koder` plus genuine taps are still required.
+- **Owner-only key/row cleanup:** revoke the M1 throwaway NVIDIA key, rotate any still-active Supabase token, and purge the five historical redaction-failure DB rows from `2026-11-24 10:20–12:44 UTC`. GitHub installation tokens from that date are expired.
+- **VM-only verification:** ARM64/rootless/gVisor (`runsc`), Caddy TLS, rclone OCI upload, Healthchecks.io dead-man drill, 4 GB keepalive floor and 256 MB OOM drill remain owner-provisioned VM work.
+- **M4 load test with `max_sessions: 2`:** not run; the setting remains `1` and the 10-request router hammer is the recorded capacity evidence on this host.
+- **No push:** this milestone is committed locally on `agent/m0-audit-fixes-b53482d`; origin remains at `9abe2a4`, as instructed.
+
+### Next
+
+Owner: complete the genuine Telegram E2E PR gate, key/row cleanup and VM drills. Coding agent: start M5 only after the owner's go-ahead.

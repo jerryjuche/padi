@@ -12,12 +12,14 @@ func testConfig() *config.Config {
 			"tools":  {Name: "tools", RPM: 10, Concurrency: 1, Enabled: true, SupportsTools: true, SupportsStream: true, MaxContext: 1000},
 			"vision": {Name: "vision", RPM: 10, Concurrency: 1, Enabled: true, SupportsImages: true, MaxContext: 100},
 			"plain":  {Name: "plain", RPM: 10, Concurrency: 1, Enabled: true, MaxContext: 50},
+			"embed":  {Name: "embed", RPM: 10, Concurrency: 1, Enabled: true, MaxContext: 100},
 		},
 		Routes: map[string][]config.Target{
 			"chat": {
 				{Provider: "plain", Model: "plain/model", Enabled: true, Priority: 1},
 				{Provider: "tools", Model: "tools/model", Enabled: true, Priority: 2},
 				{Provider: "vision", Model: "vision/model", Enabled: true, Priority: 3},
+				{Provider: "embed", Model: "embed/model", Enabled: true, Priority: 4, Embeddings: true, Dims: 384},
 			},
 		},
 	}
@@ -46,6 +48,8 @@ func TestCandidatesFiltersCapabilitiesAndContext(t *testing.T) {
 		{"tools", Request{Alias: "chat", HasTools: true, EstTokens: 10}, []string{"tools"}},
 		{"vision", Request{Alias: "chat", HasImages: true, EstTokens: 10}, []string{"vision"}},
 		{"context", Request{Alias: "chat", EstTokens: 200}, []string{"tools"}},
+		{"excluded provider", Request{Alias: "chat", EstTokens: 10, ExcludeProviders: []string{"plain"}}, []string{"tools", "vision"}},
+		{"embeddings", Request{Alias: "chat", Embeddings: true, EstTokens: 10}, []string{"embed"}},
 		{"provider-prefixed alias", Request{Alias: "padi/chat", EstTokens: 10}, []string{"plain", "tools", "vision"}},
 	}
 	for _, tc := range cases {

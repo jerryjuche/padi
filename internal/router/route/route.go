@@ -11,14 +11,16 @@ import (
 
 // Request is the normalised view of a chat-completions request.
 type Request struct {
-	Alias     string
-	Stream    bool
-	HasTools  bool
-	HasImages bool
-	EstTokens int
-	SessionID string
-	Headers   map[string]string
-	Body      []byte
+	Alias            string
+	Stream           bool
+	HasTools         bool
+	HasImages        bool
+	Embeddings       bool
+	EstTokens        int
+	SessionID        string
+	Headers          map[string]string
+	ExcludeProviders []string
+	Body             []byte
 }
 
 // Router resolves aliases to ordered candidates.
@@ -28,12 +30,18 @@ type Router struct {
 
 func New(cfg *config.Config) *Router { return &Router{Cfg: cfg} }
 
-// Candidates returns enabled targets that can serve req, in priority order.
-func (r *Router) Candidates(req Request) ([]config.Target, error) {
-	alias := strings.TrimSpace(req.Alias)
+// NormalizeAlias removes an optional provider prefix from a model alias.
+func NormalizeAlias(alias string) string {
+	alias = strings.TrimSpace(alias)
 	if i := strings.LastIndex(alias, "/"); i >= 0 {
 		alias = alias[i+1:]
 	}
+	return alias
+}
+
+// Candidates returns enabled targets that can serve req, in priority order.
+func (r *Router) Candidates(req Request) ([]config.Target, error) {
+	alias := NormalizeAlias(req.Alias)
 	targets, ok := r.Cfg.Routes[alias]
 	if !ok {
 		return nil, fmt.Errorf("route: unknown alias %q", alias)
@@ -47,16 +55,22 @@ func (r *Router) Candidates(req Request) ([]config.Target, error) {
 		if !ok || !p.Enabled {
 			continue
 		}
+		if excluded(t.Provider, req.ExcludeProviders) {
+			continue
+		}
+		if req.Embeddings != t.Embeddings {
+			continue
+		}
 		if req.Stream && !p.SupportsStream {
 			continue
 		}
 		if req.HasTools && !p.SupportsTools {
 			continue
 		}
-		if req.HasImages && !p.SupportsImages {
+		if req.HasImages && !(p.SupportsImages || t.SupportsImages) {
 			continue
 		}
-		if p.MaxContext > 0 && req.EstTokens > p.MaxContext {
+		if p.MaxContext > 0 && !req.Embeddings && req.EstTokens > p.MaxContext {
 			continue
 		}
 		out = append(out, t)
@@ -66,4 +80,13 @@ func (r *Router) Candidates(req Request) ([]config.Target, error) {
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })
 	return out, nil
+}
+
+func excluded(provider string, list []string) bool {
+	for _, name := range list {
+		if strings.EqualFold(provider, name) {
+			return true
+		}
+	}
+	return false
 }

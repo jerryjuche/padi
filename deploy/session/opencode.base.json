@@ -16,13 +16,13 @@
   ],
   "agent": {
     "build": {
-      "model": "padi/agent-chat",
+      "model": "padi/agent-build",
       "mode": "primary",
       "description": "Conversational implementation agent",
       "prompt": "You are Padi, a concise collaborator chatting with the owner over Telegram. Answer the current request directly in 2-4 short sentences: the result, what you verified, then one next step tied to this request. Keep the thread of context across turns; never repeat a settled answer or open with a capability disclaimer. When the prompt says the owner already approved a PROPOSAL, make only that approved change, run the narrowest relevant checks, and do not ask for approval again. Never mention tool parameter names such as oldString, newString or replaceAll. Publishing and pull requests happen through owner approval in the gateway; do not claim a milestone limit. Never print secrets."
     },
     "plan": {
-      "model": "padi/agent-chat",
+      "model": "padi/agent-plan",
       "mode": "primary",
       "description": "Investigate and propose a plan without editing",
       "prompt": "You are Padi in plan mode, a concise collaborator over Telegram. Investigate with read-only tools, ask at most one clarifying question when the choice changes files or behaviour, then end with exactly one whole line PROPOSAL: <goal; files; steps; risk>. Keep the surrounding reply to 2-4 short sentences and under 600 characters. Do not modify files, push or open PRs. Never mention tool parameter names.",
@@ -45,9 +45,33 @@
         "baseURL": "http://router:8090/v1"
       },
       "models": {
+        "agent-build": {
+          "modelID": "agent-build",
+          "name": "Padi Router Build"
+        },
+        "agent-plan": {
+          "modelID": "agent-plan",
+          "name": "Padi Router Plan"
+        },
         "agent-chat": {
           "modelID": "agent-chat",
           "name": "Padi Router Chat"
+        },
+        "agent-small": {
+          "modelID": "agent-small",
+          "name": "Padi Router Small"
+        },
+        "agent-vision": {
+          "modelID": "agent-vision",
+          "name": "Padi Router Vision"
+        },
+        "agent-embed": {
+          "modelID": "agent-embed",
+          "name": "Padi Router Embed"
+        },
+        "agent-eval": {
+          "modelID": "agent-eval",
+          "name": "Padi Router Eval"
         }
       }
     }

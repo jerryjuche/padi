@@ -198,19 +198,24 @@ func copyHeaders(dst, src http.Header) {
 
 func parseUsage(chunk []byte) (usage, bool) {
 	var u usage
-	line := strings.TrimSpace(string(chunk))
-	line = strings.TrimPrefix(line, "data:")
-	line = strings.TrimSpace(line)
-	if !strings.HasPrefix(line, "{") {
-		return u, false
+	for _, raw := range strings.Split(string(chunk), "\n") {
+		line := strings.TrimSpace(raw)
+		line = strings.TrimPrefix(line, "data:")
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var envelope struct {
+			Usage usage `json:"usage"`
+		}
+		if json.Unmarshal([]byte(line), &envelope) != nil {
+			continue
+		}
+		if envelope.Usage.PromptTokens > 0 || envelope.Usage.CompletionTokens > 0 {
+			return envelope.Usage, true
+		}
 	}
-	var envelope struct {
-		Usage usage `json:"usage"`
-	}
-	if json.Unmarshal([]byte(line), &envelope) != nil {
-		return u, false
-	}
-	return envelope.Usage, true
+	return u, false
 }
 
 func writeSSEError(w http.ResponseWriter, flusher http.Flusher, message string) {
