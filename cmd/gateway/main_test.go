@@ -10,7 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jerryjuche/padi/internal/gateway/runner"
+	"github.com/jerryjuche/padi/internal/gateway/store"
 	"github.com/jerryjuche/padi/internal/gateway/telegram"
 )
 
@@ -458,6 +460,75 @@ func TestScrubForUser(t *testing.T) {
 	got := scrubForUser(fmt.Errorf("git Authorization: Bearer ghs_SECRET123 failed"))
 	if strings.Contains(got, "ghs_SECRET123") || !strings.Contains(got, "[REDACTED]") {
 		t.Fatalf("scrub=%q", got)
+	}
+}
+
+func TestStatusCardIsVisualAndEscaped(t *testing.T) {
+	sid := uuid.MustParse("11111111-1111-4111-8111-111111111111")
+	tid := uuid.MustParse("22222222-2222-4222-8222-222222222222")
+	chat := &chatSession{
+		repo: "owner/<repo>", mode: "build", session: store.Session{ID: sid},
+		handle: runner.Handle{ID: "container123456789"}, state: "AWAITING_PLAN_APPROVAL",
+		lastUsed: time.Now(),
+		lastTask: taskRecord{ID: tid.String(), Prompt: "Read <b>README</b>", Outcome: "waiting"},
+	}
+	app := &application{chats: map[int64]*chatSession{7: chat}, tasks: make(chan taskJob, 2)}
+	card := app.statusCard(context.Background(), 7)
+	for _, want := range []string{
+		"PADI / CONTROL CENTER", "owner/&lt;repo&gt;", "BUILD",
+		"22222222", "Read &lt;b&gt;README&lt;/b&gt;", "⏸",
+		"AWAITING_PLAN_APPROVAL", "container123…", "Tap Approve contract",
+	} {
+		if !strings.Contains(card, want) {
+			t.Fatalf("status card missing %q:\n%s", want, card)
+		}
+	}
+	if strings.Contains(card, "<repo>") {
+		t.Fatal("status card did not escape dynamic repo text")
+	}
+	empty := app.statusCard(context.Background(), 99)
+	if !strings.Contains(empty, "— none —") || !strings.Contains(empty, "Explore next") {
+		t.Fatalf("empty status card missing guidance:\n%s", empty)
+	}
+}
+
+func TestStatusVisualTable(t *testing.T) {
+	cases := []struct {
+		state string
+		icon  string
+		bar   string
+	}{
+		{"QUEUED", "◌", "░░░░░░░░"},
+		{"awaiting_plan_approval", "⏸", "████░░░░"},
+		{"EXECUTING", "▶", "██████░░"},
+		{"DONE", "✅", "████████"},
+		{"unknown", "○", "░░░░░░░░"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.state, func(t *testing.T) {
+			icon, bar := statusVisual(tc.state)
+			if icon != tc.icon || bar != tc.bar {
+				t.Fatalf("visual=%s/%s want %s/%s", icon, bar, tc.icon, tc.bar)
+			}
+		})
+	}
+}
+
+func TestOwnerErrorText(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"network", fmt.Errorf("start container: %w", runner.ErrNetworkNotInternal), "private session network"},
+		{"generic", fmt.Errorf("clone failed"), "Check the repo name"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ownerErrorText(tc.err); !strings.Contains(got, tc.want) {
+				t.Fatalf("owner text=%q want %q", got, tc.want)
+			}
+		})
 	}
 }
 

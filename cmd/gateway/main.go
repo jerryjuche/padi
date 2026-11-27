@@ -257,10 +257,30 @@ func (c *chatSession) end() {
 	c.mu.Unlock()
 }
 
+type chatSnapshot struct {
+	Repo      string
+	Mode      string
+	SessionID uuid.UUID
+	LastUsed  time.Time
+	Busy      bool
+	State     string
+	Container string
+	Task      taskRecord
+}
+
 func (c *chatSession) detail() (repo, mode string, sessionID uuid.UUID, lastUsed time.Time, busy bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.repo, c.mode, c.session.ID, c.lastUsed, c.busy
+}
+
+func (c *chatSession) snapshot() chatSnapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return chatSnapshot{
+		Repo: c.repo, Mode: c.mode, SessionID: c.session.ID, LastUsed: c.lastUsed,
+		Busy: c.busy, State: c.state, Container: c.handle.ID, Task: c.lastTask,
+	}
 }
 
 func (c *chatSession) setState(state string) {
@@ -614,6 +634,13 @@ func validRepo(repo string) bool {
 	return strings.Count(repo, "/") >= 1
 }
 
+// peekRepo shows a repo waiting for its first prompt without consuming it.
+func (a *application) peekRepo(chatID int64) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.pending[chatID]
+}
+
 func (a *application) rememberRepo(chatID int64, repo string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -909,7 +936,7 @@ func (a *application) handleCallback(ctx context.Context, q *telegram.CallbackQu
 		a.rememberMode(chatID, modeBuild)
 		return a.replyToCallback(ctx, q, "New topic. Tell me what you'd like to work on, or send clone <repo> to open a repository.", a.buttons(chatID, "empty", ""))
 	case data == "status":
-		return a.replyToCallback(ctx, q, a.statusText(chatID), a.buttonsForChat(chatID))
+		return a.replyHTMLToCallback(ctx, q, a.statusCard(ctx, chatID), statusButtons())
 	case data == "help":
 		return a.replyToCallback(ctx, q, a.helpText(), a.buttonsForChat(chatID))
 	case strings.HasPrefix(data, "ap:"):
@@ -1056,23 +1083,162 @@ func (a *application) help(ctx context.Context, chatID int64) error {
 	return a.replyKeyboard(ctx, chatID, a.helpText(), a.buttonsForChat(chatID))
 }
 
-func (a *application) statusText(chatID int64) string {
-	chat := a.getChat(chatID)
-	text := "No active workspace. Chat normally, or send clone <repo> to open a repository."
-	if chat != nil {
-		repo, mode, sessionID, last, busy := chat.detail()
-		state := "idle"
-		if busy {
-			state = "working"
-		}
-		text = fmt.Sprintf("Workspace: %s\nMode: %s\nState: %s\nSession: %s\nLast used: %s ago",
-			repo, mode, state, sessionID.String(), time.Since(last).Round(time.Second))
+func shortID(value string, n int) string {
+	if value == "" {
+		return "—"
 	}
-	return text
+	if len(value) <= n {
+		return value
+	}
+	return value[:n] + "…"
+}
+
+func clipText(value string, n int) string {
+	value = strings.Join(strings.Fields(value), " ")
+	if len(value) <= n {
+		return value
+	}
+	return value[:n-1] + "…"
+}
+
+// statusVisual gives a compact, scannable state indicator. The bar is visual
+// only; the authoritative state is the text label beside it.
+func statusVisual(state string) (icon, bar string) {
+	switch strings.ToUpper(strings.TrimSpace(state)) {
+	case "QUEUED":
+		return "◌", "░░░░░░░░"
+	case "PREPARING", "PLANNING", "RUNNING":
+		return "◍", "██░░░░░░"
+	case "AWAITING_PLAN_APPROVAL":
+		return "⏸", "████░░░░"
+	case "EXECUTING", "FIXING":
+		return "▶", "██████░░"
+	case "VERIFYING":
+		return "◓", "███████░"
+	case "AWAITING_PUSH_APPROVAL", "PR_OPENED", "PREVIEWING":
+		return "⏸", "████████"
+	case "PUSHING":
+		return "⇧", "████████"
+	case "DONE":
+		return "✅", "████████"
+	case "FAILED":
+		return "⛔", "████████"
+	case "CANCELLED":
+		return "⊘", "░░░░░░░░"
+	case "TIMED_OUT":
+		return "⌛", "░░░░░░░░"
+	default:
+		return "○", "░░░░░░░░"
+	}
+}
+
+func statusButtons() [][]telegram.InlineButton {
+	return [][]telegram.InlineButton{
+		{
+			{Text: "↻ Refresh", CallbackData: "status"},
+			{Text: "Plan", CallbackData: "mode:plan"},
+			{Text: "Build", CallbackData: "mode:build"},
+		},
+		{
+			{Text: "Research", CallbackData: "mode:research"},
+			{Text: "Help", CallbackData: "help"},
+			{Text: "New", CallbackData: "new"},
+		},
+	}
+}
+
+// statusCard builds a trusted HTML card. Every dynamic value is escaped; only
+// the fixed markup and status glyphs are written directly.
+func (a *application) statusCard(ctx context.Context, chatID int64) string {
+	esc := html.EscapeString
+	var snap chatSnapshot
+	if chat := a.getChat(chatID); chat != nil {
+		snap = chat.snapshot()
+	}
+	repo := snap.Repo
+	if repo == "" {
+		repo = a.peekRepo(chatID)
+	}
+	mode := snap.Mode
+	if mode == "" {
+		mode = a.currentMode(chatID)
+	}
+	if mode == "" {
+		mode = "chat"
+	}
+	state := snap.State
+	if snap.Busy {
+		state = "RUNNING"
+	}
+	if state == "" {
+		state = "IDLE"
+	}
+	task := snap.Task
+	if a.db != nil && task.ID != "" {
+		if id, err := uuid.Parse(task.ID); err == nil {
+			if current, err := a.db.GetTask(ctx, id); err == nil {
+				state = string(current.State)
+				if current.Prompt != "" {
+					task.Prompt = current.Prompt
+				}
+			}
+		}
+	}
+	icon, bar := statusVisual(state)
+	sessionText := "—"
+	if snap.SessionID != uuid.Nil {
+		sessionText = shortID(snap.SessionID.String(), 8)
+	}
+	repoText := "— none —"
+	if repo != "" {
+		repoText = repo
+	}
+	taskText := "— none —"
+	if task.ID != "" {
+		taskText = shortID(task.ID, 8) + "  " + clipText(task.Prompt, 60)
+	}
+	containerText := "stopped"
+	if snap.Container != "" {
+		containerText = shortID(snap.Container, 12)
+	}
+	queued := 0
+	if a.tasks != nil {
+		queued = len(a.tasks)
+	}
+	next := "Send a repo and task, or chat normally."
+	switch strings.ToUpper(state) {
+	case "AWAITING_PLAN_APPROVAL":
+		next = "Tap Approve contract to start the read-only plan."
+	case "AWAITING_PUSH_APPROVAL":
+		next = "Tap Approve push, then Approve PR, to publish the draft."
+	case "RUNNING", "EXECUTING", "VERIFYING", "PUSHING", "PREPARING", "PLANNING":
+		next = "Work is active. Tap Refresh for a new snapshot."
+	case "FAILED", "TIMED_OUT":
+		next = "Send /new or ask me to continue locally."
+	}
+
+	var b strings.Builder
+	b.WriteString("<b>PADI / CONTROL CENTER</b>\n")
+	b.WriteString("<i>" + esc(time.Now().UTC().Format("02 Jan 15:04 UTC")) + " · live snapshot</i>\n\n")
+	b.WriteString("▸ <b>Repo</b>      <code>" + esc(repoText) + "</code>\n")
+	b.WriteString("▸ <b>Mode</b>      " + esc(strings.ToUpper(mode)) +
+		"   <b>Session</b> <code>" + esc(sessionText) + "</code>\n")
+	b.WriteString("▸ <b>Task</b>      <code>" + esc(taskText) + "</code>\n")
+	b.WriteString("▸ <b>State</b>      " + icon + " <b>" + esc(strings.ToUpper(state)) + "</b>\n")
+	b.WriteString("                <code>" + bar + "</code>\n")
+	b.WriteString("▸ <b>Sandbox</b>   " + esc(containerText) +
+		"   <b>Queue</b> " + fmt.Sprintf("%d", queued) + "\n")
+	if task.Outcome != "" {
+		b.WriteString("▸ <b>Last</b>      <code>" + esc(clipText(task.Outcome, 72)) + "</code>\n")
+	}
+	b.WriteString("\n<b>Explore next</b>\n• " + esc(next) + "\n")
+	b.WriteString("• /status refresh · /plan · /build · /research · /new\n")
+	return b.String()
 }
 
 func (a *application) status(ctx context.Context, chatID int64) error {
-	return a.replyKeyboard(ctx, chatID, a.statusText(chatID), a.buttonsForChat(chatID))
+	_, err := a.tg.SendMessageKeyboard(ctx, chatID, a.statusCard(ctx, chatID), statusButtons())
+	return err
 }
 
 // replyToCallback edits the tapped message when Telegram supplied a message ID,
@@ -1087,6 +1253,20 @@ func (a *application) replyToCallback(ctx context.Context, q *telegram.CallbackQ
 		chatID = q.Message.Chat.ID
 	}
 	return a.replyKeyboard(ctx, chatID, text, rows)
+}
+
+// replyHTMLToCallback edits or sends a pre-built trusted HTML card. Callers
+// must escape every dynamic value before passing text here.
+func (a *application) replyHTMLToCallback(ctx context.Context, q *telegram.CallbackQuery, text string, rows [][]telegram.InlineButton) error {
+	if q != nil && q.Message != nil && q.Message.MessageID != 0 {
+		return a.tg.EditMessageTextKeyboard(ctx, q.Message.Chat.ID, q.Message.MessageID, text, rows)
+	}
+	chatID := int64(0)
+	if q != nil && q.Message != nil {
+		chatID = q.Message.Chat.ID
+	}
+	_, err := a.tg.SendMessageKeyboard(ctx, chatID, text, rows)
+	return err
 }
 
 // startTask creates the audit task and either opens a fresh workspace or reuses
@@ -1173,6 +1353,9 @@ func (a *application) startTask(ctx context.Context, chatID int64, c command, ke
 	}
 	if !accepted {
 		return nil
+	}
+	if err := a.beginExecution(ctx, task.ID); err != nil {
+		return a.reportError(ctx, chatID, err)
 	}
 
 	taskCtx, taskCancel := context.WithTimeout(ctx, 20*time.Minute)
@@ -1290,14 +1473,20 @@ func (a *application) beginExecution(ctx context.Context, taskID uuid.UUID) erro
 	if err != nil {
 		return err
 	}
+	var from store.State
 	switch current.State {
-	case store.StateAwaitingPlanApproval:
-		return a.db.Transition(ctx, taskID, store.StateAwaitingPlanApproval, store.StateExecuting, "")
-	case store.StatePreparing:
-		return a.db.Transition(ctx, taskID, store.StatePreparing, store.StateExecuting, "")
+	case store.StateAwaitingPlanApproval, store.StatePreparing:
+		from = current.State
+	case store.StateExecuting:
+		return nil // idempotent: the pre-container call already advanced it
 	default:
 		return fmt.Errorf("%w: %s -> %s", store.ErrBadState, current.State, store.StateExecuting)
 	}
+	if err := a.db.Transition(ctx, taskID, from, store.StateExecuting, "agent_start"); err != nil &&
+		!errors.Is(err, store.ErrStaleState) {
+		return err
+	}
+	return nil
 }
 
 func (a *application) runTask(ctx context.Context, chat *chatSession, session store.Session, task store.Task, chatID int64, agentName, agentPrompt, priorContext string) (string, error) {
@@ -1387,12 +1576,21 @@ func (a *application) replyKeyboard(ctx context.Context, chatID int64, text stri
 	return err
 }
 
+// ownerErrorText turns a small set of infra failures into an actionable card.
+// Raw Docker, SQL and token details stay in the server log only.
+func ownerErrorText(err error) string {
+	if errors.Is(err, runner.ErrNetworkNotInternal) {
+		return "Sandbox check failed: the private session network is not isolated. " +
+			"Nothing was changed or started. The operator has been alerted; retry after the network is recreated."
+	}
+	return "I couldn't start that task. Check the repo name and try again, or send /help."
+}
+
 // reportError tells the owner what happened and marks the update as handled so
 // the poller does not replay it. Details stay in the server log.
 func (a *application) reportError(ctx context.Context, chatID int64, err error) error {
 	log.Printf("gateway: update failed: %v", scrubForUser(err))
-	message := "I couldn't start that task. Check the repo name and try again, or send /help."
-	if _, sendErr := a.tg.SendMessage(ctx, chatID, html.EscapeString(message)); sendErr != nil {
+	if _, sendErr := a.tg.SendMessage(ctx, chatID, html.EscapeString(ownerErrorText(err))); sendErr != nil {
 		return fmt.Errorf("telegram: send error reply: %w", sendErr)
 	}
 	return &telegram.ReportedError{Err: err}

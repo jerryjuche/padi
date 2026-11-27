@@ -1429,3 +1429,66 @@ Two contract approvals (`630b270e`, `1ac2c5d0`) are still `pending` and unexpire
 ### Next
 
 Owner: tap **Approve contract** on the active card, then continue with Execute and the push/PR gates. Coding agent: no push unless approved.
+
+---
+
+## 25. Visual status card and sandbox network repair (2026-11-27)
+
+### Cause
+
+The owner-approved task `0d71706d` reached the agent-start stage after the callback fix, then failed with a raw Docker error:
+
+```
+2026/11/27 11:22:20 gateway: task 0d71706d-... failed: start container: runner: network "agent-session-net" is not internal; recreate it before starting sessions
+```
+
+The network had been created before M3a without `--internal`; the runner correctly refused to weaken isolation. Two follow-on problems were found in the trace:
+
+- `reportError` sent the raw Docker sentence to Telegram. It was accurate but not actionable.
+- `beginExecution` was only called inside `runTask`, after container creation. A container-start failure therefore tried `AWAITING_PLAN_APPROVAL -> FAILED`, which is not a legal transition, and the task stayed visually stuck.
+- `/status` was a four-line plain-text snapshot with no task state, approval hint, queue depth or mode controls.
+
+### Fix
+
+- Recreated `agent-session-net` as `driver=bridge`, `internal=true`, preserving `172.20.0.0/16` and gateway `172.20.0.1` so the container-to-router bridge URL stays valid.
+- Added `runner.ErrNetworkNotInternal`; `ownerErrorText` now sends an actionable, secret-free Telegram message and leaves the raw cause in the server log.
+- Made `beginExecution` idempotent and called it before clone/container start, so an approved contract is marked `EXECUTING` before any infra can fail.
+- Replaced `/status` and the Status button with an HTML control center: repo, mode, session, task ID/prompt, state icon and progress bar, container ID, queue depth, last outcome, and a state-aware “Explore next” hint. Mode/Refresh/Help/New buttons are attached.
+- Every dynamic card value is HTML-escaped before insertion; only fixed markup and glyphs are trusted.
+
+### Evidence
+
+```
+$ docker network inspect agent-session-net --format 'internal={{.Internal}} subnet={{range .IPAM.Config}}{{.Subnet}} gateway={{.Gateway}}{{end}}'
+internal=true subnet=172.20.0.0/16 gateway=172.20.0.1
+
+$ docker run --rm --network agent-session-net --entrypoint sh sandbox-agent-session:latest -c '...'
+router HTTP 200
+external blocked
+
+$ tail -1 /tmp/opencode/padi-gateway.log
+2026/11/27 11:32:22 gateway: ready (chat=padi/agent-chat, build=padi/agent-build, plan=padi/agent-plan, network=agent-session-net)
+
+$ gofmt -l cmd internal      # no output
+$ GOPROXY=off go vet ./...   # no output
+$ GOPROXY=off go test -race -count=1 ./...
+ok  github.com/jerryjuche/padi/cmd/gateway  2.022s
+ok  github.com/jerryjuche/padi/internal/gateway/runner 1.790s
+ok  github.com/jerryjuche/padi/internal/gateway/store  1.177s
+(all other packages ok)
+
+$ scripts/dbaccess_test.sh | tail -1
+dbaccess_test: anon key cannot read any agent table (16 checked)
+$ scripts/m3b-smoke.sh | tail -1
+m3b-smoke: PASS M3b smoke (no live PR, no secrets used)
+```
+
+New tests: `TestStatusCardIsVisualAndEscaped`, `TestStatusVisualTable`, `TestOwnerErrorText`. They verify the visual card, escaping of hostile repo/prompt text, state glyphs and the friendly network failure message.
+
+### Owner note
+
+The three earlier `jerryjuche/koder` approvals are now expired or stale (`0d71706d` was approved before the network repair but never resumed). Send a fresh `clone jerryjuche/koder and read the readme` request, tap the new **Approve contract**, then send `/status` at any time for the visual card. No push was made.
+
+### Next
+
+Owner: fresh contract tap -> Execute -> push/PR gates. Exploration candidates after the live gate: timeline view, approval inbox, per-repo dashboard, queue/cost panel and incident history.

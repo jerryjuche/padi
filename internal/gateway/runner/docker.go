@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -16,6 +17,11 @@ import (
 	"strings"
 	"time"
 )
+
+// ErrNetworkNotInternal identifies the safe failure when an existing session
+// network would allow outbound routes. Callers can turn it into an actionable
+// owner message without exposing raw Docker errors to Telegram.
+var ErrNetworkNotInternal = errors.New("runner: session network is not internal")
 
 // Docker is a minimal Docker Engine API client over the rootless socket.
 // It uses only stdlib and the unversioned API paths supported by Docker 29.
@@ -446,7 +452,7 @@ func (d *Docker) EnsureNetwork(ctx context.Context, name string, internal bool) 
 			return decodeErr
 		}
 		if internal && !info.Internal {
-			return fmt.Errorf("runner: network %q is not internal; recreate it before starting sessions", name)
+			return fmt.Errorf("%w: %q", ErrNetworkNotInternal, name)
 		}
 		return nil
 	}
