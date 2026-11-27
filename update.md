@@ -1670,7 +1670,7 @@ There was also only one effective workspace model: all aliases used NVIDIA, and 
 
 ### Fix
 
-- Added `container.router_host_ip` and mapped `router -> 172.20.0.1` into every container with Docker `ExtraHosts`. The network stays `internal=true`; no egress was opened.
+- `config/gateway.yaml` leaves `container.router_host_ip` unset for portability: Compose runs a real `router` container and Docker DNS resolves it. On this host-bridge runtime the launcher sets `PADI_ROUTER_HOST_IP=172.20.0.1`; `cmd/gateway/main.go` applies it to `cfg.Container.RouterHostIP`, and the runner passes Docker `ExtraHosts router:172.20.0.1` into session containers. The network stays `internal=true`; the alias opens no egress.
 - Added an OpenCode activity probe every 15s. The live card now shows `♥ alive`, retry count and the last transport error even when the model is silent. After 6 retries the gateway fails the task instead of waiting indefinitely.
 - Added a `think` role using NVIDIA `agent-think` (small reasoning model). Unapproved work now runs `think → plan` in one OpenCode session; each role receives an explicit `HANDOFF` note. The owner's **Execute** tap still gates `plan → execute`, and the executor receives the approved PROPOSAL as a named handoff.
 - Added `agent-think` to router config and the session image; rebuilt `sandbox-agent-session:latest` with 8 model aliases and the custom read-only think agent.
@@ -1679,6 +1679,18 @@ There was also only one effective workspace model: all aliases used NVIDIA, and 
 ### Evidence
 
 ```bash
+$ grep -n 'PADI_ROUTER_HOST_IP' config/gateway.yaml
+29:  # Host-bridge runtime only: set PADI_ROUTER_HOST_IP to pin "router" to the
+
+$ grep -n 'PADI_ROUTER_HOST_IP' /tmp/opencode/start-padi.sh
+26: export PADI_ROUTER_HOST_IP=172.20.0.1
+
+$ grep -n 'cfg.Container.RouterHostIP' cmd/gateway/main.go
+68:  cfg.Container.RouterHostIP = ip
+
+$ grep -n 'spec.ExtraHosts' internal/gateway/runner/runner.go
+163:  spec.ExtraHosts = []string{host + ":" + ip}
+
 $ docker run --add-host router:172.20.0.1 ... sandbox-agent-session:latest
 dns: 172.20.0.1      router
 health: HTTP 200
@@ -1706,3 +1718,23 @@ router ready (listen=:8090, aliases=[agent-build agent-plan agent-chat agent-sma
 ### Next
 
 Owner: send a fresh `clone jerryjuche/koder and read the readme`, tap **Approve contract**, then watch `/options` for `Thinking → Agent planning → Agent executing`. No push.
+
+---
+
+## 30. Documentation sync (2026-11-27)
+
+### Done
+
+- Refreshed `README.md`, `BUILD_SPEC.md`, `CONTRACT.md` and the files under `docs/` so the written contract matches the current think/plan/execute runtime and router-host behaviour.
+- Marked `audit.md` as a historical snapshot at `cb027ca`, with current status through local commit `1a3fab8`, the uncommitted doc/runtime consistency edits, and `origin` at `9abe2a4` before the owner-authorized branch push.
+- Updated `deploy/session/AGENTS.target.md` with role-specific think/plan/execute instructions, including the `HANDOFF:` line for the think role and approval-only execution.
+- Updated `deploy/docker-compose.yml` comments to distinguish Compose's real router container and Docker DNS from the host-bridge `PADI_ROUTER_HOST_IP=172.20.0.1` / `ExtraHosts` alias; `agent-session-net` remains `internal: true`.
+- Corrected §29 to state that `config/gateway.yaml` leaves `router_host_ip` unset for portability and that only the host launcher pins the alias.
+
+### Evidence status
+
+Final gates rerun before commit: `gofmt -l cmd internal` (no output), `GOPROXY=off go vet ./...`, `GOPROXY=off go test -race -count=1 ./...`, `scripts/m3b-smoke.sh` (`PASS M3b smoke (no live PR, no secrets used)`) and `scripts/dbaccess_test.sh` (`anon key cannot read any agent table (16 checked)`) were green. YAML files parse cleanly.
+
+### Next
+
+Git push is owner-authorized and limited to `agent/m0-audit-fixes-b53482d`; no PR is opened. Owner: complete the genuine in-app Telegram E2E gate, key/row cleanup and VM drills; coding agent: start M5 only after owner go-ahead.

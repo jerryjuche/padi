@@ -73,8 +73,8 @@ func TestOpenCodeAliasMapping(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Container.RouterHostIP != "172.20.0.1" {
-		t.Fatalf("router_host_ip=%q", c.Container.RouterHostIP)
+	if c.Container.RouterHostIP != "" {
+		t.Fatalf("router_host_ip should be empty in the portable config, got %q", c.Container.RouterHostIP)
 	}
 	for _, tc := range []struct {
 		name, got, want string

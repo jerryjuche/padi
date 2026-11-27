@@ -62,6 +62,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// Host-bridge runtime only. Compose has a real router container and must
+	// leave this unset so Docker DNS resolves "router" normally.
+	if ip := strings.TrimSpace(os.Getenv("PADI_ROUTER_HOST_IP")); ip != "" {
+		cfg.Container.RouterHostIP = ip
+	}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 

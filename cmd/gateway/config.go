@@ -162,7 +162,6 @@ func defaults() Config {
 	c.Container.CPUs = 1
 	c.Container.Pids = 512
 	c.Container.Network = "agent-session-net"
-	c.Container.RouterHostIP = "172.20.0.1"
 	c.Container.BundleMaxMB = 200
 	c.OpenCode.Model = "padi/agent-build"
 	c.OpenCode.RouterBaseURL = "http://router:8090/v1"

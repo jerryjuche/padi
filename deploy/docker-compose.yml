@@ -2,6 +2,12 @@
 # default route; router and egress-proxy are the only bridges outward.
 # Secrets come from deploy/.env (gitignored) or the host environment. Nothing
 # here contains a token, key or DSN.
+#
+# This Compose topology has a real `router` container on `agent-session-net`,
+# so session containers resolve `router` through Docker DNS. The host-bridge
+# runtime instead sets PADI_ROUTER_HOST_IP=172.20.0.1 and passes ExtraHosts
+# `router:172.20.0.1` into session containers. That alias opens no egress;
+# `agent-session-net` remains `internal: true`.
 services:
   router:
     build:

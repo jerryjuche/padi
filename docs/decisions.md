@@ -2,7 +2,7 @@
 
 Authoritative summary lives in `README.md` §17 and `BUILD_SPEC.md` §8[cite: 2, 4]. Every `VERIFY` item must be tested against the real environment and recorded here with date and command/output evidence before building on it[cite: 2].
 
-## Architectural Decisions (D1–D39)
+## Architectural Decisions (D1–D43)
 
 | # | Decision | Status | Reference |
 |---|---|---|---|
@@ -12,8 +12,12 @@ Authoritative summary lives in `README.md` §17 and `BUILD_SPEC.md` §8[cite: 2,
 | D25–D29 | Supabase authoritative + nightly Object Storage dumps, memory-floor `keepalive` primary anti-reclaim lever, task contract + confirmed incident log, Phase 8 interactive browser opt-in | Adopted | `README.md` §7.7, §7.8, §11.8, §11.9[cite: 4] |
 | D30–D38 | Pinned/hashed read-only skills, Go+Postgres `memory.Store` with provenance/trust (Hard Rule 10), SearxNG on `agent-net`, low-priority routines, request-changes loop, reverse-proxy credential injection, offline `osv-scanner` + `gitleaks`, 300 MB DB size alert | Adopted | `README.md` §7.10–§7.13, §9.4, §12[cite: 4] |
 | D39 | Conversational-first Telegram broker: normal messages use the router directly with per-chat memory and no container/repo; a repo is requested only when the model marks real workspace work; every build turn is read-only plan + `PROPOSAL` until the owner taps Execute; `default_repo` is compatibility-only | Adopted | `cmd/gateway/directchat.go`, `cmd/gateway/main.go`, `deploy/session/AGENTS.target.md`, `update.md` §21 |
+| D40 | `/options` is a bounded, escaped rolling live trace (phase track, tools, files, errors, elapsed time, tokens) that edits one Telegram card and rebuilds the last 18 events from durable `agent.events` for finished/failed tasks after the container closes | Adopted | `internal/gateway/telegram`, `cmd/gateway/main.go`, `update.md` §28 |
+| D41 | A 15 s OpenCode activity probe makes silent model waits observable (`♥ alive`, retry count, last error); after 6 retries the gateway fails the task instead of waiting forever | Adopted | `cmd/gateway/main.go`, `internal/gateway/telegram`, `update.md` §29 |
+| D42 | One OpenCode session carries explicit `think → plan → execute` role handoffs; unapproved work runs `think → plan`, and only the owner's Execute tap gates `plan → execute` with the approved PROPOSAL passed as a named handoff. Session image rebuilt with 8 aliases and a read-only custom `think` agent | Adopted | `deploy/session/AGENTS.target.md`, `deploy/session/opencode.base.json`, `update.md` §29 |
+| D43 | Host-bridge runtime sets `PADI_ROUTER_HOST_IP=172.20.0.1`; the gateway adds Docker `ExtraHosts` `router:172.20.0.1` to session containers while `agent-session-net` stays `internal=true`. Compose deployments use a real `router` container and Docker DNS instead | Adopted | `config/gateway.yaml`, `internal/gateway/runner`, `deploy/docker-compose.yml`, `update.md` §29 |
 
-## Open Verifications (`VERIFY` V1–V23)
+## Open Verifications (`VERIFY` V1–V24)
 
 | # | Target | Milestone | Status | Date | Evidence |
 |---|---|---|---|---|---|
@@ -86,14 +90,14 @@ No Groq, OpenRouter or DeepSeek key exists on this host, so those model IDs were
 
 ## M2 implementation decisions and acceptance (2026-11-24)
 
-- **Router-only routing.** `config/gateway.yaml` now names `padi/agent-chat` and `http://router:8090/v1`. `deploy/session/opencode.base.json` defines exactly one provider, `padi`, using `@opencode/ai/providers/openai-compatible`, `ROUTER_TOKEN` and the router base URL. NVIDIA/Groq providers and their keys were removed from session containers; the gateway injects only `ROUTER_TOKEN` and the router base URL.
+- **Router-only routing.** `config/gateway.yaml` names `padi/agent-chat` (plus the later per-role aliases) and `http://router:8090/v1`. `deploy/session/opencode.base.json` defines one provider family, `padi`, using `@opencode/ai/providers/openai-compatible`, `ROUTER_TOKEN` and the router base URL. NVIDIA/Groq providers and their keys were removed from session containers; the gateway injects only `ROUTER_TOKEN` and the router base URL. The current session image has 8 aliases: `agent-build`, `agent-plan`, `agent-chat`, `agent-small`, `agent-think` and `agent-vision` enabled on NVIDIA, with `agent-embed` and `agent-eval` disabled[cite: update.md §23, §29].
 - **Concurrency queues instead of rejecting.** `limiter.Sem.Acquire(ctx)` blocks until a slot is free (bounded by `queue_max_wait`). The first hammer run with concurrency 1 produced 9×503 because `TryAcquire` rejected parallel requests; after this fix the same 10-request hammer returned 10×200. Delays, never failures, as the spec requires.
 - **429 cooldown escalation.** No `Retry-After` → configured steps `1s, 2s, 5s, 15s, 1m`, one step per 429 response. With `Retry-After` present, the upstream value wins. Total exhaustion returns 503 with the soonest cooldown end in `Retry-After`.
 - **Breaker isolated.** Circuit-breaker state lives in `internal/router/breaker` with its own `-race` table tests; only retryable failures count. 429 uses the cooldown map, 4xx never opens the breaker.
 - **Chat style.** Owner chose concise collaborator, one natural clarifying question, contextual buttons, and "say the M1 limit, then do the local part". This is enforced in `AGENTS.target.md`, both agent prompts, `modePrompt` and a renderer filter that drops tool-parameter jargon from final replies.
 - **Router URL must be container-reachable.** A local override of `http://127.0.0.1:8090/v1` made session tasks fail with `ECONNREFUSED`; inside a container that address is itself. Production uses the compose service name `router:8090`; local runs use the bridge gateway `172.20.0.1:8090`.
 - **Telegram tokens never in logs.** `net/http` transport errors include the full `api.telegram.org/bot<token>/...` URL. A `redactedError` wrapper scrubs the token while keeping `errors.Is` working.
-- **Placeholder discipline.** Only `agent-chat` → NVIDIA `nvidia/nemotron-3.5-bolt-e4b` is enabled. `agent-vision`, `agent-eval`, Groq, OpenRouter and DeepSeek targets remain `<placeholder>` and are disabled at startup with warnings. `/status` exposes counters only; no token, key or base URL.
+- **Placeholder discipline.** The starting `agent-chat` target was NVIDIA `nvidia/nemotron-3.5-bolt-e4b`; current enabled aliases are `agent-build`, `agent-plan`, `agent-chat`, `agent-small`, `agent-think` and `agent-vision`. `agent-embed` stays `<placeholder>`/disabled (the probed model was 2048d, not the required 384d); `agent-eval` is disabled on purpose and returns 503 `eval_provider_isolation` rather than judging NVIDIA work with NVIDIA. Groq, OpenRouter and DeepSeek targets remain `<placeholder>` and disabled at startup with warnings. `/status` exposes counters only; no token, key or base URL[cite: update.md §23].
 
 ## M3a pre-code verification (2026-11-24)
 
@@ -207,7 +211,7 @@ Decisions from defects found in the real drill:
 - The writable tmpfs is `/home/agent/.config`, not `/home/agent`, so the installed `opencode` binary stays visible.
 - Explicit `PATH` and `HOME` are injected because the container API replaces the image environment.
 - The fixed export script writes its bundle to `/workspace/.padi-task.bundle` because Docker cannot copy out of a runtime tmpfs; it deletes that file before every export so it is never committed.
-- Image rebuilt after these changes: `sandbox-agent-session:latest` = `sha256:24ff03b73b5e4b336adea2afac2355569eb369df80092953378877a9d3bf5a84`.
+- Image rebuilt locally after these changes; verify the current digest with `docker image inspect sandbox-agent-session:latest --format '{{.Id}}'` (the image has been rebuilt again since M3a[cite: update.md §27, §29]).
 
 ## V15 large-repository resolution (2026-11-24, before M3b code)
 
@@ -245,10 +249,12 @@ Verification evidence:
 - `scripts/dbaccess_test.sh` passes for all 16 `agent` tables, including `egress_allow` and `session_checkpoints`.
 - `scripts/m3b-smoke.sh` ends with `PASS M3b smoke (no live PR, no secrets used)`.
 - `GOPROXY=off go vet ./...` and `GOPROXY=off go test -race -count=1 ./...` are green.
-- Session image rebuilt with both fixed scripts and `agent-verify`: `sandbox-agent-session:latest = sha256:6c745ef9dfbacd8fafa920139c67bbcee44293b946d2ce9b642e667980a410da`.
+- Session image rebuilt locally with both fixed scripts and `agent-verify`; verify the current digest with `docker image inspect sandbox-agent-session:latest --format '{{.Id}}'` (subsequent M4-era rebuilds supersede the M3b image[cite: update.md §27, §29]).
 - An independent audit found five trust gaps before acceptance; all five were fixed with regression tests: dual approvals no longer deadlock and no extra message is sent while the second gate is pending, a 100% budget aborts with a checkpoint, owner off-limits paths stop a task on `file_change`, contract approval uses `AWAITING_PLAN_APPROVAL`, and verifier output is cleared so a stale verdict or non-zero wait is `unverifiable`.
 
 Live PR remains deliberately unopened: the owner has not supplied a genuine Telegram decision for a target repository installation, and no approval is forged in code or tests.
+
+Post-M3b/M4 evidence is in `update.md` §§23–29: M4 router/trust hardening and the §2.5 report, contract-approval callback repair, visual status card and internal-network repair, container-startup crash fix, stale-image/workspace-ownership/orphan-container fixes, `/options` rolling live trace with durable events, and silent-retry/role-handoff repairs. Status: M0–M4 implemented locally; the in-app push/PR flow is pending genuine owner Telegram taps, a git push to the audit branch is owner-authorized, and no draft PR exists. Do not start M5 without the owner's go-ahead.
 
 ## M0 VM-only deferral — owner Option B (2026-11-23)
 

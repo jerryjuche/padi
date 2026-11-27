@@ -1,6 +1,6 @@
 # Sandbox Agent: Decision Record v2 (Oct 19, 2026)
 
-> Source: the owner's own research, copied into the repository as input. It is **context, not the specification**. Where it differs from `README.md` v0.6 or `BUILD_SPEC.md` v1.2, those win. The reconciliation table at the end says what was adopted, what changed and why.
+> Source: the owner's own research, copied into the repository as input. It is **context, not the specification**. Where it differs from `README.md` v0.7 or `BUILD_SPEC.md` v1.3, those win. The reconciliation table at the end says what was adopted, what changed and why.
 
 ## Product
 Personal coding agent driven from Telegram and web chat. Core loop: I name a repo and describe the issue in plain language. The agent clones it, investigates, fixes, verifies, then opens a PR with a markdown report for my review. A life-assistant mode comes later.
@@ -62,12 +62,12 @@ Lessons file from the incident log, post-merge watch, one reviewer pass, replay 
 
 | Record item | Status | Where it lives | Note |
 |---|---|---|---|
-| Oracle Always Free, 2 OCPU Arm, 12 GB, no PAYG | Adopted | README header, 11.8, 11.6 | Sized for 2 OCPU and 12 GB. **Open:** Oracle's published docs list 3,000 OCPU-hours and 18,000 GB-hours per month (equal to 4 OCPU and 24 GB) and no cut was found, so check the tenancy's own limits page (V8). If the cut is not real there is unused headroom. |
+| Oracle Always Free, 2 OCPU Arm, 12 GB, no PAYG | Adopted | README header, 11.8, 11.6 | **Resolved (V8, 2026-11-23):** owner confirmed 2 OCPU / 12 GB, and current Oracle docs list 1,500 OCPU-hours and 9,000 GB-hours per month for A1 (equal to 2 OCPU / 12 GB). The older 3,000 / 18,000 figure is stale; the design already fits the smaller envelope. |
 | Boot volume to about 100 GB | Adopted | BUILD_SPEC M0, `docs/runbooks.md` | Done by hand in the OCI console plus `growpart` and `resize2fs`; documented, not scripted. |
 | Docker rootless; benchmark gVisor; hardened Docker fallback | Adopted | README 11.1A, 9 (runtime), D20; M3a | Seven rootless checks are VERIFY items (V9, V10). If rootless cannot meet a requirement, fall back to rootful with user-namespace remapping, never weaken isolation. |
 | Every tool needs an arm64 build; browser unverified | Adopted | V16, M11 | Browser is Phase 8 and gated on that check. |
 | One task at a time | Adopted | README 11.4, 11.6, D19; BUILD_SPEC queue | `max_sessions` defaults to 1. A second slot only on load-test evidence; three is out of scope. |
-| OpenCode headless in a disposable per-task container | Adopted | README 5.2, 11.2 | |
+| OpenCode headless in a disposable per-task container | Adopted, refined | README 5.2, 11.2; D39, D42 | Build work still runs in a disposable session container, but the current runtime is a per-chat session with explicit `think → plan → execute` role handoffs in one OpenCode session; the owner's Execute tap gates `plan → execute`. |
 | "Own git worktree" per task | **Changed** | README 5.1, 5.2, 9.2, D21 | An independent clone, not a linked worktree. A worktree's `.git` points outside the mount and shares hooks, config and objects with the cache, so a hostile repo could reach the host. The checkpoint behavior is kept (checkpoint refs, `/undo`). |
 | LSP and snapshots off | Adopted, refined | README 6.7 | Off by default; `repos.lsp_enabled` turns LSP on per repository because diagnostics help the agent self-correct. |
 | Browser on demand, own container, never alongside a build | Adopted, split in two | README 9.1, 9.3; M3a, M11 | **Research tier** (read-only fetch and search through the egress-proxy) arrives in M3a. **Interactive tier** (click, log in, submit) is Phase 8 with per-domain approval. |
@@ -96,10 +96,11 @@ Lessons file from the incident log, post-merge watch, one reviewer pass, replay 
 
 ## Open points for the owner
 
-1. **Oracle allowance (V8).** Confirm the tenancy's actual Always Free Arm limits.
-2. **Audit retention.** Decide how long tool-call events must be kept.
-3. **Kill switch name.** Keep `/cancel`, or add `/stop` as an alias.
-4. **Domain.** A domain you own is still required before M5 (cookie login) and is needed at M0 for HTTPS.
+1. **Oracle allowance (V8) — resolved.** Owner confirmed 2 OCPU / 12 GB; the older 3,000 / 18,000-hour figure is stale and does not change the design.
+2. **Owner gate — pending.** M0–M4 are implemented locally and the M4 §2.5 report is done. The in-app push/PR flow still requires genuine owner Telegram taps; a git push to the audit branch is owner-authorized, no draft PR exists, and M5 has not been started.
+3. **Audit retention — still open.** Decide how long tool-call events must be kept (live events currently use 30-day retention).
+4. **Kill switch name — still open.** Keep `/cancel`, or add `/stop` as an alias.
+5. **Domain and VM drills — pending.** A domain you own is required before M5 (cookie login) and at M0 for HTTPS; ARM64/rootless/gVisor, Caddy TLS, rclone upload and keepalive/OOM drills still need an owner-provisioned VM.
 
 ---
 

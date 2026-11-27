@@ -2,10 +2,12 @@
 
 | | |
 |---|---|
-| **Version** | 1.2 (2026-11-23) |
-| **Companion to** | `README.md` v0.6 (design and rationale) |
+| **Version** | 1.3 (2026-11-27) |
+| **Companion to** | `README.md` v0.7 (design and rationale) |
 | **Purpose** | Tell an AI builder exactly which files to create, what each does, and how the whole system behaves, from the first command to the last test |
 | **Precedence** | If this file and `README.md` disagree, `README.md` wins. Fix this file. |
+
+**Changes in 1.3:** Aligns the spec with the local implementation. Adds the `/options` live trace, the 15-second OpenCode activity probe (retry count and last transport error; failure after 6 model transport retries), the host-bridge router hostname pin (`PADI_ROUTER_HOST_IP` -> Docker `ExtraHosts`), the NVIDIA `think` role with same-session `HANDOFF` handoffs and the 8-alias session image. Records M0-M4 status, the still-pending owner push/PR gate, and the intentional `max_sessions: 1` / unrun 2-session load test.
 
 **Changes in 1.2:** Adds Phase 9 (M12 to M16): skills and SearxNG search (M12), long-term memory (M13), scheduled routines and security scanners (M14), request-changes loop and optional voice (M15), credential injection and a runtime interface (M16). New blueprints in 3.3, 3.4, 3.5A and 3.8; new config, flows 5.10 to 5.13, errors, tests, verifications V17 to V23 and checklist items. The state machine gains one edge (`AWAITING_PUSH_APPROVAL` to `EXECUTING`). Hard rule 10 added.
 
@@ -57,7 +59,7 @@
 | M2 | 2 | Router v1 | Fake-upstream tests pass; OpenCode works through the router; hammer test shows delays, not failures |
 | M3a | 3a | Isolation | `netcheck.sh` passes from inside a real container; hostile-repo fixture executes nothing on the host; a memory hog dies alone; runtime benchmark recorded |
 | M3b | 3b | Trust | A real PR opens only after verification and approval; failing tests block push; deleted test flagged; off-limits edit stopped; risk block renders |
-| M4 | 4 | Resilience and capacity | Provider kill degrades to next target; tasks queue one at a time; a second slot proven or refused with evidence; loadtest report written; real model IDs chosen |
+| M4 | 4 | Resilience and capacity | Provider kill degrades to next target; tasks queue one at a time; a second slot proven or refused with evidence; loadtest report written; real model IDs chosen (implemented locally; second-slot test not run — see 2.4) |
 | M5 | 5a | API and auth | Magic-link login works with curl; SSE resume exact; CSRF and origin tests pass |
 | M6 | 5b | Web UI | Start on Telegram, watch and approve on the web |
 | M7 | 5c | Bring-your-own-key | Paid model used only after selection; key never logged; message deleted |
@@ -73,6 +75,8 @@
 
 **Recommended order after M9:** M10, then M12, M13, M14, M15, M16, and M11 (the browser) last, because it is the riskiest addition. After M12 the Phase 9 milestones are independent.
 
+**Status (2026-11-27).** M0-M4 are implemented locally. M0-M4 reports and evidence live in `update.md` (the M4 report is §23); use the format in 2.5. `max_sessions` remains 1: the 2-session load test was not run, and the 10-request router hammer is the recorded capacity evidence on this host. The in-app push/PR gate still awaits genuine owner Telegram taps; a git push to the audit branch is owner-authorized, and no PR or production deployment is claimed. Everything from M5 onward remains to be built.
+
 ### 2.2 How the pieces talk at runtime
 
 ```
@@ -84,6 +88,8 @@ gateway ---------------------------------> Postgres (Supabase): sessions, tasks,
    | Docker API (rootless socket)
    v
 task container (opencode serve, /workspace = independent clone)
+   |  staged roles in one session: think -> plan (read-only, HANDOFF)
+   |  owner Execute tap gates plan -> execute (approved PROPOSAL only)
    |  model calls ----------> router ----------> model providers
    |  build proxy / research -> egress-proxy ---> internet (allowlist, SSRF guard, caps, logs)
    |
@@ -99,6 +105,8 @@ outside the VM: uptime monitor and dead-man's-switch
 ```
 
 Rules of thumb for the builder: **data flows inward only as a bundle, outward only through the router and the egress-proxy, and decisions flow through approvals.** If a design seems to need any other path, stop and ask.
+
+**Implemented staging.** Unapproved tasks run `think -> plan` in one OpenCode session: the custom read-only `think` agent ends with `HANDOFF`, and the planner emits `PROPOSAL`. Only the owner's **Execute** tap starts the build-role execute stage; an already-approved plan becomes a single execute stage. Every stage switches agent/model in the same session and passes explicit `HANDOFF` context; the executor applies only the approved `PROPOSAL` handoff and does not push. While a task runs, the renderer edits one Telegram message into a live card (phases `QUEUED CONTRACT CLONE SANDBOX EXECUTE VERIFY PUBLISH DONE`; `EXECUTE` moves `Thinking -> Agent planning -> Agent executing`) with elapsed time, tool/file events, tokens, `♥ alive`, retry count and last transport error. `/options` shows this live trace, or stored events after the task ends.
 
 Phase 9 adds four paths, none of which breaks that rule: **skills** are baked into the image (read-only) and loaded by OpenCode; **memory** is read and written only by the gateway, which injects a labeled notes block into the prompt before execution and retains from the task record afterwards; **search** goes container, egress-proxy, SearxNG (on `agent-net` only); **routines** and **request changes** create or resume ordinary tasks that follow the same state machine.
 
@@ -197,6 +205,7 @@ Each block lists the goal, dependencies, exact files to create, how the new code
 **Create.** Router `breaker`, fallback chain, `usage` writer (with `task_id` from `X-Task-Id`); gateway `queue` admission (one slot by default, memory admission with the keepalive credit); `cmd/agent-eval`, `internal/eval`, `scripts/bench/*`, `scripts/loadtest.sh`.
 **Connects to.** The queue reads `state/keepalive.json`; the contract meter reads `llm_usage` by `task_id`; `agent-eval` fills the model placeholders in `router.yaml`.
 **Accept.** Killing a provider degrades to the next target; queued tasks run strictly one at a time; with `max_sessions: 2` the loadtest passes 10 runs or the setting stays at 1 with the evidence recorded; real model IDs replace placeholders from benchmark results.
+**Status (2026-11-27).** Implemented locally; report in `update.md` §23. `max_sessions` stays at 1 and the 2-session load test was not run (10-request router hammer is the recorded capacity evidence). Live aliases are NVIDIA-only; `agent-embed` and `agent-eval` are disabled, and `agent-eval` returns an explicit `eval_provider_isolation` 503 instead of a silent fallback. The in-app push/PR flow remains gated on genuine owner Telegram taps; a git push to the audit branch is owner-authorized, and no PR is opened.
 
 ---
 
@@ -323,6 +332,8 @@ Do not start until M9 has passed, M12 to M16 are done or consciously deferred, a
 - **Open items:** VERIFY results with evidence, risks, questions.
 - **Next:** the next milestone, awaiting the owner's go-ahead.
 
+The M4 report is in `update.md` §23 in this format. Its open items include the unrun 2-session load test and the still-pending owner push/PR taps.
+
 ---
 
 ## 3. File-by-file blueprint
@@ -393,7 +404,7 @@ Classification: 429 means `RateLimited` (parse `Retry-After`: seconds or HTTP da
 
 ### 3.3 Gateway (`cmd/gateway`, `internal/gateway/*`)
 
-**`cmd/gateway/main.go`** wiring order: load config, open DB pool, `store.Migrate`, build `hub`, `runner`, `queue`, `approvals`, `gitops`, `risk`, `contract`, `keys` (M7), `onboard` and `preview` (M8), `incidents` (M10), start Telegram poller, start HTTP server, start watchdog loop, start GC loop, start heartbeat loop (hourly database ping), start egress-denial poller (polls the egress admin endpoint every 5 s while a task runs and raises `new_domain` approvals), start budget meter loop (every 30 s per running task), start nightly-staleness watcher (alerts if `state/nightly.json` is older than 36 h). Graceful shutdown on SIGTERM: stop accepting work, let running tasks keep their containers (they are reconciled on next start), flush events.
+**`cmd/gateway/main.go`** wiring order: load config, open DB pool, `store.Migrate`, build `hub`, `runner`, `queue`, `approvals`, `gitops`, `risk`, `contract`, `keys` (M7), `onboard` and `preview` (M8), `incidents` (M10), start Telegram poller, start HTTP server, start watchdog loop, start GC loop, start heartbeat loop (hourly database ping), start egress-denial poller (polls the egress admin endpoint every 5 s while a task runs and raises `new_domain` approvals), start budget meter loop (every 30 s per running task), start nightly-staleness watcher (alerts if `state/nightly.json` is older than 36 h). Graceful shutdown on SIGTERM: stop accepting work, let running tasks keep their containers (they are reconciled on next start), flush events. Implemented locally: the launcher may set `PADI_ROUTER_HOST_IP`; when present the gateway overrides `cfg.Container.RouterHostIP` with it, and a 15-second activity loop probes each running OpenCode session (details in `opencode/client.go` below).
 
 **`store/`**
 ```go
@@ -418,8 +429,9 @@ type Store interface {
 
 **`telegram/`**
 - `poller.go`: loop `getUpdates(offset=last_update_id+1, timeout=30)`; for each update: dedupe against stored `last_update_id`, authorize, dispatch, then persist `last_update_id` **after** handling. Exactly one poller (take a Postgres advisory lock so a second instance idles).
-- `commands.go`: routes `/new /mode /status /cancel /logs /preview /undo /incident /onboard /memory /remember /routines /models /model /setkey /forgetkey /login /logout_all /lockdown /unlock` and free text (`/undo` arrives in M3b, `/onboard` in M8, `/incident` in M10, `/memory` and `/remember` in M13, `/routines` in M14). "Request changes" is a button on the approval card (M15). Free text in a session with a running task is queued as a follow-up; otherwise it creates a task.
-- `render.go`: converts gateway events to Telegram messages. HTML parse mode with a strict escaper (`& < >`). Tool events collapse into a single status line ("Running tests...") updated in place. Streaming tokens edit one message at most once per `edit_interval_ms` (default 1200) per chat; when text exceeds 3800 chars start a new message and record it in `telegram_messages`.
+- `commands.go`: routes `/new /mode /status /options /cancel /logs /preview /undo /incident /onboard /memory /remember /routines /models /model /setkey /forgetkey /login /logout_all /lockdown /unlock` and free text (`/options` is implemented locally; `/undo` arrives in M3b, `/onboard` in M8, `/incident` in M10, `/memory` and `/remember` in M13, `/routines` in M14). `/options` shows the live trace for an active task and stored events from `agent.events` after it finishes. "Request changes" is a button on the approval card (M15). Free text in a session with a running task is queued as a follow-up; otherwise it creates a task.
+- `render.go`: converts gateway events to Telegram messages. HTML parse mode with a strict escaper (`& < >`). `RelayWithLive` edits one message into a live card while work runs and replaces it with the final answer; inline keyboards are attached only to the final card, never to intermediate edits. Streaming tokens edit one message at most once per `edit_interval_ms` (default 1200) per chat; when text exceeds 3800 chars start a new message and record it in `telegram_messages`.
+- `live.go` (implemented locally): `LiveTrace` holds a bounded in-memory trace of at most 200 events; durable history stays in `agent.events`. Phases are `QUEUED CONTRACT CLONE SANDBOX EXECUTE VERIFY PUBLISH DONE`; the `EXECUTE` label moves `Thinking -> Agent planning -> Agent executing`. `RenderLiveCard` is escaped HTML with elapsed time, tool/file events, tokens, and a heartbeat line `♥ alive` plus retry count and last transport error; `/options` renders the full trace.
 - `photos.go`: pick the largest `PhotoSize`; `getFile`; reject over the size cap (10 MB) with a friendly message; download; validate magic bytes (PNG, JPEG, WEBP); save to `workspaces/<task>/.agent/uploads/<uuid>.<ext>`; attach to the next prompt. Group by `media_group_id` with a 1.5 s collection window.
 - `approvals_ui.go`: sends an approval with inline buttons whose `callback_data` is `a:<short_id>:<y|n>` (short_id is 8 chars mapped server-side to the approval UUID). Always `answerCallbackQuery`. Expired or already-decided approvals answer "no longer pending".
 - `setkey.go` (M7): parse `/setkey <provider> <key>`; **first** call `deleteMessage`; then `keys.Set`; reply with the last four characters only. Unknown provider names are rejected from an allowlist (`gemini`, `anthropic`, `openai`, `openrouter`).
@@ -454,20 +466,25 @@ type Runner interface {
     Reconcile(ctx) error                                               // on gateway start: adopt or kill labeled containers
 }
 ```
-`SessionSpec` creates the container with: label `sandbox-agent=1`, `task=<id>`; `Memory=2560MiB`, `MemorySwap=Memory`, `NanoCPUs=1e9`, `PidsLimit=512`; runtime from `container.runtime` (`runc` or `runsc`); `ReadonlyRootfs=true` with tmpfs for `/tmp` and `/home/agent`; `CapDrop=ALL`; `SecurityOpt=no-new-privileges`; user `agent`; only mount `/workspace` (the task clone); network `agent-session-net` (internal); env `ROUTER_TOKEN`, `SESSION_ID`, `TASK_ID`, `HTTP_PROXY`/`HTTPS_PROXY` (egress-proxy build port), `NO_PROXY=router,egress-proxy`, `NODE_OPTIONS=--max-old-space-size=1536`, `GOFLAGS=-p=2`, `GIT_AUTHOR_*`/`GIT_COMMITTER_*`. No Docker socket, no secrets directory.
+`SessionSpec` creates the container with: label `sandbox-agent=1`, `task=<id>`; `Memory=2560MiB`, `MemorySwap=Memory`, `NanoCPUs=1e9`, `PidsLimit=512`; runtime from `container.runtime` (`runc` or `runsc`); `ReadonlyRootfs=true` with tmpfs for `/tmp` and `/home/agent`; `CapDrop=ALL`; `SecurityOpt=no-new-privileges`; user `agent`; only mount `/workspace` (the task clone); network `agent-session-net` (internal); env `ROUTER_TOKEN`, `SESSION_ID`, `TASK_ID`, `HTTP_PROXY`/`HTTPS_PROXY` (egress-proxy build port), `NO_PROXY=router,egress-proxy`, `NODE_OPTIONS=--max-old-space-size=1536`, `GOFLAGS=-p=2`, `GIT_AUTHOR_*`/`GIT_COMMITTER_*`. No Docker socket, no secrets directory. `ContainerSpec` also carries `ExtraHosts` (implemented locally): when `container.router_host_ip` is set, the runner pins the router hostname with `ExtraHosts=["router:<ip>"]` so the host-bridge router is resolvable inside the container. `agent-session-net` stays `internal=true`; no egress is opened. Compose runs a real `router` container and uses Docker DNS, so no alias is configured there.
 `VerifySpec` is the same image and limits, mounts `verify/<task_id>/` at `/workspace`, build-profile egress only, runs `agent-verify` as its command, and is removed after it exits. It is started only after the task container has stopped.
 After exit: if `OOMKilled || exit==137` then fail the task with `fail_reason='oom'` (task and verify containers alike).
 `Reconcile`: containers labeled `sandbox-agent` whose task is terminal are removed; those whose task is running are re-attached.
 
-**`opencode/client.go`** (**VERIFY** every endpoint against the installed OpenCode version's server docs in M1 and record the result in `docs/decisions.md`)
+**`opencode/client.go`** (**VERIFY** every endpoint against the installed OpenCode version's server docs in M1 and record the result in `docs/decisions.md`; the current client is verified against OpenCode v2.4.0)
 ```go
-type Client struct{ BaseURL string }
+type Client struct{ BaseURL string; Password string; HTTP *http.Client }
+func (c *Client) Healthy(ctx) error
 func (c *Client) CreateSession(ctx) (id string, err error)
-func (c *Client) Prompt(ctx, sessionID, text string, images []string, model string) error
 func (c *Client) Events(ctx) (<-chan RawEvent, error)       // server-sent event stream
 func (c *Client) Abort(ctx, sessionID string) error
+type SessionActivity struct{ Retry, Tokens int; LastError string }
+func (c *Client) Activity(ctx, sessionID string) (SessionActivity, error)
+func (c *Client) SetModel(ctx, sessionID, model string) error
+func (c *Client) SetAgent(ctx, sessionID, agent string) error
+func (c *Client) PromptWithAgent(ctx, sessionID, text, model, agent string) error
 ```
-`translate.go` maps raw OpenCode events to the gateway event types (`token`, `tool_call`, `tool_result`, `file_change`, `status`, `done`, `error`). Unknown raw events are logged at debug and dropped, never crash.
+`Activity` reads assistant retry metadata from the session message list and returns only `Retry`, `LastError` and `Tokens`; it never exposes message content to callers. The gateway polls it every 15 s, feeds the live-card heartbeat, and aborts the task with `model_transport_failed` once `Retry >= 6`. These SSE `: hb` comments are a separate keepalive for the event stream; they are not the activity probe. OpenCode v2 has no per-message model field, so `PromptWithAgent` applies the per-session model switch (`SetModel`) and agent switch (`SetAgent`) before posting the prompt; this is how the V1 per-message override is implemented locally. `translate.go` maps raw OpenCode events to the gateway event types (`token`, `tool_call`, `tool_result`, `file_change`, `status`, `done`, `error`). Unknown raw events are logged at debug and dropped, never crash.
 
 **`gitops/`** (README 5.2 and 9.2 are the behavioral spec)
 ```go
@@ -529,7 +546,7 @@ Models selectable per provider are a fixed table in `gateway.yaml.user_models` (
 **`summarize/`**: `Report(ctx, task, diff, verdict, risk)` calls the router with alias `agent-small`, a 5 s budget, and falls back to a deterministic template if the call fails. The summary never replaces the risk block; both are shown.
 
 **`httpapi/`**: handlers generated against `api/openapi.yaml` (oapi-codegen strict server). Hand-written parts: SSE handler (`events.go`), upload handler (`uploads.go`), middleware chain `Recover -> RequestID -> Log -> CORS -> CSRF -> RequireSession`. Health and `/auth/exchange` bypass `RequireSession` but not rate limiting.
-SSE handler: set `Content-Type: text/event-stream`, `Cache-Control: no-cache`, `X-Accel-Buffering: no`; read `Last-Event-ID` header or `after` query; call `hub.Subscribe`; write `id:`/`event:`/`data:` frames; heartbeat `: hb` every 15 s; stop on client disconnect.
+SSE handler: set `Content-Type: text/event-stream`, `Cache-Control: no-cache`, `X-Accel-Buffering: no`; read `Last-Event-ID` header or `after` query; call `hub.Subscribe`; write `id:`/`event:`/`data:` frames; heartbeat `: hb` every 15 s; stop on client disconnect. The SSE heartbeat is only a stream keepalive: it is distinct from the 15-second OpenCode `Activity` probe that supplies the live card's `♥ alive`, retry count and last transport error.
 
 **`contract/`** (M3b; README 7.7)
 ```go
@@ -740,7 +757,7 @@ Environment: only `NEXT_PUBLIC_API_BASE`.
 ### 3.7 Deploy and scripts
 - `deploy/session/Dockerfile` (arm64): base Ubuntu 24.04 slim; install git, curl, ripgrep, jq, build-essential, Go, Node LTS, Python 3; install pinned OpenCode; copy `agent-verify`; create user `agent`; `WORKDIR /workspace`; `ENTRYPOINT ["/entrypoint.sh"]`.
 - `deploy/session/entrypoint.sh`: render `opencode.json` from the base template using env (`SESSION_ID`, `TASK_ID`, mode, LSP flag from the repo setting), then `exec opencode serve --hostname 0.0.0.0 --port 4096`.
-- `deploy/docker-compose.yml`, `deploy/Caddyfile` (reverse proxy `api.<domain>` to gateway; `flush_interval -1` for SSE; no response buffering; HSTS).
+- `deploy/docker-compose.yml`, `deploy/Caddyfile` (reverse proxy `api.<domain>` to gateway; `flush_interval -1` for SSE; no response buffering; HSTS). Local status: Compose has a real `router` container and uses Docker DNS, so no `ExtraHosts` alias is needed there; the host-bridge launcher instead sets `PADI_ROUTER_HOST_IP=172.20.0.1`. `agent-session-net` stays internal.
 - `deploy/host/setup-swap.sh` (4 GB swapfile, `vm.swappiness=10`), `sysctl.conf`, `docker-daemon.json` (json-file, `max-size=10m`, `max-file=3`), firewall rules (deny by default; allow 22, 80, 443). Blocking containers from the metadata address and private ranges is done by the internal network and the egress-proxy design and **proved** by `netcheck.sh`, not assumed from host rules (rootless networking may bypass them).
 - **Host and survival (M0):** `deploy/host/rootless-docker.sh`, `firewall.sh`, `keepalive.service`, `agent-nightly.service`, `agent-nightly.timer`. `scripts/nightly.sh` runs in this order and never aborts the whole run on one failure (it records each step in `state/nightly.json`): database touch (`select 1` plus a heartbeat row), `backup.sh` (`pg_dump -n agent` plus a config and state tar, local copy kept 7 days, upload to Object Storage kept 14), `gc.sh`, `docker image prune`, git cache `gc` for large caches, osv-scanner offline database refresh into `/srv/agent/cache/osv-db` (M14; the gateway starts memory reflection, M13, when `state/nightly.json` shows tonight's run finished), then ping `HEALTHCHECK_PING_URL` if set. `scripts/restore-test.sh` restores the latest dump into a throwaway Postgres container and checks row counts. `scripts/rebuild.sh` (idempotent): rootless Docker, sysctl and swap, directory layout, build and start services, restore config from the latest archive, install units, print the manual steps (re-enter secrets).
 - **Isolation (M3a):** `scripts/netcheck.sh` runs from inside a real session container and asserts the table in README 3.4 (direct internet fails; proxy to an allowlisted registry works; non-allowlisted host returns 403; metadata address, gateway API, Postgres and the Docker socket are unreachable; the router answers; research fetch of a public page works and of a private address is refused; the environment contains only the allowed variables). `scripts/runtime-bench.sh` times a build and a test run under `runc` and `runsc` and records memory and wall time.
@@ -779,6 +796,7 @@ Questions asked by interview-style skills reach the owner as a `question` event 
 
 **`config/gateway.yaml`**
 ```yaml
+policies_file: "config/policies.yaml"
 http:      { listen: ":8080", ui_origin: "https://app.example.com", cookie_domain: ".example.com" }
 telegram:  { poll_timeout_s: 30, edit_interval_ms: 1200, max_message_chars: 3800, photo_max_mb: 10 }
 sessions:  { max_sessions: 1, min_free_mem_mb: 3000, workspace_retention_days: 7, workspace_max_mb: 2048 }
@@ -789,8 +807,22 @@ container:
   cpus: 1.0
   pids: 512
   network: "agent-session-net"  # internal network
+  internal_network: true        # local runtime: no default route out of the sandbox
+  # Portable default is empty. This host's launcher sets
+  # PADI_ROUTER_HOST_IP=172.20.0.1; the gateway copies it into
+  # Container.RouterHostIP -> ExtraHosts ["router:172.20.0.1"].
+  # Leave empty in Compose, where "router" is a real container on the
+  # internal network and Docker DNS resolves it.
+  router_host_ip: ""
   proxy: "http://egress-proxy:3128"
   bundle_max_mb: 200
+opencode:                        # M4: all model calls go to the router
+  model: "padi/agent-build"
+  aliases: { build: "padi/agent-build", plan: "padi/agent-plan", research: "padi/agent-plan", chat: "padi/agent-chat", small: "padi/agent-small", think: "padi/agent-think", eval: "padi/agent-eval" }
+  router_base_url: "http://router:8090/v1"
+  router_token_env: "ROUTER_TOKEN"
+  lsp: false
+  snapshots: false              # V12: intentionally false in the local config
 watchdog:  { planning_min: 15, executing_min: 30, verifying_min: 15, idle_events_min: 10 }
 auth:      { login_token_ttl: 5m, session_idle: 12h, session_absolute: 720h }
 approvals: { ttl: 30m }
@@ -841,6 +873,8 @@ browser:                        # M11 draft; ignored until then
   cpus: 1.0
   wall_min: 20
 ```
+
+Status: the top part of this block matches the local `config/gateway.yaml` (M0-M4: one session slot, internal network, router aliases, `snapshots: false`). The remaining keys are introduced with their milestones; `config/gateway.yaml` leaves `container.router_host_ip` empty for portability, and this host's launcher supplies `PADI_ROUTER_HOST_IP=172.20.0.1`.
 
 **`config/policies.yaml`**
 ```yaml
@@ -916,12 +950,28 @@ log_path: /var/log/agent/egress.ndjson
 
 **`config/keepalive`** is passed as flags in `deploy/host/keepalive.service`: `--target-used-mb=4096 --min-available-mb=2500 --tick=30s --state=/srv/agent/state/keepalive.json`, with `OOMScoreAdjust=1000` and `MemoryMax=4352M`.
 
-**`config/router.yaml` addition (M13)**
+**`config/router.yaml` (M4/M13 aliases)**
 ```yaml
+providers:
+  nvidia:                       # the only live provider on this host
+    base_url: "https://integrate.api.nvidia.com/v1"
+    api_key_env: "NVIDIA_API_KEY"
 routes:
-  agent-embed:                  # /v1/embeddings; disabled while targets are placeholders
-    - { provider: nim, model: <verified-embed-model-384d>, embeddings: true, dims: 384 }
+  agent-build:                  # NVIDIA target first; placeholder fallbacks disabled
+    - { provider: nvidia, model: "nvidia/<verified-build-model>", priority: 1 }
+  agent-plan:  [{ provider: nvidia, model: "nvidia/<verified-build-model>", priority: 1 }]
+  agent-chat:  [{ provider: nvidia, model: "nvidia/<verified-chat-model>",  priority: 1 }]
+  agent-small: [{ provider: nvidia, model: "nvidia/<verified-small-model>", priority: 1 }]
+  agent-think: [{ provider: nvidia, model: "nvidia/<verified-think-model>", priority: 1 }]  # read-only role
+  agent-vision: [{ provider: nvidia, model: "nvidia/<verified-vision-model>", supports_images: true }]
+  agent-embed:                  # M13 /v1/embeddings; disabled while targets are placeholders
+    - { provider: nvidia, model: "<placeholder>", embeddings: true, dims: 384 }
+  agent-eval:  [{ provider: groq, model: "<placeholder>" }]  # disabled; explicit 503
+retry:
+  attempts: 3
+  backoff: 150ms
 ```
+Status: `agent-build`, `agent-plan`, `agent-chat`, `agent-small`, `agent-think` and `agent-vision` are enabled NVIDIA-only; `agent-embed` and `agent-eval` are disabled. `agent-eval` deliberately returns 503 `eval_provider_isolation` — no silent fallback to the build provider. The session image ships 8 aliases including `agent-think` and a custom read-only think agent; `retry.attempts` is 3 (the separate OpenCode transport-retry limit is 6, in 5.14).
 
 ---
 
@@ -952,8 +1002,8 @@ Terminal: DONE, FAILED, CANCELLED, TIMED_OUT. `AWAITING_PLAN_APPROVAL` carries t
 3. Task is `QUEUED`; the user sees "queued, position N" if not admitted (one slot by default).
 4. `Admit()` passes: `Transition(QUEUED->PREPARING)`. `EnsureCache` (fresh installation token, `gitexec` only), `CloneForTask` (independent clone, branch `agent/<slug>-<shortid>`), write `.agent/task.json`. If the repo has not been onboarded, ask once whether to run `/onboard` first.
 5. `contract.Draft` builds the contract from defaults, repo settings and the message. If policy `task_contract` is `ask`, create the approval and move to `AWAITING_PLAN_APPROVAL`; on approval take checkpoint 0 (baseline).
-6. Before the prompt is built, `memory.Recall` fetches notes for the goal and likely paths (token-capped, labeled as context, IDs stored in `tasks.memory_used`). `runner.Start` creates the task container on the internal network; the gateway waits for OpenCode health and creates an OpenCode session with the baked-in skills. Plan mode, if requested, runs first (`PLANNING`) and its plan joins the approval.
-7. `EXECUTING`: send the prompt (contract text included; model = `sessions.active_model` or the default alias). Events flow through `translate` into the store, hub and clients. For each `file_change` the gateway checks the contract (`off_limits` is a hard stop, protected paths create approvals, out-of-scope files are noted). The budget meter counts tokens, tool calls and files. Research calls go to the egress-proxy; a denied domain becomes a `new_domain` approval (5.7). Checkpoints are taken on schedule.
+6. Before the prompt is built, `memory.Recall` fetches notes for the goal and likely paths (token-capped, labeled as context, IDs stored in `tasks.memory_used`). `runner.Start` creates the task container on the internal network (with `ExtraHosts` when `router_host_ip` is set); the gateway waits for OpenCode health and creates one OpenCode session with the baked-in skills (8 aliases). For an unapproved task, the role director runs `think -> plan` in that same session: the read-only `think` agent ends with `HANDOFF`, the planner receives it and emits `PROPOSAL`, and each stage switches agent/model before its prompt. The live card shows `Thinking` then `Agent planning`; plan mode's proposal joins the approval.
+7. The owner's **Execute** tap gates `plan -> execute`: the build-role stage runs in the same session with the approved `PROPOSAL` passed as a named `HANDOFF`, and the executor applies only that handoff and does not push. An already-approved plan skips to this single execute stage. `EXECUTING`: send the prompt (contract text included; model = `sessions.active_model` or the default alias). Events flow through `translate` into the store, hub and the edited live card. Every 15 s `Activity` updates `♥ alive`, retry count and last transport error; retry >= 6 fails the task with `model_transport_failed`. For each `file_change` the gateway checks the contract (`off_limits` is a hard stop, protected paths create approvals, out-of-scope files are noted). The budget meter counts tokens, tool calls and files. Research calls go to the egress-proxy; a denied domain becomes a `new_domain` approval (5.7). Checkpoints are taken on schedule.
 8. Agent finishes. The gateway runs `ContainerCommit`, `ExportBundle` (one file out) and stops the task container.
 9. `Quarantine` fetches the bundle. `VERIFYING`: `CheckoutForVerify` makes a fresh checkout, `runner.StartVerify` runs `agent-verify`, and `verify/guard` runs on the quarantine diff. Pass leads to step 10. Fail with loops left: `FIXING`, send `fix.tmpl` with the output tail, then `EXECUTING` starts a new task container on the retained clone and steps 8 and 9 repeat.
 10. Compute diff, risk context (on the quarantine repo, with confirmed incidents), guard findings, contract check and budget use. Create the push approval containing diff summary, verdict, **risk block**, guard findings, out-of-scope files and budget used. State `AWAITING_PUSH_APPROVAL`.
@@ -961,6 +1011,8 @@ Terminal: DONE, FAILED, CANCELLED, TIMED_OUT. `AWAITING_PLAN_APPROVAL` carries t
 12. If a preview was requested or policy allows: `PREVIEWING` starts the preview container from the verify checkout (cap 1 GB), registers the signed route, screenshots via Playwright, sends the link. `DONE`.
 13. Containers stop; `verify/<task_id>/` is removed; the clone is retained 7 days; `gc.sh` collects. `memory.Retain` runs asynchronously from the task record (5.10).
 14. If the owner later reports breakage, `/incident` starts the incident flow (M10, 5.9).
+
+Local status: steps 1-10 are implemented, but the in-app push/PR gate is still blocked on genuine owner Telegram taps; a git push to the audit branch is owner-authorized and no PR is opened. Steps 11-14 remain pending owner verification. The live trace and `/options` are described in 5.14.
 
 ### 5.3 Web login and session flow
 `/login` in Telegram, then `IssueLoginToken`, link sent. Browser opens the link, the page reads the fragment, `POST /auth/exchange`, cookie set, redirect. Every later request passes `RequireSession` and CSRF checks. `/logout_all` marks all `web_sessions.revoked`. `/lockdown` sets `system_flags.lockdown=true`, revokes all sessions, and blocks new tasks; `/unlock` clears it.
@@ -995,6 +1047,11 @@ On the approval card the owner taps **Request changes** (Telegram: the bot asks 
 ### 5.13 Credential-injection flow (M16)
 The agent's tool is configured with a route such as `http://egress-proxy:3131/svc/npm-private/`. The first request without a grant is refused; the gateway sees the refusal through the admin poller and raises a `credential_use` approval ("Allow private registry for this task?"). On approval the gateway calls `PUT /admin/credentials`; the proxy then forwards allowed paths and methods with the credential added and strips authentication echoes. At task end the gateway calls `DELETE /admin/credentials`. Every use is audited without header values.
 
+### 5.14 Live staging and telemetry (implemented locally)
+A task owns one OpenCode session and a bounded `LiveTrace` (200 events in memory; durable history in `agent.events`). `RelayWithLive` edits one Telegram message at the configured `edit_interval_ms`, moving through `QUEUED CONTRACT CLONE SANDBOX EXECUTE VERIFY PUBLISH DONE`; inside `EXECUTE` the label moves `Thinking -> Agent planning -> Agent executing`. The card shows elapsed time, tool/file events, tokens, `♥ alive`, retry count and the last transport error. Every dynamic value is escaped and clipped; keyboards appear only on the final card. `/options` (and the Options button) shows the live card during a run and rebuilds stored events after it ends.
+
+Unapproved work runs `think -> plan` in that session; the owner's Execute tap starts the build-role execute stage with the approved `PROPOSAL` handoff. Each stage switches agent/model and passes explicit `HANDOFF` context. A 15-second `Activity` probe reads retry metadata (never message content): a healthy probe prints `♥ alive`, a probe error is shown as the last error, and `Retry >= 6` aborts with `model_transport_failed`. SSE `: hb` frames are a separate stream keepalive, not this probe. For the host bridge, `PADI_ROUTER_HOST_IP` overrides `cfg.Container.RouterHostIP` and becomes `ExtraHosts=["router:<ip>"]`; `agent-session-net` stays internal and Compose relies on Docker DNS with no alias.
+
 ---
 
 ## 6. Error taxonomy and user-facing messages
@@ -1002,6 +1059,7 @@ The agent's tool is configured with a route such as `http://egress-proxy:3131/sv
 | Code | Cause | Message to user |
 |---|---|---|
 | `queued_memory` | Free memory below threshold | "Waiting for capacity (position N)." |
+| `model_transport_failed` | OpenCode reported 6 model transport retries without a response | "Task failed after 6 model transport retries." The live card shows the last transport error. |
 | `provider_exhausted` | All router targets in cooldown | "All models are rate limited. Retrying in about X minutes." |
 | `user_model_failed` | Paid model call failed | "Your <model> request failed. Use /model default to continue on free models." |
 | `verify_failed` | Three failed fix loops | "Tests still failing after 3 attempts. Branch not pushed. Here is the last output." |
@@ -1095,7 +1153,7 @@ Each item is a **real test**, not a reading exercise. Record the outcome in `doc
 | V9 | Rootless Docker: cgroup v2 delegation (memory, CPU, PID limits and OOM kill at the limit), privileged ports, socket path, storage driver | M0, M3a |
 | V10 | gVisor (`runsc`) on arm64 with rootless Docker: works at all, overhead versus `runc`, OpenCode, Node and Go toolchains run correctly | M3a |
 | V11 | Network topology: session containers reach only the router and egress-proxy; the gateway reaches OpenCode and can `docker exec`; nothing else (proved by `netcheck.sh`) | M3a |
-| V12 | OpenCode headless: valid `lsp` and `snapshot` keys, per-provider custom headers (`X-Task-Id`), support for remote MCP servers or custom tool files | M1, M3a |
+| V12 | OpenCode headless: valid `lsp` and `snapshot` keys (locally `lsp: false`, `snapshots: false`), per-provider custom headers (`X-Task-Id`), support for remote MCP servers or custom tool files | M1, M3a |
 | V13 | A search provider with an acceptable free tier, or keep `provider: none` | M3a |
 | V14 | Object Storage upload from the VM (CLI or S3-compatible API) on arm64 with instance-principal permissions; scheduled boot-volume backups; free tier of an external uptime monitor and a dead-man's-switch service | M0 |
 | V15 | `git bundle` round trip, `git clone --no-hardlinks` from the bare cache gives OpenCode what it needs offline, bundle size cap behavior on a large repository | M3a, M3b |
@@ -1108,18 +1166,20 @@ Each item is a **real test**, not a reading exercise. Record the outcome in `doc
 | V22 | gitleaks and osv-scanner arm64 builds, the flag names in the installed versions, offline database download and layout | M14 |
 | V23 | npm, Go and pip clients work through base-URL override to the credential routes | M16 |
 
----
+Local status: V1 is verified against OpenCode v2.4.0 — there is no per-message model field, so the override is a per-session `SetModel` switch before `PromptWithAgent`, and `Activity` reads retry metadata without exposing message content. V12's `snapshots` is intentionally `false` in the local config; `lsp` is also `false`.
 
 ## 9. Definition of done checklist
 
 - [ ] M0: VM hardened; rootless Docker with working limits; swap and log rotation; keepalive holds the floor and yields; nightly job, backup upload and `restore-test.sh` pass; stop-the-VM alert drill; schema applied; RLS test passes; TLS up; V4, V6, V8, V9, V14 recorded
-- [ ] M1: container runs OpenCode; Telegram round trip; edit of an independent clone works; throwaway key noted for revocation; V1, V12 recorded
+  - 2026-11-27: local schema, RLS, router/gateway and Docker work is implemented. VM-only drills (ARM64/rootless/gVisor, Caddy TLS, rclone upload, keepalive floor and 256 MB OOM, dead-man alert) remain owner work, so the box stays unchecked.
+- [x] M1: container runs OpenCode; Telegram round trip; edit of an independent clone works; throwaway key noted for revocation; V1, V12 recorded (2026-11-27: implemented locally)
 - [ ] M2: router tests green; OpenCode works through router; hammer test clean; throwaway key revoked; V2, V5 recorded
-  - 2026-11-24: all items except external revocation pass (router `-race` tests, real task through `padi/agent-chat`, 10×200 hammer, V2/V5 recorded). The owner must revoke the M1 throwaway key in the NVIDIA console before this box is ticked.
+  - 2026-11-24: all items except external revocation pass (router `-race` tests, real task through `padi/agent-chat`, 10×200 hammer, V2/V5 recorded). The owner must revoke the M1 throwaway key in the NVIDIA console before this box is ticked. Local implementation is complete.
 - [x] M3a: `netcheck.sh` passes; hostile-repo test passes; memory hog dies alone; runtime chosen with evidence; research fetch works and refuses private addresses; V9, V10, V11, V12, V13, V15 recorded
 - [x] M3b: PR opened only after verification and approval; failing change blocked; deleted test flagged high; off-limits edit stopped; budgets enforced; `/undo` verified; risk block renders
   - 2026-11-24: hermetic gates and stub PR are green; the live PR is intentionally withheld until a genuine owner Telegram decision. Evidence in `update.md` §19.
-- [ ] M4: fallback proven; queue runs one task at a time; second slot proven or refused with evidence; loadtest report stored; real model IDs set
+- [x] M4: fallback proven; queue runs one task at a time; second slot proven or refused with evidence; loadtest report stored; real model IDs set
+  - 2026-11-27: implemented locally; report in `update.md` §23. `max_sessions` stays at 1, the 2-session load test was not run (10-request hammer is the recorded evidence), and real NVIDIA model IDs are set. In-app push/PR awaits genuine owner Telegram taps; git push to the audit branch is owner-authorized and no PR is opened.
 - [ ] M5: auth and SSE tests green; contract drift check in CI
 - [ ] M6: web UI usable from a phone; approve from either client; risk, contract and guard findings visible
 - [ ] M7: BYOK works; key never in logs; Telegram message deleted
