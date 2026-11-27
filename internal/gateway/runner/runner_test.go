@@ -89,9 +89,13 @@ func TestStartWaitStop(t *testing.T) {
 		t.Fatalf("capabilities not dropped: %+v", host)
 	}
 	tmpfs := host["Tmpfs"].(map[string]any)
-	if !strings.Contains(fmt.Sprint(tmpfs["/tmp"]), "exec") ||
-		!strings.Contains(fmt.Sprint(tmpfs["/home/agent/.config"]), "uid=1001") {
-		t.Fatalf("tmpfs options missing exec or agent ownership: %+v", tmpfs)
+	if !strings.Contains(fmt.Sprint(tmpfs["/tmp"]), "exec") {
+		t.Fatalf("tmpfs /tmp missing exec: %+v", tmpfs)
+	}
+	for _, dir := range []string{"/home/agent/.config", "/home/agent/.local", "/home/agent/.cache"} {
+		if !strings.Contains(fmt.Sprint(tmpfs[dir]), "uid=1001") {
+			t.Fatalf("tmpfs %s missing agent-writable options: %+v", dir, tmpfs)
+		}
 	}
 	env := create["Env"].([]any)
 	joined := fmt.Sprint(env)

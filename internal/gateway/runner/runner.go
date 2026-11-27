@@ -130,9 +130,15 @@ func (r *Runner) hardenedSpec(spec ContainerSpec) ContainerSpec {
 		spec.Runtime = "runc"
 	}
 	spec.ReadonlyRootfs = true
+	// OpenCode writes config, state and cache under $HOME at startup. All three
+	// XDG dirs must be writable; a read-only rootfs otherwise kills the
+	// container before the health endpoint can answer.
+	tmpfsOpts := "rw,nosuid,nodev,size=64m,uid=1001,gid=1001,mode=0700"
 	spec.Tmpfs = map[string]string{
 		"/tmp":                "rw,nosuid,nodev,exec,size=512m",
-		"/home/agent/.config": "rw,nosuid,nodev,size=64m,uid=1001,gid=1001,mode=0700",
+		"/home/agent/.config": tmpfsOpts,
+		"/home/agent/.local":  tmpfsOpts,
+		"/home/agent/.cache":  tmpfsOpts,
 	}
 	spec.CapDrop = []string{"ALL"}
 	spec.SecurityOpt = []string{"no-new-privileges"}

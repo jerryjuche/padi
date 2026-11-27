@@ -1492,3 +1492,61 @@ The three earlier `jerryjuche/koder` approvals are now expired or stale (`0d7170
 ### Next
 
 Owner: fresh contract tap -> Execute -> push/PR gates. Exploration candidates after the live gate: timeline view, approval inbox, per-repo dashboard, queue/cost panel and incident history.
+
+---
+
+## 26. Container crash on startup traced and fixed (2026-11-27)
+
+### Cause
+
+Log check after the network repair found the next task `f269cac9` had been approved but failed:
+
+```
+2026/11/27 11:42:20 gateway: task f269cac9-... failed: open code health: runner: opencode not healthy: opencode: GET /api/info: Get "http://172.20.0.2:4096/api/info": dial tcp 172.20.0.2:4096: connect: no route to host
+```
+
+Docker events showed the real sequence:
+
+```
+container create padi-task-f269cac9-...
+network connect agent-session-net
+container start  padi-task-f269cac9-...
+network disconnect agent-session-net   # 1 second later
+container die    padi-task-f269cac9-...
+```
+
+Reproducing the exact hardened spec exposed the crash:
+
+```
+PlatformError: Unknown: FileSystem.makeDirectory (/home/agent/.local/share/opencode/log)
+[cause]: Error: EROFS: read-only file system, mkdir '/home/agent/.local'
+```
+
+The read-only rootfs only allowed `/tmp` and `/home/agent/.config` as writable tmpfs. The current OpenCode image also writes state to `/home/agent/.local` and cache to `/home/agent/.cache`, so it exited `1` before binding port 4096. The health check then probed a released container IP, which appeared as `no route to host`.
+
+### Fix
+
+- `internal/gateway/runner/runner.go:hardenedSpec` now mounts all three XDG dirs as agent-owned writable tmpfs: `.config`, `.local` and `.cache`. Capability drop, no-new-privileges, read-only rootfs and non-root user are unchanged.
+- Extended the runner regression test to require all three dirs with `uid=1001`.
+
+### Evidence
+
+```bash
+$ docker run -d ... --tmpfs /home/agent/.config ... --tmpfs /home/agent/.local ... --tmpfs /home/agent/.cache ... sandbox-agent-session:latest
+$ docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}}' "$CID"
+running exit=0
+$ curl -s -o /dev/null -w 'HTTP %{http_code}\n' "http://172.20.0.2:4096/api/info"
+HTTP 401                      # server is up; auth required
+$ docker logs "$CID"
+server listening on http://0.0.0.0:4096
+
+$ gofmt -l cmd internal       # no output
+$ GOPROXY=off go vet ./...    # no output
+$ GOPROXY=off go test -race -count=1 ./...   # all packages ok
+$ tail -1 /tmp/opencode/padi-gateway.log
+2026/11/27 11:50:15 gateway: ready (chat=padi/agent-chat, build=padi/agent-build, plan=padi/agent-plan, network=agent-session-net)
+```
+
+### Next
+
+Owner: send a fresh `clone jerryjuche/koder and read the readme`, tap **Approve contract**, then use `/status` for the visual card. No push.
