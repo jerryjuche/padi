@@ -1604,6 +1604,9 @@ func (a *application) fail(ctx context.Context, session store.Session, task stor
 		chat.setOutcome("failed: " + reason)
 		chat.setState("failed")
 	}
+	// A failed task must not leave its container running or let a follow-up
+	// reuse a dead session. The DB task state remains the source of truth.
+	a.closeChat(chatID)
 	a.event(ctx, session.ID, &task.ID, "error", map[string]string{"message": reason})
 	current, err := a.db.GetTask(ctx, task.ID)
 	if err != nil {

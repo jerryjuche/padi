@@ -1550,3 +1550,57 @@ $ tail -1 /tmp/opencode/padi-gateway.log
 ### Next
 
 Owner: send a fresh `clone jerryjuche/koder and read the readme`, tap **Approve contract**, then use `/status` for the visual card. No push.
+
+---
+
+## 27. Log check: stale image, workspace permissions, orphan container (2026-11-27)
+
+### Cause
+
+The next approved task `8f3f9277` failed with two messages:
+
+```
+11:53:49 gateway: baseline checkpoint task 8f3f9277-...: contract: checkpoint failed: save 0: runner: exec exit 128: error: insufficient permission for adding an object to repository database .git/objects
+11:54:03 gateway: task 8f3f9277-... failed: Error: Model unavailable: padi/agent-plan
+```
+
+Three independent problems:
+
+1. **Stale session image.** The running `sandbox-agent-session:latest` was built before the router aliases were added to `deploy/session/opencode.base.json`; its OpenCode config declared only `agent-chat`. The gateway asked for `padi/agent-plan`, which OpenCode did not know. The repo file already had all seven aliases; the image was simply old.
+2. **Workspace ownership.** The gateway-owned bind mount is `gamp:gamp` mode 0775. The container runs as `agent` (1001:1001), so `git add` in the checkpoint script could not write `.git/objects`. The scripts already pass `safe.directory`; write permission was the missing piece.
+3. **Orphan container.** `fail()` marked the task failed but left the container running until the 30-minute idle sweep, and a follow-up could have reused a dead session.
+
+### Fix
+
+- Rebuilt `sandbox-agent-session:latest` from `deploy/session/Dockerfile`; the generated config now contains all seven aliases including `agent-plan`.
+- Added `GroupAdd` to `ContainerSpec`; `hardenedSpec` passes the gateway process GID (`os.Getgid()`) as a supplementary group. The agent gets group-write on its bind-mounted workspace without root, extra capabilities or weakened `safe.directory` scoping.
+- `fail()` now calls `closeChat` so the container is stopped and a failed session cannot be reused.
+- Extended the runner regression test to require the workspace group.
+
+### Evidence
+
+```bash
+$ docker run ... --group-add 1000 -v "$WORKSPACE:/workspace" ... padi-checkpoint save 1
+af4900c79d8dcc70ae61176bf162926ccec04ea3      # checkpoint succeeds
+
+$ docker run -d ... (final hardened container with rebuilt image)
+status=running exit=0
+model config: 7 aliases
+config model: "padi/agent-plan"
+checkpoint: 384bf6128f4e564ec50a088c02c345c285ce740d
+health: HTTP 401                              # server alive, auth required
+
+$ gofmt -l cmd internal       # no output
+$ GOPROXY=off go vet ./...    # no output
+$ GOPROXY=off go test -race -count=1 ./...     # all packages ok
+$ scripts/m3b-smoke.sh | tail -1
+m3b-smoke: PASS M3b smoke (no live PR, no secrets used)
+$ tail -1 /tmp/opencode/padi-gateway.log
+2026/11/27 12:02:35 gateway: ready (chat=padi/agent-chat, build=padi/agent-build, plan=padi/agent-plan, network=agent-session-net)
+```
+
+Orphan `padi-task-8f3f9277` container was removed; no test containers remain.
+
+### Next
+
+Owner: send a fresh `clone jerryjuche/koder and read the readme`, tap **Approve contract**, then `/status` for the visual card. No push.

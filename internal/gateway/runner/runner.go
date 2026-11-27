@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -142,6 +143,12 @@ func (r *Runner) hardenedSpec(spec ContainerSpec) ContainerSpec {
 	}
 	spec.CapDrop = []string{"ALL"}
 	spec.SecurityOpt = []string{"no-new-privileges"}
+	// The gateway owns the bind-mounted workspace. Give the agent its host
+	// group so git can write objects there; safe.directory in the fixed scripts
+	// already trusts this exact path. No extra capability or root access.
+	if gid := os.Getgid(); gid > 0 {
+		spec.GroupAdd = []string{strconv.Itoa(gid)}
+	}
 	spec.User = "agent"
 	return spec
 }

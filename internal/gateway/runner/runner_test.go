@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -87,6 +88,9 @@ func TestStartWaitStop(t *testing.T) {
 	}
 	if fmt.Sprint(host["CapDrop"]) != "[ALL]" || fmt.Sprint(host["SecurityOpt"]) != "[no-new-privileges]" {
 		t.Fatalf("capabilities not dropped: %+v", host)
+	}
+	if fmt.Sprint(host["GroupAdd"]) != fmt.Sprintf("[%d]", os.Getgid()) {
+		t.Fatalf("workspace group not passed: %+v", host)
 	}
 	tmpfs := host["Tmpfs"].(map[string]any)
 	if !strings.Contains(fmt.Sprint(tmpfs["/tmp"]), "exec") {

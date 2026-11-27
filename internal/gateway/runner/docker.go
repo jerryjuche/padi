@@ -113,6 +113,7 @@ type ContainerSpec struct {
 	Tmpfs          map[string]string
 	CapDrop        []string
 	SecurityOpt    []string
+	GroupAdd       []string
 	User           string
 	Entrypoint     []string
 	Cmd            []string
@@ -146,6 +147,9 @@ func (s ContainerSpec) body() map[string]any {
 	}
 	if len(s.SecurityOpt) > 0 {
 		host["SecurityOpt"] = s.SecurityOpt
+	}
+	if len(s.GroupAdd) > 0 {
+		host["GroupAdd"] = s.GroupAdd
 	}
 	body := map[string]any{
 		"Image":        s.Image,
