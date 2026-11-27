@@ -175,12 +175,14 @@ func run() error {
 		checkpoints:      make(map[uuid.UUID]int),
 		publishing:       make(map[uuid.UUID]bool),
 		waits:            make(map[uuid.UUID]chan bool),
+		tasks:            make(chan taskJob, 32),
 		direct:           make(map[int64]*directChatState),
 		chatClient: &routerChatClient{
 			BaseURL: routerBaseURL, Token: routerToken, Model: cfg.DirectModel(),
 		},
 	}
 	go approvalManager.ExpireLoop(ctx)
+	go app.taskWorker(ctx)
 	poller := &telegram.Poller{
 		Client:  tg,
 		Store:   db,
@@ -403,6 +405,52 @@ type application struct {
 	checkpoints map[uuid.UUID]int
 	publishing  map[uuid.UUID]bool
 	waits       map[uuid.UUID]chan bool
+
+	// tasks serialises workspace work off the Telegram poller. contractGate
+	// waits for an owner tap, so running it inline would block the same poller
+	// that has to deliver that tap.
+	tasks chan taskJob
+}
+
+type taskJob struct {
+	ctx    context.Context
+	chatID int64
+	cmd    command
+	key    string
+	fresh  bool
+}
+
+// taskWorker owns workspace tasks one at a time. The Telegram poller stays
+// free to deliver the approval callback that contractGate is waiting for.
+func (a *application) taskWorker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case job := <-a.tasks:
+			if err := a.startTask(job.ctx, job.chatID, job.cmd, job.key, job.fresh); err != nil {
+				log.Printf("gateway: task %s failed: %s", job.key, scrubForUser(err))
+			}
+		}
+	}
+}
+
+// enqueueTask hands workspace work to the single task worker. A nil channel is
+// only used by tests that construct an application directly; startup always
+// installs the queue and worker.
+func (a *application) enqueueTask(ctx context.Context, chatID int64, c command, key string, fresh bool) error {
+	job := taskJob{ctx: ctx, chatID: chatID, cmd: c, key: key, fresh: fresh}
+	if a.tasks == nil {
+		return a.startTask(ctx, chatID, c, key, fresh)
+	}
+	select {
+	case a.tasks <- job:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return a.reportError(ctx, chatID, errors.New("gateway: task queue is full"))
+	}
 }
 
 // markAction consumes a legacy action or approval token. Tokens are never
@@ -761,7 +809,7 @@ func (a *application) handleUpdate(ctx context.Context, u telegram.Update) error
 			return a.reply(ctx, chatID, "Got "+c.repo+". What should I do in it?")
 		}
 		fresh := a.getChat(chatID) == nil
-		return a.startTask(ctx, chatID, c, key, fresh)
+		return a.enqueueTask(ctx, chatID, c, key, fresh)
 	}
 	return a.handleConversation(ctx, chatID, text, key, "")
 }
@@ -791,7 +839,7 @@ func (a *application) handleConversation(ctx context.Context, chatID int64, text
 			return a.replyKeyboard(ctx, chatID, question, a.buttons(chatID, "empty", ""))
 		}
 		repo, _, _, _, _ := chat.detail()
-		return a.startTask(ctx, chatID, command{repo: repo, prompt: message}, key, false)
+		return a.enqueueTask(ctx, chatID, command{repo: repo, prompt: message}, key, false)
 	case directNeedsRepo:
 		question := ensureRepoQuestion(message, text)
 		if modeHint != "" && modeHint != modeBuild {
@@ -884,7 +932,7 @@ func (a *application) handleCallback(ctx context.Context, q *telegram.CallbackQu
 		}
 		chat.setProposal(nil)
 		repo, _, _, _, _ := chat.detail()
-		return a.startTask(ctx, chatID, command{repo: repo, prompt: p.Prompt, approved: true}, "exec:"+taskID, false)
+		return a.enqueueTask(ctx, chatID, command{repo: repo, prompt: p.Prompt, approved: true}, "exec:"+taskID, false)
 	case strings.HasPrefix(data, "undo:"):
 		return a.undoCallback(ctx, chatID, data)
 	case strings.HasPrefix(data, "x:"):
@@ -944,7 +992,7 @@ func (a *application) handleTap(ctx context.Context, chatID int64, q *telegram.C
 		p, _ := chat.proposalFor(tap.TaskID)
 		chat.setProposal(nil)
 		repo, _, _, _, _ := chat.detail()
-		return a.startTask(ctx, chatID, command{repo: repo, prompt: p.Prompt, approved: true}, "tap:"+token, false)
+		return a.enqueueTask(ctx, chatID, command{repo: repo, prompt: p.Prompt, approved: true}, "tap:"+token, false)
 	case "undo":
 		return a.undo(ctx, chatID, "")
 	default:
@@ -974,7 +1022,7 @@ func (a *application) runAction(ctx context.Context, chatID int64, chat *chatSes
 	}
 	repo, _, _, _, _ := chat.detail()
 	readOnly := action == "checks" || action == "explain" || action == "diff" || action == "summary"
-	return a.startTask(ctx, chatID, command{repo: repo, prompt: prompt, readOnly: readOnly}, key, false)
+	return a.enqueueTask(ctx, chatID, command{repo: repo, prompt: prompt, readOnly: readOnly}, key, false)
 }
 
 // runLegacyAction keeps keyboards issued by an older binary harmless. Those

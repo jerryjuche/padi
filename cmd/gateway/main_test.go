@@ -461,6 +461,30 @@ func TestScrubForUser(t *testing.T) {
 	}
 }
 
+func TestEnqueueTaskKeepsPollerFreeAndOrdered(t *testing.T) {
+	app := &application{tasks: make(chan taskJob, 3)}
+	ctx := context.Background()
+	for i, prompt := range []string{"first", "second", "third"} {
+		key := fmt.Sprintf("key-%d", i)
+		if err := app.enqueueTask(ctx, 42, command{repo: "owner/repo", prompt: prompt}, key, false); err != nil {
+			t.Fatalf("enqueue %s: %v", key, err)
+		}
+	}
+	for _, prompt := range []string{"first", "second", "third"} {
+		select {
+		case job := <-app.tasks:
+			if job.cmd.prompt != prompt {
+				t.Fatalf("job prompt=%q want %q", job.cmd.prompt, prompt)
+			}
+			if job.chatID != 42 || job.fresh {
+				t.Fatalf("job chat/fresh=%d/%t want 42/false", job.chatID, job.fresh)
+			}
+		default:
+			t.Fatal("enqueueTask blocked instead of returning to the poller")
+		}
+	}
+}
+
 func TestPrepareWorkspaceReplacesCrossRepoSession(t *testing.T) {
 	var mu sync.Mutex
 	var stopped []string

@@ -57,10 +57,18 @@ func (p *PG) GetApproval(ctx context.Context, id uuid.UUID) (approvals.Approval,
 	return p.scanApproval(p.pool.QueryRow(ctx, approvalSelect, id))
 }
 
-const approvalSelect = `
+const approvalColumns = `
 	select id, task_id, action, detail, status, expires_at, created_at, decided_at,
 	       coalesce(decided_via, ''), coalesce(chat_id, 0), coalesce(session_id, '00000000-0000-0000-0000-000000000000'::uuid)
-	from agent.approvals where id=$1`
+	from agent.approvals`
+
+const approvalSelect = approvalColumns + ` where id=$1`
+
+// shortIDSelect uses $1, not $2: the old query inherited approvalSelect's id=$1
+// and passed only the short ID, so pgx rejected every callback lookup.
+const shortIDSelect = approvalColumns + `
+	where left(replace(id::text, '-', ''), 8) = $1
+	order by created_at desc limit 1`
 
 func (p *PG) DecideApproval(ctx context.Context, id uuid.UUID, approve bool, via string) (approvals.Approval, error) {
 	if p == nil || p.pool == nil {
@@ -145,7 +153,7 @@ func (p *PG) ApprovalByShortID(ctx context.Context, shortID string) (approvals.A
 	if _, err := hex.DecodeString(shortID); err != nil {
 		return approvals.Approval{}, approvals.ErrInvalidVia
 	}
-	row := p.pool.QueryRow(ctx, approvalSelect+` and left(replace(id::text, '-', ''), 8) = $2 order by created_at desc limit 1`, shortID)
+	row := p.pool.QueryRow(ctx, shortIDSelect, shortID)
 	return p.scanApproval(row)
 }
 

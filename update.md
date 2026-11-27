@@ -1363,3 +1363,69 @@ The `agent-eval` failure is the intended acceptance result here: NVIDIA is the o
 ### Next
 
 Owner: complete the genuine Telegram E2E PR gate, key/row cleanup and VM drills. Coding agent: start M5 only after the owner's go-ahead.
+
+---
+
+## 24. Contract-approval tap failure traced and fixed (2026-11-27)
+
+### Cause
+
+Two independent defects made every `Approve contract` tap fail, and neither was a Telegram network fault.
+
+1. `internal/gateway/store/approvals.go:ApprovalByShortID` appended `... and left(...) = $2` to a query that already contained `where id=$1`, then passed only the short ID. pgx therefore rejected every approval lookup with `expected 2 arguments, got 1` before a decision could be recorded.
+2. `cmd/gateway/main.go:startTask` ran inline from the single Telegram poller. `contractGate` blocks until the owner taps the approval callback, so the poller was waiting on the same callback it was responsible for delivering. The DB error above left the wait unresolved and replayed the stale callback.
+
+### Evidence
+
+```
+$ tail -4 /tmp/opencode/padi-gateway.log    # before fix
+2026/11/27 10:56:00 gateway: answer callback: telegram: answerCallbackQuery: HTTP 400: {"ok":false,"error_code":400,"description":"Bad Request: query is too old and response timeout expired or query ID is invalid"}
+2026/11/27 10:56:00 gateway: update failed: resolve approval 1ac2c5d0: store: scan approval: expected 2 arguments, got 1
+2026/11/27 10:56:01 gateway: answer callback: telegram: answerCallbackQuery: HTTP 400: ...
+2026/11/27 10:56:02 gateway: answer callback: telegram: answerCallbackQuery: HTTP 400: ...
+
+$ curl .../getMe   # three consecutive checks
+HTTP 200 connect=0.20s total=0.74s
+HTTP 200 connect=0.16s total=0.54s
+HTTP 200 connect=0.16s total=0.59s
+```
+
+Telegram reachability, bot token and polling transport were healthy. The `query is too old` lines were replay artifacts, not the root cause.
+
+### Fix
+
+- Split `approvalSelect` into `approvalColumns`, `approvalSelect` (`where id=$1`) and `shortIDSelect` (`... = $1`). `ApprovalByShortID` now passes exactly one argument. `TestApprovalSelectParameterCounts` guards both query forms.
+- Added a single workspace-task queue (`taskJob`, `enqueueTask`, `taskWorker`). All message and callback paths now enqueue work instead of blocking the Telegram poller. `TestEnqueueTaskKeepsPollerFreeAndOrdered` verifies the poller is not blocked and job order is preserved.
+- Rebuilt and restarted the gateway from the fixed tree; the router was restarted in the same launcher.
+
+### Evidence after fix
+
+```
+$ pgrep -af '/tmp/opencode/padi-(gateway|router)'
+62071 /tmp/opencode/padi-router
+62072 /tmp/opencode/padi-gateway
+
+$ tail -1 /tmp/opencode/padi-gateway.log
+2026/11/27 11:16:25 gateway: ready (chat=padi/agent-chat, build=padi/agent-build, plan=padi/agent-plan, network=agent-session-net)
+
+$ gofmt -l cmd internal     # no output
+$ GOPROXY=off go vet ./...  # no output
+$ GOPROXY=off go test -race -count=1 ./...
+ok  github.com/jerryjuche/padi/cmd/gateway       2.089s
+ok  github.com/jerryjuche/padi/internal/gateway/store 1.113s
+(all other packages ok)
+
+$ scripts/dbaccess_test.sh | tail -1
+dbaccess_test: anon key cannot read any agent table (16 checked)
+$ scripts/m3b-smoke.sh | tail -1
+m3b-smoke: PASS M3b smoke (no live PR, no secrets used)
+
+$ psql ... -c "select id,last_update_id from agent.telegram_state"
+1|374300574
+```
+
+Two contract approvals (`630b270e`, `1ac2c5d0`) are still `pending` and unexpired; the owner was notified in Telegram to tap the newest card before `10:29 UTC`. If it expires, send a fresh `clone jerryjuche/koder and read the readme` request to get a new card.
+
+### Next
+
+Owner: tap **Approve contract** on the active card, then continue with Execute and the push/PR gates. Coding agent: no push unless approved.

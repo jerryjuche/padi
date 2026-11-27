@@ -53,3 +53,25 @@ func TestDecideViaExpiredUsesExpirePath(t *testing.T) {
 		t.Fatalf("want nil-pool error from expire path, got %v", err)
 	}
 }
+
+// Callback lookups pass exactly one argument. The earlier approvalSelect+...$2
+// form had two parameters and made every Telegram approval tap fail with
+// "expected 2 arguments, got 1".
+func TestApprovalSelectParameterCounts(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		sql  string
+		want int
+	}{
+		{"by id", approvalSelect, 1},
+		{"by short id", shortIDSelect, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := strings.Count(tc.sql, "$"); got != tc.want {
+				t.Fatalf("%s has %d query parameters, want %d", tc.name, got, tc.want)
+			}
+		})
+	}
+}
