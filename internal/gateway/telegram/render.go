@@ -127,13 +127,25 @@ func (r *Renderer) RelayWithKeyboard(ctx context.Context, chatID int64, sessionI
 
 // RelayWithKeyboardFunc builds the final keyboard only when the reply is ready.
 func (r *Renderer) RelayWithKeyboardFunc(ctx context.Context, chatID int64, sessionID uuid.UUID, taskID *uuid.UUID, events <-chan opencode.Event, keyboard KeyboardFunc) (string, error) {
-	statusID, err := r.Client.SendMessage(ctx, chatID, html.EscapeString("Working..."))
+	return r.RelayWithLive(ctx, chatID, sessionID, taskID, events, keyboard, nil)
+}
+
+// RelayWithLive is RelayWithKeyboardFunc with an underground live trace. The
+// same Telegram message is edited into a phase/event card while work runs,
+// then replaced by the final answer. Without a trace the classic working
+// message is preserved for callers and tests.
+func (r *Renderer) RelayWithLive(ctx context.Context, chatID int64, sessionID uuid.UUID, taskID *uuid.UUID, events <-chan opencode.Event, keyboard KeyboardFunc, live *LiveTrace) (string, error) {
+	initial := html.EscapeString("Working...")
+	if live != nil {
+		initial = RenderLiveCard(live.Snapshot(), "", 8)
+	}
+	statusID, err := r.Client.SendMessage(ctx, chatID, initial)
 	if err != nil {
 		return "", err
 	}
 	r.record(ctx, sessionID, taskID, chatID, statusID)
 
-	lastText := html.EscapeString("Working...")
+	lastText := initial
 	lastMarkup := ""
 	edit := func(text string, rows [][]InlineButton) error {
 		markup, err := keyboardJSON(rows)
@@ -157,18 +169,52 @@ func (r *Renderer) RelayWithKeyboardFunc(ctx context.Context, chatID int64, sess
 		switch ev.Type {
 		case "token":
 			answer.WriteString(ev.Text)
+			if live != nil {
+				live.AddTokens(len([]rune(ev.Text)))
+			}
 		case "done":
 			goto finish
 		case "error":
 			if ev.Terminal {
 				message := Render(ev)
+				if live != nil {
+					live.SetPhase("done", "Failed")
+					live.Add("error", message, "")
+				}
 				if editErr := edit(html.EscapeString(message), nil); editErr != nil {
 					return "", editErr
 				}
 				return "", fmt.Errorf("%s", message)
 			}
+			if live != nil {
+				live.Add("error", ev.Message, "")
+			}
 			status = Render(ev)
+		case "tool_call":
+			if live != nil {
+				live.Add("tool", ev.Tool, "called")
+			}
+			if line := Render(ev); line != "" {
+				status = line
+			}
+		case "tool_result":
+			if live != nil {
+				live.Add("tool", ev.Tool, "finished")
+			}
+			if line := Render(ev); line != "" {
+				status = line
+			}
+		case "file_change":
+			if live != nil {
+				live.Add("file", ev.Text, "changed")
+			}
+			if line := Render(ev); line != "" {
+				status = line
+			}
 		default:
+			if live != nil && ev.Type == "status" && ev.Message != "" {
+				live.Add("status", ev.Message, "")
+			}
 			if line := Render(ev); line != "" {
 				status = line
 			}
@@ -176,13 +222,19 @@ func (r *Renderer) RelayWithKeyboardFunc(ctx context.Context, chatID int64, sess
 		if time.Since(lastEdit) < r.interval() {
 			continue
 		}
-		text := "Working..."
-		if answer.Len() > 0 {
-			text = answer.String()
-		} else if status != "" {
-			text = status
+		var text string
+		if live != nil {
+			text = RenderLiveCard(live.Snapshot(), answer.String(), 8)
+		} else {
+			text = "Working..."
+			if answer.Len() > 0 {
+				text = answer.String()
+			} else if status != "" {
+				text = status
+			}
+			text = html.EscapeString(truncate(text, r.maxChars()))
 		}
-		if err := edit(html.EscapeString(truncate(text, r.maxChars())), nil); err != nil {
+		if err := edit(text, nil); err != nil {
 			return "", err
 		}
 		lastEdit = time.Now()

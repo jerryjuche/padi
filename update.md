@@ -1604,3 +1604,50 @@ Orphan `padi-task-8f3f9277` container was removed; no test containers remain.
 ### Next
 
 Owner: send a fresh `clone jerryjuche/koder and read the readme`, tap **Approve contract**, then `/status` for the visual card. No push.
+
+---
+
+## 28. Underground activity view: `/options` live trace (2026-11-27)
+
+### Cause
+
+The gateway already recorded every OpenCode event into `agent.events`, but the Telegram relay collapsed them into one message that mostly read `Working...`. The owner could not see which phase a task was in, which tool was running, or which files changed. There was no `/options` command; only `/status` showed a static snapshot.
+
+### Fix
+
+- Added `/options` and an **Options** button on the status card. It opens a bounded, escaped HTML trace panel.
+- Added `telegram.LiveTrace`: phase track (`QUEUED → CONTRACT → CLONE → SANDBOX → EXECUTE → VERIFY → PUBLISH → DONE`), tool calls, file paths, errors, status lines, elapsed time and token count. The relay edits one rolling card every ~1.2s; the final answer replaces it. No per-event message spam or 5-second deletion.
+- Phases are injected from `startTask` before the relay starts, so the first card already shows the route taken. Failures mark the trace `FAILED` and keep it available.
+- `/options` shows the live card for an active task and rebuilds the last 18 stored events from `agent.events` for a finished or failed task, even after the container is closed (a bounded per-chat trace cache keeps the session/task IDs).
+- All dynamic text is HTML-escaped and line-clipped; the card stays under Telegram's 4096-character limit.
+- Added regression tests for phase monotonicity, memory bounds, escaping, live relay edits, closed-chat history and the Options button.
+
+### Evidence
+
+```bash
+$ gofmt -l cmd internal       # no output
+$ GOPROXY=off go vet ./...    # no output
+$ GOPROXY=off go test -race -count=1 ./...     # all packages ok
+$ scripts/m3b-smoke.sh | tail -1
+m3b-smoke: PASS M3b smoke (no live PR, no secrets used)
+$ scripts/dbaccess_test.sh | tail -1
+dbaccess_test: anon key cannot read any agent table (16 checked)
+```
+
+Sample live card from the tests:
+
+```text
+PADI / LIVE TRACE  task-123… · owner/repo · BUILD · 00:00
+▶ AGENT EXECUTING
+✓ QUEUED ✓ CONTRACT ✓ CLONE ✓ SANDBOX ▶ EXECUTE ○ VERIFY ○ PUBLISH ○ DONE
+Events  7 total
+11:24:14 ⚙ shell: read README.md
+11:24:14 ✎ README.md: changed
+Draft: answer &lt;b&gt;text&lt;/b&gt;
+42 tokens
+/options for full trace
+```
+
+### Next
+
+Owner: send a fresh `clone jerryjuche/koder and read the readme`, tap **Approve contract**, use `/status` for the card and `/options` during the run for the full underground trace. No push.

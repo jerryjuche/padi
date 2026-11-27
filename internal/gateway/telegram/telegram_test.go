@@ -259,6 +259,63 @@ func TestRendererRelay(t *testing.T) {
 	}
 }
 
+func TestRendererRelayWithLiveShowsUndergroundTrace(t *testing.T) {
+	var mu sync.Mutex
+	var calls []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		mu.Lock()
+		calls = append(calls, r.Form.Get("text"))
+		mu.Unlock()
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/sendMessage"):
+			fmt.Fprint(w, `{"ok":true,"result":{"message_id":99}}`)
+		default:
+			fmt.Fprint(w, `{"ok":true,"result":true}`)
+		}
+	}))
+	defer srv.Close()
+	events := make(chan opencode.Event, 5)
+	events <- opencode.Event{Type: "tool_call", Tool: "shell"}
+	events <- opencode.Event{Type: "file_change", Text: "README.md"}
+	events <- opencode.Event{Type: "token", Text: "final answer"}
+	events <- opencode.Event{Type: "done"}
+	close(events)
+	trace := NewLiveTrace("task-1234", "owner/repo", "build")
+	trace.SetPhase("execute", "Agent executing")
+	r := &Renderer{
+		Client:       &Client{BaseURL: srv.URL, Token: "t", HTTP: srv.Client()},
+		EditInterval: time.Nanosecond, MaxChars: 3800,
+	}
+	summary, err := r.RelayWithLive(context.Background(), 7, uuid.New(), nil, events, nil, trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary != "final answer" {
+		t.Fatalf("summary=%q", summary)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) < 2 {
+		t.Fatalf("calls=%v", calls)
+	}
+	if !strings.Contains(calls[0], "PADI / LIVE TRACE") {
+		t.Fatalf("initial message was not a live card: %q", calls[0])
+	}
+	var liveSeen bool
+	for _, call := range calls[:len(calls)-1] {
+		if strings.Contains(call, "shell") && strings.Contains(call, "README.md") {
+			liveSeen = true
+		}
+	}
+	if !liveSeen {
+		t.Fatalf("underground events missing: %q", calls)
+	}
+	if !strings.Contains(calls[len(calls)-1], "final answer") {
+		t.Fatalf("final answer missing: %q", calls[len(calls)-1])
+	}
+}
+
 func TestRendererRelayTreatsNotModifiedAsNoOp(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/sendMessage") {

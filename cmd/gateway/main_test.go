@@ -58,6 +58,36 @@ func TestHintMessagesAreValidTelegramHTML(t *testing.T) {
 	}
 }
 
+func TestOptionsCardKeepsTraceAfterChatClose(t *testing.T) {
+	trace := telegram.NewLiveTrace("task-1234", "owner/repo", "build")
+	trace.SetPhase("execute", "Agent executing")
+	trace.SetPhase("done", "Done")
+	trace.Add("file", "README.md", "changed")
+	a := &application{traces: make(map[int64]*traceEntry)}
+	a.rememberTrace(7, &traceEntry{
+		Live: trace, SessionID: uuid.New(), TaskID: "task-1234",
+		Repo: "owner/repo", Mode: "build",
+	})
+	card := a.optionsCard(context.Background(), 7)
+	for _, want := range []string{"PADI / LIVE TRACE", "DONE", "README.md", "store not configured"} {
+		if !strings.Contains(card, want) {
+			t.Errorf("options card missing %q: %s", want, card)
+		}
+	}
+
+	var optionsButton bool
+	for _, row := range statusButtons() {
+		for _, button := range row {
+			if button.CallbackData == "options" {
+				optionsButton = true
+			}
+		}
+	}
+	if !optionsButton {
+		t.Fatal("status keyboard has no Options button")
+	}
+}
+
 func TestNormalizeRepo(t *testing.T) {
 	cases := map[string]string{
 		"GitHub.com/jerryjuche/koder":             "jerryjuche/koder",

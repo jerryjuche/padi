@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
@@ -177,6 +178,7 @@ func run() error {
 		waits:            make(map[uuid.UUID]chan bool),
 		tasks:            make(chan taskJob, 32),
 		direct:           make(map[int64]*directChatState),
+		traces:           make(map[int64]*traceEntry),
 		chatClient: &routerChatClient{
 			BaseURL: routerBaseURL, Token: routerToken, Model: cfg.DirectModel(),
 		},
@@ -237,6 +239,7 @@ type chatSession struct {
 	state     string
 	lastTask  taskRecord
 	proposal  *proposalRecord
+	live      *telegram.LiveTrace
 }
 
 func (c *chatSession) begin() bool {
@@ -305,6 +308,41 @@ func (c *chatSession) setOutcome(outcome string) {
 	c.mu.Lock()
 	c.lastTask.Outcome = outcome
 	c.mu.Unlock()
+}
+
+func (c *chatSession) setLive(l *telegram.LiveTrace) {
+	c.mu.Lock()
+	c.live = l
+	c.mu.Unlock()
+}
+
+func (c *chatSession) currentLive() *telegram.LiveTrace {
+	c.mu.Lock()
+	l := c.live
+	c.mu.Unlock()
+	return l
+}
+
+// rememberTrace keeps the last trace available to /options even after the
+// chat and its container are closed. It keeps a bounded number of chats so a
+// long-running gateway cannot grow this cache without limit.
+func (a *application) rememberTrace(chatID int64, entry *traceEntry) {
+	a.traceMu.Lock()
+	defer a.traceMu.Unlock()
+	const maxTraces = 32
+	if _, exists := a.traces[chatID]; !exists && len(a.traces) >= maxTraces {
+		for id := range a.traces {
+			delete(a.traces, id)
+			break
+		}
+	}
+	a.traces[chatID] = entry
+}
+
+func (a *application) lastTrace(chatID int64) *traceEntry {
+	a.traceMu.Lock()
+	defer a.traceMu.Unlock()
+	return a.traces[chatID]
 }
 
 func (c *chatSession) setProposal(p *proposalRecord) {
@@ -403,6 +441,11 @@ type application struct {
 	directMu sync.Mutex
 	direct   map[int64]*directChatState
 
+	// traces keeps the last underground trace per chat even after the
+	// workspace container is closed, so /options can still show stored events.
+	traceMu sync.Mutex
+	traces  map[int64]*traceEntry
+
 	// chatClient calls the same router the session containers use, so normal
 	// conversation needs no clone, container or provider keys in the gateway.
 	chatClient *routerChatClient
@@ -430,6 +473,14 @@ type application struct {
 	// waits for an owner tap, so running it inline would block the same poller
 	// that has to deliver that tap.
 	tasks chan taskJob
+}
+
+type traceEntry struct {
+	Live      *telegram.LiveTrace
+	SessionID uuid.UUID
+	TaskID    string
+	Repo      string
+	Mode      string
 }
 
 type taskJob struct {
@@ -801,6 +852,8 @@ func (a *application) handleUpdate(ctx context.Context, u telegram.Update) error
 		return a.help(ctx, chatID)
 	case strings.HasPrefix(text, "/status"):
 		return a.status(ctx, chatID)
+	case strings.HasPrefix(text, "/options"):
+		return a.options(ctx, chatID)
 	case strings.HasPrefix(text, "/undo"):
 		return a.undo(ctx, chatID, strings.TrimSpace(strings.TrimPrefix(text, "/undo")))
 	case strings.HasPrefix(text, "/new"):
@@ -937,6 +990,8 @@ func (a *application) handleCallback(ctx context.Context, q *telegram.CallbackQu
 		return a.replyToCallback(ctx, q, "New topic. Tell me what you'd like to work on, or send clone <repo> to open a repository.", a.buttons(chatID, "empty", ""))
 	case data == "status":
 		return a.replyHTMLToCallback(ctx, q, a.statusCard(ctx, chatID), statusButtons())
+	case data == "options":
+		return a.replyHTMLToCallback(ctx, q, a.optionsCard(ctx, chatID), optionsButtons())
 	case data == "help":
 		return a.replyToCallback(ctx, q, a.helpText(), a.buttonsForChat(chatID))
 	case strings.HasPrefix(data, "ap:"):
@@ -1074,6 +1129,7 @@ func (a *application) helpText() string {
 		"• /plan — investigate and propose a plan before editing\n" +
 		"• /research — read, search and report; no edits\n" +
 		"• /status — show the active workspace\n" +
+		"• /options — live underground trace and stored events\n" +
 		"• /undo [n] — restore a saved checkpoint\n" +
 		"• /new — close this workspace and start fresh\n\n" +
 		"Buttons offer next steps for this conversation. Use /build, /plan or /research when you want to switch mode."
@@ -1136,11 +1192,14 @@ func statusButtons() [][]telegram.InlineButton {
 	return [][]telegram.InlineButton{
 		{
 			{Text: "↻ Refresh", CallbackData: "status"},
-			{Text: "Plan", CallbackData: "mode:plan"},
-			{Text: "Build", CallbackData: "mode:build"},
+			{Text: "Options", CallbackData: "options"},
 		},
 		{
+			{Text: "Plan", CallbackData: "mode:plan"},
+			{Text: "Build", CallbackData: "mode:build"},
 			{Text: "Research", CallbackData: "mode:research"},
+		},
+		{
 			{Text: "Help", CallbackData: "help"},
 			{Text: "New", CallbackData: "new"},
 		},
@@ -1241,6 +1300,146 @@ func (a *application) status(ctx context.Context, chatID int64) error {
 	return err
 }
 
+func optionsButtons() [][]telegram.InlineButton {
+	return [][]telegram.InlineButton{
+		{
+			{Text: "↻ Refresh", CallbackData: "options"},
+			{Text: "Status", CallbackData: "status"},
+		},
+		{
+			{Text: "Plan", CallbackData: "mode:plan"},
+			{Text: "Build", CallbackData: "mode:build"},
+			{Text: "Research", CallbackData: "mode:research"},
+		},
+		{
+			{Text: "Help", CallbackData: "help"},
+			{Text: "New", CallbackData: "new"},
+		},
+	}
+}
+
+func storedEventLine(e store.Event) string {
+	var data struct {
+		Text    string `json:"text"`
+		Tool    string `json:"tool"`
+		Message string `json:"message"`
+		State   string `json:"state"`
+		Mode    string `json:"mode"`
+		Summary string `json:"summary"`
+		Branch  string `json:"branch"`
+	}
+	_ = json.Unmarshal(e.Data, &data)
+	detail := data.Text
+	if detail == "" {
+		detail = data.Message
+	}
+	if detail == "" {
+		detail = data.Summary
+	}
+	if detail == "" {
+		detail = data.State
+	}
+	if detail == "" {
+		detail = data.Branch
+	}
+	if data.Tool != "" {
+		if detail == "" {
+			detail = data.Tool
+		} else {
+			detail = data.Tool + ": " + detail
+		}
+	}
+	if detail == "" {
+		detail = "—"
+	}
+	if len(detail) > 60 {
+		detail = detail[:59] + "…"
+	}
+	return e.TS.UTC().Format("15:04:05") + " " + e.Type + "  " + detail
+}
+
+// optionsCard shows the underground trace. A running chat contributes its
+// in-memory live trace; a finished one is rebuilt from agent.events so the
+// history survives gateway restarts and closed containers.
+func (a *application) optionsCard(ctx context.Context, chatID int64) string {
+	esc := html.EscapeString
+	var b strings.Builder
+	b.WriteString("<b>PADI / OPTIONS</b>\n")
+	trace := a.lastTrace(chatID)
+	chat := a.getChat(chatID)
+	if trace == nil && chat == nil {
+		b.WriteString("<i>No active workspace. Underground history appears after a task runs.</i>\n")
+		b.WriteString("\n<b>Available</b>\n• /status — live control center\n• /plan · /build · /research — choose a mode\n• /new — close this topic\n")
+		return b.String()
+	}
+
+	var live *telegram.LiveTrace
+	var sessionID uuid.UUID
+	var taskID string
+	if chat != nil {
+		snap := chat.snapshot()
+		live = chat.currentLive()
+		sessionID, taskID = snap.SessionID, snap.Task.ID
+	}
+	if trace != nil {
+		if live == nil {
+			live = trace.Live
+		}
+		if sessionID == uuid.Nil {
+			sessionID, taskID = trace.SessionID, trace.TaskID
+		}
+	}
+	if live != nil {
+		b.WriteString(telegram.RenderLiveCard(live.Snapshot(), "", 10))
+		b.WriteString("\n\n")
+	} else {
+		b.WriteString("<i>No live trace for this task.</i>\n\n")
+	}
+
+	b.WriteString("<b>Stored trace</b> <i>agent.events</i>\n")
+	if a.db == nil {
+		b.WriteString("<code>store not configured</code>\n")
+	} else if sessionID == uuid.Nil {
+		b.WriteString("<code>no session recorded yet</code>\n")
+	} else {
+		events, err := a.db.EventsAfter(ctx, sessionID, 0, 400)
+		if err != nil {
+			b.WriteString("<code>history unavailable</code>\n")
+		} else {
+			var lines []string
+			for _, e := range events {
+				if taskID != "" && e.TaskID != nil && e.TaskID.String() != taskID {
+					continue
+				}
+				lines = append(lines, storedEventLine(e))
+			}
+			if len(lines) == 0 {
+				b.WriteString("<code>no events recorded yet</code>\n")
+			} else {
+				start := len(lines) - 18
+				if start < 0 {
+					start = 0
+				}
+				b.WriteString("<code>")
+				for _, line := range lines[start:] {
+					b.WriteString(esc(line) + "\n")
+				}
+				b.WriteString("</code>")
+				if start > 0 {
+					b.WriteString("<i>" + fmt.Sprintf("%d earlier events omitted", start) + "</i>\n")
+				}
+			}
+		}
+	}
+	b.WriteString("\n<i>Full history stays in agent.events. Tap refresh for a new snapshot.</i>")
+	return b.String()
+}
+
+func (a *application) options(ctx context.Context, chatID int64) error {
+	_, err := a.tg.SendMessageKeyboard(ctx, chatID, a.optionsCard(ctx, chatID), optionsButtons())
+	return err
+}
+
 // replyToCallback edits the tapped message when Telegram supplied a message ID,
 // so a button press does not stack another card in the chat. Stubbed callbacks
 // in tests have no message ID and fall back to a normal reply.
@@ -1332,6 +1531,18 @@ func (a *application) startTask(ctx context.Context, chatID int64, c command, ke
 	}
 	a.budgets[task.ID] = a.contractDefaults
 	a.mu.Unlock()
+
+	// Underground trace for this task. Phases are recorded here before the
+	// relay starts, so the first live card already shows the full path taken.
+	live := telegram.NewLiveTrace(task.ID.String(), c.repo, mode)
+	if chat != nil {
+		chat.setLive(live)
+	}
+	a.rememberTrace(chatID, &traceEntry{
+		Live: live, SessionID: session.ID, TaskID: task.ID.String(),
+		Repo: c.repo, Mode: mode,
+	})
+	live.SetPhase("contract", "Contract approval")
 	// Capture the previous task before this one becomes current; it is injected
 	// into the agent prompt so follow-ups do not re-open settled questions.
 	var priorContext string
@@ -1361,6 +1572,7 @@ func (a *application) startTask(ctx context.Context, chatID int64, c command, ke
 	taskCtx, taskCancel := context.WithTimeout(ctx, 20*time.Minute)
 	defer taskCancel()
 
+	live.SetPhase("clone", "Cloning repository")
 	if chat == nil {
 		workDir, branch, err := a.git.CloneForTask(taskCtx, c.repo, task.ID.String())
 		if err != nil {
@@ -1368,6 +1580,7 @@ func (a *application) startTask(ctx context.Context, chatID int64, c command, ke
 			return nil
 		}
 		a.event(taskCtx, session.ID, &task.ID, "status", map[string]string{"state": "PREPARING", "branch": branch})
+		live.SetPhase("sandbox", "Starting sandbox")
 		handle, err := a.runner.Start(taskCtx, task.ID.String(), workDir)
 		if err != nil {
 			a.fail(taskCtx, session, task, chatID, fmt.Errorf("start container: %w", err))
@@ -1389,6 +1602,7 @@ func (a *application) startTask(ctx context.Context, chatID int64, c command, ke
 			repo: c.repo, mode: mode, session: session, handle: handle,
 			oc: oc, ocSession: ocSession, lastUsed: time.Now(), busy: true,
 			state: "running", lastTask: taskRecord{ID: task.ID.String(), Prompt: c.prompt, Outcome: "running"},
+			live: live,
 		}
 		task.Branch = branch
 		if err := a.db.SetTaskBranch(taskCtx, task.ID, branch); err != nil {
@@ -1411,6 +1625,11 @@ func (a *application) startTask(ctx context.Context, chatID int64, c command, ke
 		return a.reportError(ctx, chatID, err)
 	}
 	stopCheckpoints := a.checkpointLoop(taskCtx, task.ID, session.ID, chat.handle.ID)
+	if agentName == "plan" {
+		live.SetPhase("execute", "Agent planning")
+	} else {
+		live.SetPhase("execute", "Agent executing")
+	}
 	summary, err := a.runTask(taskCtx, chat, session, task, chatID, agentName, agentPrompt, priorContext)
 	stopCheckpoints()
 	if err != nil {
@@ -1425,6 +1644,7 @@ func (a *application) startTask(ctx context.Context, chatID int64, c command, ke
 		return nil
 	}
 	a.clearBudgetStop(task.ID)
+	live.SetPhase("verify", "Verifying and saving checkpoint")
 	if _, err := a.checkpoint(taskCtx, task.ID, session.ID, chat.handle.ID); err != nil {
 		log.Printf("gateway: final checkpoint task %s: %s", task.ID, scrubForUser(err))
 	}
@@ -1435,6 +1655,7 @@ func (a *application) startTask(ctx context.Context, chatID int64, c command, ke
 	// Publish only build-mode work that actually changed files. Chat replies,
 	// research and plans finish locally; they never create approval cards.
 	if mode == modeBuild && a.hasWorkspaceChanges(taskCtx, chat.handle.ID) {
+		live.SetPhase("publish", "Publish approval")
 		if err := a.publishTask(taskCtx, chat, session, task, chatID, c.prompt); err != nil {
 			a.fail(taskCtx, session, task, chatID, err)
 			return nil
@@ -1449,6 +1670,7 @@ func (a *application) startTask(ctx context.Context, chatID int64, c command, ke
 	if err := a.db.Transition(taskCtx, task.ID, store.StateExecuting, store.StateDone, ""); err != nil {
 		return a.reportError(ctx, chatID, err)
 	}
+	live.SetPhase("done", "Done")
 	chat.setState("done")
 	chat.setLastTask(taskRecord{ID: task.ID.String(), Prompt: c.prompt, Outcome: "completed", Evidence: summary})
 	// The final task card already carries the correct Execute/Revise buttons
@@ -1544,7 +1766,7 @@ func (a *application) runTask(ctx context.Context, chat *chatSession, session st
 	if err := chat.oc.PromptWithAgent(ctx, chat.ocSession, agentPrompt, a.cfg.TaskModel(agentName), agentName); err != nil {
 		return "", err
 	}
-	summary, err := a.renderer.RelayWithKeyboardFunc(ctx, chatID, session.ID, &task.ID, normalized, func(final string) [][]telegram.InlineButton {
+	summary, err := a.renderer.RelayWithLive(ctx, chatID, session.ID, &task.ID, normalized, func(final string) [][]telegram.InlineButton {
 		kind := "done"
 		if parseProposal(final, task.ID.String()) != nil {
 			kind = "decision"
@@ -1552,7 +1774,7 @@ func (a *application) runTask(ctx context.Context, chat *chatSession, session st
 			kind = "workspace"
 		}
 		return a.buttons(chatID, kind, task.ID.String())
-	})
+	}, chat.currentLive())
 	select {
 	case cause := <-abortHit:
 		return "", cause
@@ -1603,6 +1825,10 @@ func (a *application) fail(ctx context.Context, session store.Session, task stor
 		chat.setProposal(nil)
 		chat.setOutcome("failed: " + reason)
 		chat.setState("failed")
+		if live := chat.currentLive(); live != nil {
+			live.SetPhase("done", "Failed")
+			live.Add("error", reason, "")
+		}
 	}
 	// A failed task must not leave its container running or let a follow-up
 	// reuse a dead session. The DB task state remains the source of truth.
