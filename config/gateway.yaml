@@ -1,5 +1,5 @@
 # Gateway config. No secrets belong in this file.
-policies_file: "config/policies.yaml"
+policies_file: "/etc/padi/policies.yaml"
 
 http:
   listen: ":8080"
