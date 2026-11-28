@@ -39,7 +39,7 @@ else
   runuser -u "$PU" -- git clone -q -b "$BRANCH" "$REPO" "$SRC"
 fi
 chown -R "$PU:$PU" "$SRC"
-echo "code:    $SRC at $(git -C "$SRC" rev-parse --short HEAD)"
+echo "code:    $SRC at $(runuser -u "$PU" -- git -C "$SRC" rev-parse --short HEAD)"
 
 # 3. rootless daemon that only padi uses
 if [ ! -S "$SOCK" ]; then
