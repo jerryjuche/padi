@@ -3,4 +3,5 @@
 .env.*
 !.env.example
 **/secrets/
+!internal/verify/secrets/
 *.pem

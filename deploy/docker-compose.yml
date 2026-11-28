@@ -61,9 +61,15 @@ services:
       GITHUB_APP_ID: ${GITHUB_APP_ID:-}
       GITHUB_APP_INSTALLATION_ID: ${GITHUB_APP_INSTALLATION_ID:-${GITHUB_INSTALLATION_ID:-}}
       GITHUB_APP_PRIVATE_KEY_PATH: /srv/agent/secrets/github-app.pem
+    # Shared-host / rootless deployments: set PADI_UID/PADI_GID to the owner of
+    # the rootless Docker socket so the gateway can both reach the daemon and
+    # write /srv/agent. Default keeps the image's nonroot user.
+    user: "${PADI_UID:-65532}:${PADI_GID:-65532}"
     volumes:
       - ../config/gateway.yaml:/etc/padi/gateway.yaml:ro
-      - /var/run/docker.sock:/var/run/docker.sock
+      # DOCKER_SOCK points at a rootless socket (e.g. /run/user/1001/docker.sock)
+      # when padi must not share the host's root daemon with other services.
+      - "${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock"
       - /srv/agent:/srv/agent
     # The gateway needs the session network for OpenCode HTTP and docker exec.
     # Its own HTTP/UI listener is not part of M3a; add a host firewall rule or
@@ -72,6 +78,8 @@ services:
       - agent-net
       - agent-session-net
 
+  # Only for the future web API/HTTPS entry point. Do NOT start this service on
+  # a host where another app already owns ports 80/443.
   caddy:
     image: caddy:2-alpine
     ports:
