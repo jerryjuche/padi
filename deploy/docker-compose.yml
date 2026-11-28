@@ -77,7 +77,6 @@ services:
     # an interface-bound listener before exposing port 8080 to sessions.
     networks:
       - agent-net
-      - agent-net
       - agent-session-net
 
   # Only for the future web API/HTTPS entry point. Do NOT start this service on
