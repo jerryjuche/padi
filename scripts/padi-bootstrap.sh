@@ -91,9 +91,17 @@ if ! grep -q '^DATABASE_URL=.' "$ENVF" ||
   exit 0
 fi
 
+# Rootless: container uid 0 maps to the padi host user, so the gateway must run
+# as 0 inside its namespace to read /run/user/<uid>/docker.sock and write
+# /srv/agent. A rootful daemon keeps the plain host uid.
+case "$SOCK" in
+  /run/user/*) CUID=0; CGID=0 ;;
+  *) CUID=$UP; CGID=$GP ;;
+esac
+
 # 6. start padi only (no host ports, no caddy)
 runuser -u "$PU" -- env DOCKER_HOST="$DOCKER_HOST" \
-  PADI_UID="$UP" PADI_GID="$GP" DOCKER_SOCK="$SOCK" \
+  PADI_UID="$CUID" PADI_GID="$CGID" DOCKER_SOCK="$SOCK" \
   sh -c "cd $SRC && docker compose -f deploy/docker-compose.yml \
          up -d --build router egress-proxy gateway"
 echo ""

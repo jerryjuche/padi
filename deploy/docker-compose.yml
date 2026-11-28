@@ -19,6 +19,7 @@ services:
         PKG: cmd/router
     environment:
       ROUTER_CONFIG: /etc/padi/router.yaml
+      ROUTER_TOKEN: ${ROUTER_TOKEN}
       NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
